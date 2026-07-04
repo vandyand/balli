@@ -131,11 +131,11 @@ Goal: §F — the hardest phase. New module `src/balli/regex.lpy`.
 
 Goal: §H, `src/balli/generator.lpy`.
 
-- [ ] `generate` (1/2-arity, opts `{:seed :size}`), `sample` (`{:size n}` count); `random.Random` instance threaded; deterministic under seed
-- [ ] Per-type strategies per §H incl. bounds, `:and` retry-100, `:not` filter, `:map` optional-p=0.5, `:map-of` distinct keys, `:multi`/`:or`/`:orn` branch pick, `:maybe` 20% nil, `:ref` depth counter (cap 5; at cap prefer non-recursive alternatives, else throw `:balli.core/unsatisfiable-schema`), `:re`/`:fn`/`:=>`-less throw `:balli.core/no-generator`
-- [ ] `:gen/return`/`:gen/elements`/`:gen/schema`/`:gen/fmap` (real fns)/`:gen/min`/`:gen/max` property hooks
-- [ ] Seqex generation: flat splicing per §H; `:=>` gen deferred to Phase 8
-- [ ] `tests/test_generator.lpy`: for each type — `(b/validate s (bg/generate s {:seed k}))` over several seeds; determinism (same seed twice → equal); bounds respected; recursive tree schema terminates and validates; `:gen/*` hooks; no-generator throws; **composition: generate `[:map [:cmd [:cat :keyword [:* :int]]]]` and validate it**
+- [x] `generate` (1/2-arity, opts `{:seed :size}`), `sample` (`{:size n}` count); `random.Random` instance threaded; deterministic under seed (commit: fddbbc9)
+- [x] Per-type strategies per §H incl. bounds, `:and` retry-100, `:not` filter, `:map` optional-p=0.5, `:map-of` distinct keys, `:multi`/`:or`/`:orn` branch pick, `:maybe` 20% nil, `:ref` depth counter (cap 5; at cap: target `:maybe` → nil, else throw `:balli.core/unsatisfiable-schema`; at cap `:map` omits optional entries and coll/rep counts collapse to their minimum, so optional-key/0-min-coll recursion terminates by omission), `:re`/`:fn`/`:=>`-less throw `:balli.core/no-generator` (commit: fddbbc9)
+- [x] `:gen/return`/`:gen/elements`/`:gen/schema`/`:gen/fmap` (real fns)/`:gen/min`/`:gen/max` property hooks (commit: fddbbc9)
+- [x] Seqex generation: flat splicing per §H (ref directly in seqex child position throws `:balli.core/potentially-recursive-seqex`, mirroring the compilers); `:=>` gen deferred to Phase 8 (commit: fddbbc9)
+- [x] `tests/test_generator.lpy`: for each type — `(b/validate s (bg/generate s {:seed k}))` over several seeds; determinism (same seed twice → equal); bounds respected; recursive tree schema terminates and validates; `:gen/*` hooks; no-generator throws; **composition: generate `[:map [:cmd [:cat :keyword [:* :int]]]]` and validate it** (commit: fddbbc9)
 
 **Checkpoints:**
 - `(let [v (bg/generate [:int {:min 1 :max 5}] {:seed 7})] (and (int? v) (<= 1 v 5)))` → `true`

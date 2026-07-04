@@ -47,7 +47,7 @@ See [research.md](research.md) and the [implementation plan](implementation-plan
 - [x] Phase 4: Key spell-checking
 - [x] Phase 5: parse/unparse + :orn
 - [x] Phase 6: Sequence schemas (balli.regex)
-- [ ] Phase 7: Generators
+- [x] Phase 7: Generators
 - [ ] Phase 8: Function schemas + instrument
 - [ ] Phase 9: Provider (schema inference)
 - [ ] Phase 10: Docs + full sweep
