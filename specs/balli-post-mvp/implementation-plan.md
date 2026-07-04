@@ -92,13 +92,13 @@ Goal: §D in `balli.error`.
 
 Goal: §E. (Phase 0 decided the Tag/Tags representation.)
 
-- [ ] `Tag`/`Tags` records (or fallback) in `balli.core` + `tag`/`tag?`/`tags`/`tags?` ctors/preds; `:balli.core/invalid` sentinel + `invalid?`
-- [ ] New type `:orn` in normalize (`entry vectors like :map`, ≥1 child) + registry + both compilers (validate/explain like `:or` with tag in `:path`)
-- [ ] `compile-parser [ast registry]` + `compile-unparser` in compile.lpy: simple types → validate-then-value; `:orn` → Tag of first match; `:multi` → Tag(dispatch, parsed); `:maybe`/`:or` (first match, untagged)/colls (per-element)/`:map` (entry values; Tag/Tags guard)/`:tuple`/`:map-of`/`:ref`
-- [ ] `:and` parse per §E: parse via the single TRANSFORMING child (parser produces structure; analysis derefs refs via registry) when exactly one exists; zero → first child's parse; in BOTH cases all remaining children validate against the original value; ≥2 transforming → `:balli.core/invalid-schema` at parser COMPILE time (registry available there). Track a `transforming-parser?` analysis fn (ast, registry, visited-ref-set) → bool — ref cycles count as non-transforming (no infinite analysis loop); tests: ref-hidden-transforming case AND recursive non-transforming ref under `:and`
-- [ ] `balli.core`: `parse`/`parser`/`unparse`/`unparser` (cached)
-- [ ] Additive integration of `:orn` into earlier phases' surfaces: json-schema (`anyOf` of branch schemas), transformers (branch-select like `:or`), walk/util (entry-style children), humanize (tag in `:path` only)
-- [ ] `tests/test_parse.lpy`: round-trip `(unparse s (parse s x)) = x` for every type; `:orn`/`:multi` Tag shapes; invalid → sentinel both directions; map containing user data that *looks* like a Tag is rejected by the guard; **composition: `[:map [:result [:orn [:ok :int] [:err :string]]]]` round-trip**
+- [x] `Tag`/`Tags` records (or fallback) in `balli.core` + `tag`/`tag?`/`tags`/`tags?` ctors/preds; `:balli.core/invalid` sentinel + `invalid?` (records physically live in `balli.compile` — core requires compile, so defining them in core would be a circular require; core's ctor/pred fns are the public surface. `invalid?` compares with `=` not `identical?`: keyword literals loaded from cached namespace bytecode are NOT globally interned in Basilisp, so keyword identity does not hold across modules)
+- [x] New type `:orn` in normalize (`entry vectors like :map`, ≥1 child) + registry + both compilers (validate/explain like `:or` with tag in `:path`)
+- [x] `compile-parser [ast registry]` + `compile-unparser` in compile.lpy: simple types → validate-then-value; `:orn` → Tag of first match; `:multi` → Tag(dispatch, parsed); `:maybe`/`:or` (first match, untagged)/colls (per-element)/`:map` (entry values; Tag/Tags guard)/`:tuple`/`:map-of`/`:ref` (commit: 2a84b74)
+- [x] `:and` parse per §E: parse via the single TRANSFORMING child (parser produces structure; analysis derefs refs via registry) when exactly one exists; zero → first child's parse; in BOTH cases all remaining children validate against the original value; ≥2 transforming → `:balli.core/invalid-schema` at parser COMPILE time (registry available there). Track a `transforming-parser?` analysis fn (ast, registry, visited-ref-set) → bool — ref cycles count as non-transforming (no infinite analysis loop); tests: ref-hidden-transforming case AND recursive non-transforming ref under `:and` (commit: 2a84b74)
+- [x] `balli.core`: `parse`/`parser`/`unparse`/`unparser` (cached)
+- [x] Additive integration of `:orn` into earlier phases' surfaces: json-schema (`anyOf` of branch schemas), transformers (branch-select like `:or`), walk/util (entry-style children), humanize (tag in `:path` only)
+- [x] `tests/test_parse.lpy`: round-trip `(unparse s (parse s x)) = x` for every type; `:orn`/`:multi` Tag shapes; invalid → sentinel both directions; map containing user data that *looks* like a Tag is rejected by the guard; **composition: `[:map [:result [:orn [:ok :int] [:err :string]]]]` round-trip** (commit: 2a84b74)
 
 **Checkpoints:**
 - `(b/parse [:orn [:num :int] [:str :string]] 42)` → Tag with `:key :num :value 42`

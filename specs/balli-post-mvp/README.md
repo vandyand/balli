@@ -45,7 +45,7 @@ See [research.md](research.md) and the [implementation plan](implementation-plan
 - [x] Phase 2: Walk + util + per-branch :or explain
 - [x] Phase 3: JSON Schema export
 - [x] Phase 4: Key spell-checking
-- [ ] Phase 5: parse/unparse + :orn
+- [x] Phase 5: parse/unparse + :orn
 - [ ] Phase 6: Sequence schemas (balli.regex)
 - [ ] Phase 7: Generators
 - [ ] Phase 8: Function schemas + instrument
