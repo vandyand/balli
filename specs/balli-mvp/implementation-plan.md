@@ -16,13 +16,13 @@ Seven phases building a Malli-inspired schema library for Basilisp, in dependenc
 
 Goal: an installable, testable, empty-but-real Basilisp library. Proves the toolchain before any schema code.
 
-- [ ] Create `pyproject.toml`: setuptools build, name `balli`, version `0.1.0`, `dependencies = ["basilisp>=0.5.0"]`, optional dev extra with `pytest>=8.0`; `[tool.pytest.ini_options]` with `testpaths = ["tests"]`; package dir `src/` layout (`[tool.setuptools.packages.find] where = ["src"]` — note: `.lpy` files need `[tool.setuptools.package-data] balli = ["*.lpy"]`)
-- [ ] Create `basilisp.edn` containing `{}`
-- [ ] Create `src/balli/core.lpy` stub: `(ns balli.core)` with `(def version "0.1.0")`
-- [ ] Create `tests/test_toolchain.lpy`: `(ns tests.test-toolchain (:require [basilisp.test :refer [deftest is]] [balli.core :as b]))` with a trivial `(deftest smoke (is (= "0.1.0" b/version)))`
-- [ ] Create `.gitignore` (`__pycache__/`, `*.lpyc`, `.venv/`, `*.egg-info/`, `dist/`)
-- [ ] Install editable: `pip install -e . --break-system-packages` (if editable install fails to expose `.lpy` files, fall back to setting `pythonpath = ["src", "."]` in pytest config and document it)
-- [ ] Verify test run: `basilisp test` → 1 passed
+- [x] Create `pyproject.toml`: setuptools build, name `balli`, version `0.1.0`, `dependencies = ["basilisp>=0.5.0"]`, optional dev extra with `pytest>=8.0`; `[tool.pytest.ini_options]` with `testpaths = ["tests"]`; package dir `src/` layout (`[tool.setuptools.packages.find] where = ["src"]` — note: `.lpy` files need `[tool.setuptools.package-data] balli = ["*.lpy"]`) (commit: 7c84fea)
+- [x] Create `basilisp.edn` containing `{}` (commit: 7c84fea)
+- [x] Create `src/balli/core.lpy` stub: `(ns balli.core)` with `(def version "0.1.0")` (commit: 7c84fea)
+- [x] Create `tests/test_toolchain.lpy`: `(ns tests.test-toolchain (:require [basilisp.test :refer [deftest is]] [balli.core :as b]))` with a trivial `(deftest smoke (is (= "0.1.0" b/version)))` (commit: 7c84fea)
+- [x] Create `.gitignore` (`__pycache__/`, `*.lpyc`, `.venv/`, `*.egg-info/`, `dist/`) (commit: 7c84fea)
+- [x] Install editable: `pip install -e . --break-system-packages` (if editable install fails to expose `.lpy` files, fall back to setting `pythonpath = ["src", "."]` in pytest config and document it) (commit: 7c84fea)
+- [x] Verify test run: `basilisp test` → 1 passed (commit: 7c84fea)
 
 **Checkpoints:**
 - `basilisp run -c '(require (quote [balli.core :as b])) (println b/version)'` → prints `0.1.0`
