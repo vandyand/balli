@@ -110,14 +110,14 @@ Goal: §E. (Phase 0 decided the Tag/Tags representation.)
 
 Goal: §F — the hardest phase. New module `src/balli/regex.lpy`.
 
-- [ ] Driver: iterative loop, thunk stack (Python list via interop or atom+vector), memo cache set of `[matcher-id pos regs]`, success box. NO Python recursion proportional to input length
-- [ ] Combinators: `item` (single element via child validator/parser/explainer), `cat*`, `alt*`, `opt*` (?), `star*` (*), `plus*` (+), `repeat*` (min/max with regs counter + nullable-child guard), `end`. Validator, parser, and explainer variants (explainer tracks furthest-pos errors per §F)
-- [ ] Normalize + registry for `:cat :catn :alt :altn :? :* :+ :repeat` (catn/altn entries like :map/:orn; `:repeat` requires child + optional `{:min :max}` numeric props; boundary-validate)
-- [ ] Compile integration: `-regex-op?` on AST nodes; seqex child of seqex splices; non-seqex child = item; `[:schema <seqex>]`... MVP has no `:schema` wrapper type — ADD `:schema` type (single child, transparent validate/explain/parse, forces item semantics in seqex context); ref into seqex throws `:balli.core/potentially-recursive-seqex` at compile
-- [ ] Top-level seqex validate/explain/parse: sequential? guard, whole-input consumption, error types `:balli.core/end-of-input` / `:balli.core/input-remaining` / invalid-type; parse shapes per §E/§F; unparsers re-splice (concat)
-- [ ] `regex-min-max [ast]` fn (Phase 8 dependency)
-- [ ] Transformer + walk pass-through for seqex types and `:schema` (extend Phase 1/2 code additively); json-schema: seqex types → `{"type" "array"}` best-effort with `"items"` when single-child (document as lossy), `:schema` transparent
-- [ ] `tests/test_regex.lpy`: validate/explain/parse/unparse for each combinator; splicing `[:* [:cat :int :string]]` flat + parse nesting `[[1 "a"] ...]`; `[:schema [:cat ...]]` single-element; greedy backtracking case `[:cat [:* :int] :int]` on `[1 2 3]`; pathological memo case `[:* [:* :int]]` on 30 elements terminates <2s; catn Tags round-trip; explain furthest-position + end-of-input + input-remaining; empty `[:cat]`; `:repeat` bounds; ref-in-seqex throws; **composition: seqex inside `[:map [:args [:cat :keyword [:* :int]]]]`**
+- [x] Driver: iterative loop, thunk stack (Python list via interop or atom+vector), memo cache set of `[matcher-id pos regs]`, success box. NO Python recursion proportional to input length (commit: fac37a1)
+- [x] Combinators: `item` (single element via child validator/parser/explainer), `cat*`, `alt*`, `opt*` (?), `star*` (*), `plus*` (+), `repeat*` (min/max with regs counter + nullable-child guard), `end`. Validator, parser, and explainer variants (explainer tracks furthest-pos errors per §F)
+- [x] Normalize + registry for `:cat :catn :alt :altn :? :* :+ :repeat` (catn/altn entries like :map/:orn; `:repeat` requires child + optional `{:min :max}` numeric props; boundary-validate)
+- [x] Compile integration: `-regex-op?` on AST nodes; seqex child of seqex splices; non-seqex child = item; `[:schema <seqex>]`... MVP has no `:schema` wrapper type — ADD `:schema` type (single child, transparent validate/explain/parse, forces item semantics in seqex context); ref into seqex throws `:balli.core/potentially-recursive-seqex` at compile (commit: fac37a1)
+- [x] Top-level seqex validate/explain/parse: sequential? guard, whole-input consumption, error types `:balli.core/end-of-input` / `:balli.core/input-remaining` / invalid-type; parse shapes per §E/§F; unparsers re-splice (concat)
+- [x] `regex-min-max [ast]` fn (Phase 8 dependency)
+- [x] Transformer + walk pass-through for seqex types and `:schema` (extend Phase 1/2 code additively); json-schema: seqex types → `{"type" "array"}` best-effort with `"items"` when single-child (document as lossy), `:schema` transparent (commit: fac37a1)
+- [x] `tests/test_regex.lpy`: validate/explain/parse/unparse for each combinator; splicing `[:* [:cat :int :string]]` flat + parse nesting `[[1 "a"] ...]`; `[:schema [:cat ...]]` single-element; greedy backtracking case `[:cat [:* :int] :int]` on `[1 2 3]`; pathological memo case `[:* [:* :int]]` on 30 elements terminates <2s; catn Tags round-trip; explain furthest-position + end-of-input + input-remaining; empty `[:cat]`; `:repeat` bounds; ref-in-seqex throws; **composition: seqex inside `[:map [:args [:cat :keyword [:* :int]]]]`** (commit: fac37a1)
 
 **Checkpoints:**
 - `(b/validate [:cat :int [:* :string]] [1 "a" "b"])` → `true`; `[1 "a" 2]` → `false`
