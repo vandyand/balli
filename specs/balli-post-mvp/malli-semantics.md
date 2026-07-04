@@ -37,7 +37,8 @@ Extracted from `~/.m2/repository/metosin/malli/0.20.0/malli-0.20.0.jar` (source 
 - `:int`: `"42"` → 42 (integer parse; non-numeric unchanged). `:double`/`:float`/`:number`: `"1.5"` → 1.5.
 - `:boolean`: exactly `"true"`→true, `"false"`→false, else unchanged.
 - `:keyword`: `"kw"`→:kw, `"ns/kw"`→:ns/kw (no leading-colon stripping in malli; Balli MAY strip a single leading `:` — document). `:symbol` similar. `:uuid`: only if canonical 8-4-4-4-12 hex regex matches, else unchanged.
-- `:vector`: sequential→vector; `:set`: sequential→set; `:map-of` keys: keyword keys→string keys on encode side.
+- `:vector`: sequential→vector; `:set`: sequential→set.
+- `:map-of` key DECODING (both string- and json-transformer): map keys are decoded with the key-schema's decoder (e.g. `[:map-of :keyword :int]` decodes `{"a" 1}` → `{:a 1}`); a decoded key is kept only when valid per the key schema, else the original key is kept. Encode side: keyword keys → string keys.
 - encoders: numbers→str; keyword→name (or "ns/name"); booleans NOT stringified.
 
 **json-transformer** (name `:json`): assumes JSON-parsed input — NO string→number/boolean coercions. Decoders: keyword/symbol/uuid from string; float/double from number; int from number only when integral. `:set` from sequential; `:vector` sequential→vector.
@@ -126,7 +127,7 @@ Opt-in rewrite of explain data BEFORE humanize: `(with-spell-checking explanatio
 - Tag containers: `Tag {key value}` and `Tags {values}` — implement as Basilisp records (`defrecord Tag [key value]`), with helper ctors/predicates exported from `balli.core`.
 - `:orn` (new schema type): `[:orn [:tag schema] ...]` — validates like `:or`; parse → `Tag(tag, parsed)` of first matching branch; unparse dispatches on `:key`. Entries like `:map` (props map allowed per entry).
 - `:multi` parse → `Tag(dispatch-value, parsed-branch)`; unparse via `:key`.
-- `:maybe`: nil → nil, else child parse. `:map`: parse entry values (stays a map); guard rejects Tag/Tags instances. Colls: parse each element. `:and`: parse via FIRST child, validate rest against original value. Simple schemas: validate → value | invalid.
+- `:maybe`: nil → nil, else child parse. `:map`: parse entry values (stays a map); guard rejects Tag/Tags instances. Colls: parse each element. `:and`: parse via the single TRANSFORMING child (one whose parser produces structure: `:orn`/`:multi`/`:catn`/`:altn`/seqex/nested transforming) when exactly one exists, validating the remaining children against the ORIGINAL value; zero transforming children → first child's parse; two or more transforming children at normalize time → throw `:balli.core/invalid-schema` (malli's child-selection generalization, simplified — document). Simple schemas: validate → value | invalid.
 - seqex parse shapes: see section F.
 
 ---
