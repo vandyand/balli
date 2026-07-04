@@ -2,7 +2,7 @@
 
 Data-driven schemas for [Basilisp](https://github.com/basilisp-lang/basilisp), inspired by [Malli](https://github.com/metosin/malli).
 
-Schemas are plain data in Malli's vector syntax — no macros, no protocols to implement. Balli normalizes a schema form into an AST and compiles it into fast validator/explainer closures, produces Malli-shaped explain data with `:path`/`:in`, humanizes errors into structures that mirror your value, and supports custom registries with (recursive) refs. Pure Basilisp; no Python dependencies beyond the standard library.
+Schemas are plain data in Malli's vector syntax — no macros, no protocols to implement. Balli covers most of Malli's surface: validation and Malli-shaped explain data with `:path`/`:in`, humanized errors with key spell-checking, value transformation (decode/encode/coerce), parse/unparse with tagged branches, sequence (regex) schemas with an iterative backtracking engine, function schemas with generative checking and instrumentation, deterministic seeded generators, JSON Schema export, schema utilities (`merge`/`union`/`closed-schema`/...), form walking, schema inference from sample data, and custom registries with (recursive) refs. Malli-inspired, not a strict port — see [Differences from Malli](#differences-from-malli). Pure Basilisp; no Python dependencies beyond the standard library.
 
 ## Install
 
@@ -101,9 +101,58 @@ Assert, getting the value back or an `ex-info` carrying the explain map:
 ;; => :balli.core/invalid-input
 ```
 
+Decode values with a transformer:
+
+```clojure
+(require '[balli.transform :as bt])
+
+(b/decode [:map [:age :int] [:tags [:set :keyword]]]
+          {:age "42" :tags ["a" "b"]}
+          (bt/string-transformer))
+;; => {:age 42 :tags #{:a :b}}
+```
+
+Parse into tagged branches (and back):
+
+```clojure
+(b/parse [:orn [:num :int] [:str :string]] 42)
+;; => #balli.compile.Tag{:key :num :value 42}
+
+(b/parse :int "x")
+;; => :balli.core/invalid
+```
+
+Validate sequences with regex schemas:
+
+```clojure
+(b/validate [:cat :int [:* :string]] [1 "a" "b"])
+;; => true
+
+(b/validate [:cat :int [:* :string]] [1 "a" 2])
+;; => false
+```
+
+Generate values, deterministically under a seed:
+
+```clojure
+(require '[balli.generator :as bg])
+
+(bg/generate [:map [:id :uuid] [:n [:int {:min 0 :max 9}]]] {:seed 1})
+;; => {:id #uuid "4283fefc-63f0-cd0e-873a-0000c6d07ef7" :n 5}
+```
+
+Infer a schema from sample data:
+
+```clojure
+(require '[balli.provider :as bp])
+
+(bp/provide [{:x 1} {:x 2 :y "a"}])
+;; => [:map [:x :int] [:y {:optional true} :string]]
+```
+
 ## Supported schemas
 
-All 27 schema types, each with a validating example:
+All 39 schema types, each with a validating example:
 
 | Type | Example |
 |---|---|
@@ -129,55 +178,417 @@ All 27 schema types, each with a validating example:
 | `:maybe` | `(b/validate [:maybe :int] nil)` |
 | `:and` | `(b/validate [:and :int [:fn even?]] 4)` |
 | `:or` | `(b/validate [:or :int :string] "x")` |
+| `:orn` | `(b/validate [:orn [:num :int] [:str :string]] 42)` (named branches; parses to a `Tag`) |
 | `:not` | `(b/validate [:not :string] 1)` |
 | `:fn` | `(b/validate [:fn {:error/message "must be even"} even?] 4)` (thrown exceptions count as invalid) |
 | `:multi` | `(b/validate [:multi {:dispatch :kind} [:cat [:map [:kind [:= :cat]]]]] {:kind :cat})` |
 | `:re` | `(b/validate [:re #"\d+"] "123")` (full match; string patterns compiled via `re-pattern`) |
 | `:ref` | `(b/validate [:ref :user/id] "abc" {:registry (reg/registry {:user/id :string})})` |
+| `:cat` | `(b/validate [:cat :int :string] [1 "a"])` (sequence concatenation) |
+| `:catn` | `(b/validate [:catn [:n :int] [:s :string]] [1 "x"])` (named `:cat`; parses to `Tags`) |
+| `:alt` | `(b/validate [:alt :int :string] ["x"])` (one-element alternatives, in a sequence) |
+| `:altn` | `(b/validate [:altn [:n :int] [:s :string]] [1])` (named `:alt`; parses to a `Tag`) |
+| `:?` | `(b/validate [:? :int] [])` (zero or one) |
+| `:*` | `(b/validate [:* :int] [1 2 3])` (zero or more) |
+| `:+` | `(b/validate [:+ :int] [1])` (one or more) |
+| `:repeat` | `(b/validate [:repeat {:min 1 :max 3} :int] [1 2])` (bounded repetition) |
+| `:schema` | `(b/validate [:schema :int] 5)` (transparent wrapper; stops seqex splicing) |
+| `:=>` | `(b/validate [:=> [:cat :int] :int] inc)` (function schema: input seqex + output) |
+| `:function` | `(b/validate [:function [:=> [:cat :int] :int] [:=> [:cat :int :int] :int]] +)` (multi-arity) |
 
 ## Properties
 
 | Property | Applies to | Meaning |
 |---|---|---|
-| `:min` / `:max` | `:string` (length), `:int`/`:float`/`:double`/`:number` (value), `:vector`/`:sequential`/`:set`/`:map-of` (element count) | Inclusive bounds; violations produce `:balli.core/limits` errors |
+| `:min` / `:max` | `:string` (length), `:int`/`:float`/`:double`/`:number` (value), `:vector`/`:sequential`/`:set`/`:map-of` (element count), `:repeat` (repetition count) | Inclusive bounds; violations produce `:balli.core/limits` errors |
 | `:closed` | `:map` | When `true`, keys not declared in the schema are rejected (`:balli.core/extra-key`); maps are open by default |
 | `:optional` | `:map` entries (entry-level props: `[:k {:optional true} schema]`) | Key may be absent; when present its value must still match |
 | `:error/message` | any schema | Overrides the default humanized message for errors at that schema |
 | `:dispatch` | `:multi` (required) | Keyword or function used to pick the child schema; unknown dispatch values are invalid (`:balli.core/invalid-dispatch-value`) |
+| `:default` | any schema / `:map` entries | Replacement for nil (and missing map keys) under `default-value-transformer` |
+| `:decode/<name>` / `:encode/<name>` | any schema | Per-schema transformer override for the transformer named `<name>` (e.g. `:decode/string`); a real fn or `{:enter f :leave g}` map |
+| `:gen/return` `:gen/elements` `:gen/schema` `:gen/fmap` `:gen/min` `:gen/max` | any schema | Generator hooks — constant, uniform pick, alternate schema, post-map fn, bound overrides |
+
+## Transformers
+
+`balli.transform` provides value transformation driven by the schema. `decode` transforms input toward the schema, `encode` away from it; both are **lenient** — mismatching values pass through unchanged, never throw:
+
+```clojure
+(require '[balli.core :as b]
+         '[balli.transform :as bt])
+
+(b/decode :int "42" (bt/json-transformer))
+;; => "42"   (JSON already has numbers -- json-transformer does NOT parse number strings)
+
+(b/encode [:map [:age :int]] {:age 42} (bt/string-transformer))
+;; => {:age "42"}
+```
+
+`coerce` is decode-then-validate: it returns the decoded value or throws `ex-info` with `{:type :balli.core/coercion :value ... :schema ... :explain ...}`:
+
+```clojure
+(b/coerce :int "42" (bt/string-transformer))
+;; => 42
+
+(try (b/coerce :int "x" (bt/json-transformer))
+     (catch python/Exception e (:type (ex-data e))))
+;; => :balli.core/coercion
+```
+
+The six built-ins:
+
+| Transformer | Behavior |
+|---|---|
+| `string-transformer` | Decode scalars from strings (int/double/boolean/keyword/symbol/uuid/enum), sequentials into vectors/sets; encode scalars to strings |
+| `json-transformer` | Assumes JSON-parsed input: no string→number/boolean coercion; keyword/symbol/uuid from string, sets from sequentials, `:map-of` keys via string rules |
+| `strip-extra-keys-transformer` | `:map` — drop undeclared keys (unless explicitly `{:closed false}`); `:map-of` — drop entries failing the key/value schemas |
+| `key-transformer` | `{:decode f :encode g}` applied to map keys |
+| `default-value-transformer` | Replace nil (and fill missing required map keys) from the `:default` property; opts `{:key ... :defaults {type f} :add-optional-keys bool}` |
+| `collection-transformer` | Coerce between collection kinds (sequential↔set↔vector) |
+
+```clojure
+(b/decode [:map [:x :int]] {:x 1 :junk 2} (bt/strip-extra-keys-transformer))
+;; => {:x 1}
+
+(b/decode [:map [:x {:default 7} :int]] {} (bt/default-value-transformer))
+;; => {:x 7}
+
+(b/decode [:map [:x :int]] {"x" 1} (bt/key-transformer {:decode keyword}))
+;; => {:x 1}
+
+(b/decode [:set :int] [1 1 2] (bt/collection-transformer))
+;; => #{1 2}
+```
+
+Schemas can override a transformer per node with `:decode/<name>` / `:encode/<name>` properties (real fns, or `{:enter f :leave g}` maps):
+
+```clojure
+(b/decode [:string {:decode/string (fn [s] (.upper s))}]
+          "kikka" (bt/string-transformer))
+;; => "KIKKA"
+```
+
+Transformers compose with `bt/transformer` — decode runs the chain in order, encode in reverse:
+
+```clojure
+(b/decode [:map [:x :int]] {:x "1" :junk 2}
+          (bt/transformer (bt/strip-extra-keys-transformer)
+                          (bt/string-transformer)))
+;; => {:x 1}
+```
+
+`decoder`/`encoder`/`coercer` return the compiled 1-arg fns (cached per schema + transformer identity) when you transform many values.
+
+## Schema utilities
+
+`balli.util` is the `malli.util` port: form→form functions over `:map` schemas (they accept forms or schema objects and return forms):
+
+```clojure
+(require '[balli.util :as u])
+
+(u/merge [:map [:x :int]] [:map [:x :string] [:y :int]])
+;; => [:map [:x :string] [:y :int]]     (last-one-wins, entry order preserved)
+
+(u/union [:map [:x :int]] [:map [:x :string]])
+;; => [:map [:x [:or :int :string]]]
+
+(u/select-keys [:map [:x :int] [:y :string]] [:x])   ;; => [:map [:x :int]]
+(u/dissoc [:map [:x :int] [:y :string]] :y)          ;; => [:map [:x :int]]
+(u/optional-keys [:map [:x :int] [:y :string]] [:y])
+;; => [:map [:x :int] [:y {:optional true} :string]]
+
+(u/closed-schema [:map [:a [:map [:b :int]]]])
+;; => [:map {:closed true} [:a [:map {:closed true} [:b :int]]]]
+
+(u/get-in [:map [:a [:map [:b :int]]]] [:a :b])
+;; => :int
+```
+
+Also: `required-keys`, `open-schema`, `get`. `u/get`/`get-in` address `:map`/`:multi`/`:orn`/`:catn`/`:altn` children by entry key and all indexed types (`:and`/`:or`/`:tuple`/colls/seqex/...) by integer index.
+
+`balli.core/walk` is a form-level postwalk — at every node, children first, the rebuilt form and its path are passed to your fn, whose return value replaces the node:
+
+```clojure
+(let [acc (atom [])]
+  (b/walk [:map [:x [:vector :int]]]
+          (fn [form path] (swap! acc conj [path form]) form))
+  @acc)
+;; => [[[:x 0] :int] [[:x] [:vector :int]] [[] [:map [:x [:vector :int]]]]]
+```
+
+`(b/walk s (b/schema-walker f))` adapts a 1-arg form fn, mirroring Malli's `(m/walk s (m/schema-walker f))`. Refs are not entered (the ref node is a leaf).
+
+## JSON Schema export
+
+`balli.json-schema/transform` exports any schema as a JSON Schema (draft 2020-12 style, string-keyed Basilisp map — `basilisp.json/write-str` takes it as-is):
+
+```clojure
+(require '[balli.json-schema :as bjs])
+
+(bjs/transform [:map [:id :string] [:age {:optional true} [:int {:min 0}]]])
+;; => {"type" "object"
+;;     "properties" {"id" {"type" "string"}
+;;                   "age" {"type" "integer" "minimum" 0}}
+;;     "required" ["id"]}
+
+(bjs/transform [:tuple :string :int])
+;; => {"type" "array" "prefixItems" [{"type" "string"} {"type" "integer"}] "items" false}
+```
+
+Refs become `$ref` pointers with a top-level `"definitions"` map (recursion terminates); ref names are JSON-Pointer-escaped in the `$ref` string but unescaped as definitions keys:
+
+```clojure
+(bjs/transform [:ref :tree/node] {:registry tree-registry})
+;; => {"$ref" "#/definitions/tree~1node"
+;;     "definitions" {"tree/node" {"type" "object"
+;;                                 "properties" {"value" {"type" "integer"}
+;;                                               "children" {"type" "array"
+;;                                                           "items" {"$ref" "#/definitions/tree~1node"}}}
+;;                                 "required" ["value" "children"]}}}
+```
+
+`:title`/`:description`/`:default` properties pass through; a `:json-schema` property replaces the generated node wholesale and `:json-schema/foo` properties unlift into it (winning over generated keys). Sequence schemas export as a lossy `{"type" "array"}` best-effort.
+
+## Humanized errors and spell-checking
+
+`balli.error/humanize` renders explain data into messages mirroring the value shape (see Quick start). `with-spell-checking` rewrites explain errors before humanizing: an extra key within edit distance of an absent declared key becomes `:balli.error/misspelled-key` (and the corresponding missing-key error is dropped); an unknown `:multi` dispatch value near a declared one becomes `:balli.error/misspelled-value`:
+
+```clojure
+(-> (b/explain [:map {:closed true} [:name :string]] {:nam "x"})
+    be/with-spell-checking
+    be/humanize)
+;; => {:nam ["should be spelled :name"]}
+```
+
+`be/levenshtein` (the underlying edit distance) is public too: `(be/levenshtein "nam" "name")` → `1`.
+
+## Parsing
+
+`parse` destructures a value against a schema; `unparse` is the exact inverse. Both return the sentinel `:balli.core/invalid` on mismatch (test with `b/invalid?`, never `identical?`). Non-transforming schemas parse as validate-then-value; named branches produce records:
+
+- `:orn`/`:multi`/`:altn` → a `Tag` record `{:key branch-key :value parsed}` (`b/tag`, `b/tag?`)
+- `:catn` → a `Tags` record `{:values {tag parsed ...}}` (`b/tags`, `b/tags?`)
+
+```clojure
+(b/parse [:catn [:n :int] [:s :string]] [1 "x"])
+;; => #balli.compile.Tags{:values {:n 1 :s "x"}}
+
+(b/unparse [:catn [:n :int] [:s :string]]
+           (b/parse [:catn [:n :int] [:s :string]] [1 "x"]))
+;; => [1 "x"]
+
+(b/unparse [:orn [:num :int] [:str :string]] (b/tag :num 42))
+;; => 42
+```
+
+`Tag`/`Tags` are records — user data that merely looks like `{:key ... :value ...}` is not confused with them by the `:map` parser guard. `parser`/`unparser` return the compiled (cached) 1-arg fns.
+
+## Sequence schemas
+
+`:cat`/`:catn`/`:alt`/`:altn`/`:?`/`:*`/`:+`/`:repeat` describe *sequences* and are compiled to an iterative backtracking regex engine (no Python recursion on input length, memoized against pathological backtracking):
+
+```clojure
+(b/validate [:cat [:* :int] :int] [1 2 3])          ;; => true (backtracks)
+(b/validate [:map [:args [:cat :keyword [:* :int]]]]
+            {:args [:add 1 2]})                     ;; => true (seqex nested in a map)
+```
+
+Seqex children of seqex **splice** — `[:* [:cat :int :string]]` matches a flat `[1 "a" 2 "b"]` — while parse output nests per combinator:
+
+```clojure
+(b/parse [:* [:cat :int :string]] [1 "a" 2 "b"])
+;; => [[1 "a"] [2 "b"]]
+```
+
+Wrap a seqex in `[:schema ...]` to escape splicing and match one nested sequence element instead:
+
+```clojure
+(b/validate [:cat :int [:schema [:cat :int :string]]] [1 [2 "a"]])
+;; => true
+```
+
+Explain reports the furthest failure position with dedicated error types:
+
+```clojure
+(:type (first (:errors (b/explain [:cat :int] []))))     ;; => :balli.core/end-of-input
+(:type (first (:errors (b/explain [:cat :int] [1 2]))))  ;; => :balli.core/input-remaining
+```
+
+A `:ref` directly in seqex child position throws `:balli.core/potentially-recursive-seqex` at compile time (unbounded recursion cannot be compiled); wrap the ref in `[:schema [:ref ...]]` for one nested element.
+
+## Function schemas
+
+`[:=> input-seqex output-schema guard?]` describes a function; `:function` groups `:=>` children with distinct arities. Plain `validate` only checks callability:
+
+```clojure
+(b/validate [:=> [:cat :int] :int] inc)   ;; => true
+(b/validate [:=> [:cat :int] :int] 5)     ;; => false
+```
+
+Pass a **function checker** to validate generatively (100 generated input vectors, outputs validated):
+
+```clojure
+(require '[balli.generator :as bg])
+
+(b/validate [:=> [:cat :int] :int] str
+            {:balli.core/function-checker (bg/function-checker)})
+;; => false   (str returns strings, not ints)
+```
+
+The checker opt is honored on raw forms (bypassing the raw-form cache) and can be baked into a schema object at construction — call-time opts on an existing schema object are ignored.
+
+`instrument` wraps a fn with per-call arity/input/output/guard validation, throwing typed `ex-info` (`:balli.core/invalid-arity` / `invalid-input` / `invalid-output` / `invalid-guard`) or routing failures to your `:report` fn:
+
+```clojure
+(try ((b/instrument {:schema [:=> [:cat :int] :int]} inc) "x")
+     (catch python/Exception e (:type (ex-data e))))
+;; => :balli.core/invalid-input
+```
+
+`function-info` extracts arity/shape data:
+
+```clojure
+(b/function-info (b/schema [:=> [:cat :int :int] :int]))
+;; => {:min 2 :max 2 :arity 2 :input [:cat :int :int] :output :int}
+```
+
+A `:=>` whose input does not normalize to `:cat`/`:catn` throws `:balli.core/invalid-input-schema`. Generating from a `:=>` yields a constant-ish function producing valid outputs.
+
+## Generators
+
+`balli.generator` generates schema-satisfying values with pure `random.Random` — equal seeds give equal values:
+
+```clojure
+(bg/generate [:int {:min 0 :max 100}] {:seed 1})       ;; deterministic
+(bg/sample [:int {:min 0 :max 100}] {:seed 1 :size 5}) ;; => [17 72 97 8 32]
+
+(= (bg/generate [:map [:a :int] [:b [:vector :string]]] {:seed 42})
+   (bg/generate [:map [:a :int] [:b [:vector :string]]] {:seed 42}))
+;; => true
+```
+
+`:size` (default 30) scales magnitudes and collection lengths. Seqex schemas generate flat sequences (`(bg/generate [:cat :int [:* :string]] {:seed 3})` validates against its own schema). Recursive refs are depth-capped and escape through `:maybe`/optional keys/zero-min collections, else throw `:balli.core/unsatisfiable-schema` (as does `:and`/`:not` filtering after 100 retries).
+
+`:re` and `:fn` schemas have no generator — they throw `:balli.core/no-generator` unless you supply `:gen/*` property hooks:
+
+```clojure
+(try (bg/generate [:re #"\d+"])
+     (catch python/Exception e (:type (ex-data e))))
+;; => :balli.core/no-generator
+
+(bg/generate [:re {:gen/elements ["a1" "b2"]} #"[ab]\d"] {:seed 3})
+;; => "a1"
+
+(bg/generate [:int {:gen/fmap str}] {:seed 0})
+;; => "829"
+```
+
+Hooks (highest priority first): `:gen/return` (constant), `:gen/elements` (uniform pick), `:gen/schema` (generate an alternate schema), `:gen/fmap` (post-map with a real fn), `:gen/min`/`:gen/max` (bound overrides).
+
+## Schema inference
+
+`balli.provider/provide` infers a schema form from sample values — every sample validates against the result:
+
+```clojure
+(bp/provide [{:x 1} {:x 2 :y "a"}])
+;; => [:map [:x :int] [:y {:optional true} :string]]
+
+(bp/provide [1 2 nil])
+;; => [:maybe :int]
+
+(bp/provide [{"a" 1 "b" 2} {"c" 3} {"d" 4 "e" 5}])
+;; => [:map-of :string :int]
+```
+
+Maps with many distinct keys but uniform key/value shapes become `[:map-of k v]` (tune with `{:map-of-threshold n}`, default 3); mixed scalars become `[:or ...]`; nil-mixed become `[:maybe ...]`.
 
 ## API
 
-All functions live in `balli.core` unless noted. `s` is a raw schema form or a schema object; `opts` supports `{:registry r}` and is ignored when `s` is already a schema object (its baked-in registry wins).
+`s` is a raw schema form or a schema object; `opts` supports `{:registry r}` and is ignored when `s` is already a schema object (its baked-in registry — and baked-in checker — win). Compiled fns are cached on schema objects, or in a bounded global cache for raw forms.
+
+### `balli.core`
 
 | Function | Signature | Description |
 |---|---|---|
-| `schema` | `(schema form)` `(schema form opts)` | Wrap a form into a schema object (normalized AST + registry + compile cache). Idempotent on schema objects. |
+| `schema` | `(schema form)` `(schema form opts)` | Wrap a form into a schema object (normalized AST + registry + compile cache). Idempotent on schema objects. `opts` may carry `:balli.core/function-checker`. |
 | `schema?` | `(schema? x)` | True when `x` is a balli schema object. |
 | `form` | `(form s)` | The original schema form. |
 | `properties` | `(properties s)` | Properties map of the root node, e.g. `{:closed true}`. |
 | `children` | `(children s)` | AST children of the root node. |
-| `validator` | `(validator s)` `(validator s opts)` | Compiled 1-arg boolean validator. Cached on the schema object, or in a bounded global cache for raw forms. |
-| `validate` | `(validate s value)` `(validate s value opts)` | Boolean. |
-| `explainer` | `(explainer s)` `(explainer s opts)` | Compiled 1-arg explainer: nil on success, else `{:schema :value :errors}`. Cached like `validator`. |
-| `explain` | `(explain s value)` `(explain s value opts)` | nil when valid, else the explain map. Each error is `{:path :in :schema :value :type}` where `:path` indexes into the schema form and `:in` into the value. |
-| `assert-valid` | `(assert-valid s value)` `(assert-valid s value opts)` | Returns `value`, or throws `ex-info` with the explain map plus `{:type :balli.core/invalid-input}`. |
-| `balli.error/humanize` | `(humanize explain-map)` | Human-readable messages mirroring the value shape; nil in, nil out. |
-| `balli.registry/registry` | `(registry & schema-maps)` | Layer `{qualified-kw schema-form}` maps over the default registry. |
-| `balli.registry/default-registry` | `(default-registry)` | Builtin types, no custom schemas. |
-| `balli.registry/resolve-ref` | `(resolve-ref reg k)` | Registered schema form for `k`, or nil. |
-| `balli.registry/builtin-types` | var | The set of 27 builtin type keywords. |
+| `validator` / `validate` | `(validator s opts?)` / `(validate s value opts?)` | Compiled 1-arg boolean validator / one-shot boolean. |
+| `explainer` / `explain` | `(explainer s opts?)` / `(explain s value opts?)` | nil when valid, else `{:schema :value :errors}`; each error is `{:path :in :schema :value :type}`. |
+| `assert-valid` | `(assert-valid s value opts?)` | Returns `value`, or throws `ex-info` with the explain map plus `{:type :balli.core/invalid-input}`. |
+| `decoder` / `decode` | `(decoder s t opts?)` / `(decode s value t opts?)` | Transform toward the schema with transformer `t`; lenient (mismatches pass through). |
+| `encoder` / `encode` | `(encoder s t opts?)` / `(encode s value t opts?)` | Transform away from the schema; lenient. |
+| `coercer` / `coerce` | `(coercer s t opts?)` / `(coerce s value t opts?)` | Decode then validate; returns the decoded value or throws `:balli.core/coercion`. |
+| `parser` / `parse` | `(parser s opts?)` / `(parse s value opts?)` | Value → parsed value or `:balli.core/invalid`; `Tag`/`Tags` for named branches. |
+| `unparser` / `unparse` | `(unparser s opts?)` / `(unparse s value opts?)` | Exact inverse of `parse`; same sentinel. |
+| `tag` / `tag?` | `(tag k v)` / `(tag? x)` | Construct/detect the `Tag` parse container (`:orn`/`:multi`/`:altn`). |
+| `tags` / `tags?` | `(tags m)` / `(tags? x)` | Construct/detect the `Tags` parse container (`:catn`). |
+| `invalid?` | `(invalid? x)` | True when `x` is the parse failure sentinel (`=`-compared). |
+| `walk` | `(walk s f opts?)` | Form-level postwalk; `f` is `(fn [rebuilt-form path] form')`. |
+| `schema-walker` | `(schema-walker f)` | Adapt a 1-arg form fn for `walk`. |
+| `function-info` | `(function-info s opts?)` | `{:min :max? :arity :input :output :guard?}` for a `:=>` schema; nil otherwise. |
+| `instrument` | `(instrument props f)` | Wrap `f` per `{:schema s :scope #{:input :output} :report rf}` — typed failures per call. |
+| `version` | var | The library version string. |
 
-Unknown schema forms throw `ex-info` with `:type :balli.core/invalid-schema`; a `:ref` to an unregistered keyword throws `:balli.core/unresolved-ref` at compile time (fail fast, not at validate).
+### `balli.transform`
+
+| Function | Description |
+|---|---|
+| `transformer` | Compose chain-link maps / transformers / 0-arg fns into one transformer (decode in chain order, encode reversed). |
+| `transformer?` / `into-transformer` | Predicate / coercion into a transformer object. |
+| `string-transformer` `json-transformer` `strip-extra-keys-transformer` `key-transformer` `default-value-transformer` `collection-transformer` | The built-ins (see [Transformers](#transformers)). |
+
+### `balli.util`
+
+| Function | Description |
+|---|---|
+| `merge` / `union` | Combine two `:map` forms — last-wins / `[:or]`-combining. |
+| `select-keys` / `dissoc` | Keep / remove `:map` entries. |
+| `optional-keys` / `required-keys` | Set / clear `:optional` on entries (all, or a key seq). |
+| `closed-schema` / `open-schema` | Recursively add / remove `{:closed true}` (explicit `{:closed false}` is respected). |
+| `get` / `get-in` | Sub-schema form by entry key or child index; nil when absent. |
+
+### Other namespaces
+
+| Function | Description |
+|---|---|
+| `balli.json-schema/transform` | `(transform s opts?)` — JSON Schema as a string-keyed map, `"definitions"` when refs are reached. |
+| `balli.error/humanize` | `(humanize explain-map)` — messages mirroring the value shape; nil in, nil out. |
+| `balli.error/with-spell-checking` | `(with-spell-checking explain-map)` — rewrite extra-key/dispatch errors as misspellings. |
+| `balli.error/levenshtein` | `(levenshtein a b)` — edit distance. |
+| `balli.generator/generate` | `(generate s opts?)` — one value; `{:seed :size :registry}`. |
+| `balli.generator/sample` | `(sample s opts?)` — vector of values; `:size` is the count (default 10). |
+| `balli.generator/function-checker` | `(function-checker opts?)` — generative `:=>`/`:function` checker; `{:iterations n}` (default 100). |
+| `balli.provider/provide` | `(provide samples opts?)` — infer a schema form; `{:map-of-threshold n}`. |
+| `balli.registry/registry` | `(registry & schema-maps)` — layer `{qualified-kw form}` maps over the default registry. |
+| `balli.registry/default-registry` | Builtin types, no custom schemas. |
+| `balli.registry/resolve-ref` | `(resolve-ref reg k)` — registered form or nil. |
+| `balli.registry/builtin-types` | var — the set of 39 builtin type keywords. |
+
+Unknown or malformed schema forms throw `ex-info` with `:type :balli.core/invalid-schema`; a `:ref` to an unregistered keyword throws `:balli.core/unresolved-ref` at compile time (fail fast, not at validate).
 
 ## Differences from Malli
 
-Balli is an honest **subset** of Malli — the core validate/explain/humanize/registry workflow — not a port:
+Balli covers most of Malli's core surface but is Malli-**inspired**, not a port. Not implemented:
 
-- **No transformers** — no `decode`/`encode`/coercion.
-- **No generators** — no `mg/generate`, no test.check integration.
-- **No JSON Schema export** (or Swagger, or schema inference).
-- **No sequence schemas** (`:cat`/`:alt`/`:*`/`:+`/`:?`/`:repeat`) and **no function schemas** (`:=>`, instrumentation).
-- **Basilisp data only** — validators check Basilisp data structures (maps, vectors, sets, ...). Python `dict`/`list` values are *not* accepted; convert at the interop boundary first.
+- **No sexpr/serialized property code** — schema properties take real Basilisp fns (`:fn` children, `:dispatch`, `:gen/fmap`, `:decode/*` overrides, ...); there is no sci and no evaluation of quoted code.
+- **No `:andn`** and **no old (pre-0.18) parse format** shim.
+- **No test.check shrinking** — generators produce single values; failures are not minimized.
+- **`:re`/`:fn` generation requires `:gen/*` props** — otherwise `:balli.core/no-generator` is thrown (Malli dynaloads test.chuck for regex generation).
+- **No `malli.dev`, `malli.experimental`, OpenAPI/Swagger, DOT, or clj-kondo modules.**
+
+Behavioral deviations:
+
+- **Basilisp data only** — validators check Basilisp data structures. Python `dict`/`list` values are *not* accepted; convert at the interop boundary first.
+- **`walk` is form-level** — `f` is `(fn [rebuilt-form path] form')` over forms, not Malli's 4-arg walker over schema objects; `schema-walker` keeps the familiar call shape. Refs are not entered.
+- **Schema-object opts are baked** — call-time opts (registry, `:balli.core/function-checker`) are ignored when the schema argument is already a schema object; bake them at `(b/schema form opts)`. Raw-form calls carrying a checker bypass the global raw-form cache.
+- **`instrument` always arity-checks** — the argument-count check against the input seqex bounds runs on every call regardless of `:scope`.
+- **`:multi` keyword dispatch uses `get`** — a keyword `:dispatch` is looked up with `(get value k)` (nil on non-associative values → `:balli.core/invalid-dispatch-value`); it is not invoked as an arbitrary ifn. Fn dispatch must be Python-callable.
+- **Provider never tuple-izes** — same-arity vector samples infer `[:vector x]`, never `:tuple`; and mixed int/float samples infer `[:or :int :double]` (Basilisp `float?` rejects ints, so no single scalar type covers both). No `:enum` inference.
+- **`:?` unparse is stricter** — the child unparser is tried first; only a nil the child rejects unparses to `[]`, and shape mismatches return `:balli.core/invalid` rather than best-effort output.
+- **JSON Schema ref names are JSON-Pointer-escaped** in `$ref` strings (`:tree/node` → `"#/definitions/tree~1node"`) with unescaped `"definitions"` keys; seqex types export as lossy `{"type" "array"}`.
 - **Set element `:in`** uses the element's seq-order ordinal (sets are unordered; the index identifies which element in seq order failed, not a stable position).
 - **Mixed-level humanize uses `:balli/error`** — when a value has errors of its own *and* nested child errors (e.g. `[:vector {:min 3} :int]` on `[1 "x"]`), `humanize` renders that level as a map with child entries plus the level's own messages under the reserved `:balli/error` key: `{1 ["should be an integer"] :balli/error ["should have at least 3 elements"]}`.
 

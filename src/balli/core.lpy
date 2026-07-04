@@ -13,7 +13,7 @@
             [balli.registry :as reg]
             [balli.transform :as bt]))
 
-(def version "0.1.0")
+(def version "0.2.0")
 
 (defn schema?
   "True when `x` is a balli schema object."
