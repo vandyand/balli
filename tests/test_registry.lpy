@@ -1,0 +1,186 @@
+(ns tests.test-registry
+  "Phase 5: custom registries, :ref resolution, recursion, and caching.
+
+  Covers: custom scalar refs (bare keyword + [:ref kw]), refs nested inside
+  composite schemas, self-recursive and mutually-recursive schemas, unresolved
+  refs failing fast at compile time for both validate and explain, explain
+  :in/:path through refs, registry layering over builtins, and raw-form cache
+  behavior ([form registry-id] identity-token keying)."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.registry :as reg]))
+
+;; ---------------------------------------------------------------------------
+;; Custom scalar refs
+
+(deftest custom-scalar-ref
+  (let [r (reg/registry {:user/id [:string {:min 1}]})]
+    (testing "[:ref kw] form"
+      (is (true? (b/validate [:ref :user/id] "abc" {:registry r})))
+      (is (false? (b/validate [:ref :user/id] "" {:registry r})))
+      (is (false? (b/validate [:ref :user/id] 42 {:registry r}))))
+    (testing "bare registered qualified keyword"
+      (is (true? (b/validate :user/id "abc" {:registry r})))
+      (is (false? (b/validate :user/id "" {:registry r}))))))
+
+;; ---------------------------------------------------------------------------
+;; Nested refs: ref inside map inside vector
+
+(deftest nested-ref
+  (let [r (reg/registry {:user/id [:string {:min 1}]
+                         :user/address [:map
+                                        [:street :string]
+                                        [:zip :user/id]]})
+        form [:vector [:map [:id [:ref :user/id]] [:address :user/address]]]]
+    (is (true? (b/validate form
+                           [{:id "u1" :address {:street "Main" :zip "49004"}}]
+                           {:registry r})))
+    (is (false? (b/validate form
+                            [{:id "u1" :address {:street "Main" :zip ""}}]
+                            {:registry r})))
+    (testing "explain keeps :in through nested refs"
+      (let [ex (b/explain form
+                          [{:id "" :address {:street "Main" :zip "49004"}}]
+                          {:registry r})]
+        (is (= [[0 :id]] (mapv :in (:errors ex))))
+        (is (= [:balli.core/limits] (mapv :type (:errors ex))))))))
+
+;; ---------------------------------------------------------------------------
+;; Recursive schemas
+
+(def tree-registry
+  (reg/registry {:tree/node [:maybe [:map [:children [:vector [:ref :tree/node]]]]]}))
+
+(deftest recursive-tree-valid
+  (testing "nil (maybe) root"
+    (is (true? (b/validate [:ref :tree/node] nil {:registry tree-registry}))))
+  (testing "single node, empty children"
+    (is (true? (b/validate [:ref :tree/node] {:children []} {:registry tree-registry}))))
+  (testing "2-level tree"
+    (is (true? (b/validate [:ref :tree/node]
+                           {:children [{:children []}]}
+                           {:registry tree-registry}))))
+  (testing "3-level tree"
+    (is (true? (b/validate [:ref :tree/node]
+                           {:children [{:children [{:children []}]}
+                                       {:children []}]}
+                           {:registry tree-registry})))))
+
+(deftest recursive-tree-invalid
+  (is (false? (b/validate [:ref :tree/node]
+                          {:children [{:children [42]}]}
+                          {:registry tree-registry})))
+  (testing "explain pinpoints the deep bad leaf with correct :in"
+    (let [ex (b/explain [:ref :tree/node]
+                        {:children [{:children [42]}]}
+                        {:registry tree-registry})]
+      (is (= [:ref :tree/node] (:schema ex)))
+      (is (= 1 (count (:errors ex))))
+      (let [e (first (:errors ex))]
+        (is (= [:children 0 :children 0] (:in e)))
+        (is (= 42 (:value e)))
+        (is (= :balli.core/invalid-type (:type e)))
+        (is (= [:map [:children [:vector [:ref :tree/node]]]] (:schema e)))
+        ;; :path descends maybe(0) map(:children) vector(0) per ref hop;
+        ;; refs themselves are transparent in :path
+        (is (= [0 :children 0 0 :children 0 0] (:path e))))))
+  (testing "explain nil on a valid deep tree"
+    (is (nil? (b/explain [:ref :tree/node]
+                         {:children [{:children [{:children []}]}]}
+                         {:registry tree-registry})))))
+
+;; ---------------------------------------------------------------------------
+;; Mutual recursion
+
+(deftest mutually-recursive-schemas
+  (let [r (reg/registry {:ping/node [:map [:pong {:optional true} [:ref :pong/node]]]
+                         :pong/node [:map [:ping {:optional true} [:ref :ping/node]]]})]
+    (is (true? (b/validate [:ref :ping/node] {} {:registry r})))
+    (is (true? (b/validate [:ref :ping/node]
+                           {:pong {:ping {:pong {}}}}
+                           {:registry r})))
+    (is (false? (b/validate [:ref :ping/node]
+                            {:pong {:ping {:pong 5}}}
+                            {:registry r})))
+    (testing "explain :in through alternating refs"
+      (let [ex (b/explain [:ref :ping/node]
+                          {:pong {:ping {:pong 5}}}
+                          {:registry r})]
+        (is (= [[:pong :ping :pong]] (mapv :in (:errors ex))))
+        (is (= [:balli.core/invalid-type] (mapv :type (:errors ex))))))))
+
+;; ---------------------------------------------------------------------------
+;; Unresolved refs fail fast at compile time
+
+(deftest unresolved-ref-throws
+  (testing "validate"
+    (is (= :balli.core/unresolved-ref
+           (try (b/validate [:ref :nope] 1)
+                (catch python/Exception e (:type (ex-data e))))))
+    (is (= :nope
+           (try (b/validate [:ref :nope] 1)
+                (catch python/Exception e (:ref (ex-data e)))))))
+  (testing "explain"
+    (is (= :balli.core/unresolved-ref
+           (try (b/explain [:ref :nope] 1)
+                (catch python/Exception e (:type (ex-data e)))))))
+  (testing "nested unresolved ref also throws at compile time"
+    (is (= :balli.core/unresolved-ref
+           (try (b/validate [:map [:x [:ref :still/nope]]] {:x 1})
+                (catch python/Exception e (:type (ex-data e))))))))
+
+;; ---------------------------------------------------------------------------
+;; Registry layering: customs over builtins
+
+(deftest registry-layering
+  (let [r (reg/registry {:user/id [:string {:min 1}]}
+                        {:user/age [:int {:min 0}]})]
+    (testing "variadic maps all merge over defaults"
+      (is (true? (b/validate :user/id "x" {:registry r})))
+      (is (true? (b/validate :user/age 30 {:registry r})))
+      (is (false? (b/validate :user/age -1 {:registry r}))))
+    (testing "builtins still work under a custom registry"
+      (is (true? (b/validate [:map [:id :user/id] [:tags [:vector :keyword]]]
+                             {:id "u1" :tags [:a :b]}
+                             {:registry r})))
+      (is (true? (b/validate :string "plain" {:registry r}))))
+    (testing "schema objects bake in the registry"
+      (let [s (b/schema [:vector :user/id] {:registry r})]
+        (is (true? (b/validate s ["a" "b"])))
+        (is (false? (b/validate s ["a" ""])))))))
+
+;; ---------------------------------------------------------------------------
+;; Caching behavior
+
+(deftest raw-form-caching
+  (testing "default registry: same raw form → identical compiled fn"
+    (is (identical? (b/validator [:vector [:map [:cache-test/x :int]]])
+                    (b/validator [:vector [:map [:cache-test/x :int]]])))
+    (is (identical? (b/explainer [:vector [:map [:cache-test/x :int]]])
+                    (b/explainer [:vector [:map [:cache-test/x :int]]]))))
+  (testing "same form + same registry object → identical compiled fn"
+    (let [r (reg/registry {:user/id [:string {:min 1}]})]
+      (is (identical? (b/validator [:ref :user/id] {:registry r})
+                      (b/validator [:ref :user/id] {:registry r})))
+      (is (identical? (b/explainer [:ref :user/id] {:registry r})
+                      (b/explainer [:ref :user/id] {:registry r})))))
+  (testing "same form + different (even value-equal) registry object → different fn"
+    (let [r1 (reg/registry {:user/id [:string {:min 1}]})
+          r2 (reg/registry {:user/id [:string {:min 1}]})]
+      (is (= r1 r2))
+      (is (not (identical? (b/validator [:ref :user/id] {:registry r1})
+                           (b/validator [:ref :user/id] {:registry r2}))))))
+  (testing "schema objects cache on their own :cache atom"
+    (let [s (b/schema [:vector :int])]
+      (is (identical? (b/validator s) (b/validator s)))
+      (is (identical? (b/explainer s) (b/explainer s))))))
+
+(deftest nested-unresolved-ref-fails-at-compile-time
+  (testing "a ref nested inside a registered target fails fast at compile"
+    (let [r (reg/registry {:outer [:map [:x [:ref :missing]]]})]
+      (is (= :balli.core/unresolved-ref
+             (try (b/validator [:ref :outer] {:registry r})
+                  (catch python/Exception e (:type (ex-data e))))))
+      (is (= :balli.core/unresolved-ref
+             (try (b/explainer [:ref :outer] {:registry r})
+                  (catch python/Exception e (:type (ex-data e)))))))))

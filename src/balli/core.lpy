@@ -1,0 +1,183 @@
+(ns balli.core
+  "Public API for balli - Malli-inspired data-driven schemas for Basilisp.
+
+  Schemas are plain data (Malli vector syntax). `schema` wraps a form into a
+  schema object {:balli/schema true :form ... :ast ... :registry ... :cache
+  (atom {})}; `validator`/`validate` accept either a raw form or a schema
+  object. Compiled validators/explainers are cached: on the schema object's
+  :cache atom, or (for raw forms) in a bounded global cache keyed by
+  [form registry-id], where registry-id is an identity token assigned per
+  registry map (default registry = token 0)."
+  (:require [balli.compile :as c]
+            [balli.normalize :as norm]
+            [balli.registry :as reg]))
+
+(def version "0.1.0")
+
+(defn schema?
+  "True when `x` is a balli schema object."
+  [x]
+  (boolean (and (map? x) (:balli/schema x))))
+
+(defn schema
+  "Wrap schema `form` into a schema object. `opts` supports {:registry r};
+  defaults to the builtin registry. Passing an existing schema object returns
+  it unchanged (its baked-in registry wins)."
+  ([form] (schema form {}))
+  ([form opts]
+   (if (schema? form)
+     form
+     (let [registry (or (:registry opts) (reg/default-registry))]
+       {:balli/schema true
+        :form form
+        :ast (norm/normalize form {:registry registry})
+        :registry registry
+        :cache (atom {})}))))
+
+(defn form
+  "The original schema form of `s` (raw form or schema object)."
+  [s]
+  (:form (schema s)))
+
+(defn properties
+  "The properties map of the root of `s` (raw form or schema object)."
+  [s]
+  (:properties (:ast (schema s))))
+
+(defn children
+  "The AST children of the root of `s` (raw form or schema object)."
+  [s]
+  (:children (:ast (schema s))))
+
+;; ---------------------------------------------------------------------------
+;; Raw-form compilation cache
+;;
+;; Raw forms (not schema objects) compile through a bounded global cache keyed
+;; by [form registry-id]. registry-id is an *identity* token: each distinct
+;; registry map object gets a monotonically increasing integer the first time
+;; it is seen, matched with `identical?` (never value equality — registries
+;; may be large and callers who rebuild an equal registry simply pay one
+;; recompile). The default registry (no :registry in opts) is the constant
+;; token 0, so plain `(b/validate [:vector :int] v)` calls always share cache
+;; entries. Simplest-correct trade-off: the token table holds strong
+;; references to registries, which is fine for the expected pattern of a few
+;; long-lived registries (Malli-style def-once usage).
+
+(def ^:private registry-tokens
+  "Identity-token table: {:next-id 1 :entries [[registry id] ...]}."
+  (atom {:next-id 1 :entries []}))
+
+(defn- registry-id
+  "Identity token for registry map `r`; nil (default registry) → 0. Assigns a
+  fresh monotonic id the first time a given registry object is seen."
+  [r]
+  (if (nil? r)
+    0
+    (letfn [(lookup [entries]
+              (some (fn [[reg id]] (when (identical? reg r) id)) entries))]
+      (or (lookup (:entries @registry-tokens))
+          (lookup (:entries (swap! registry-tokens
+                                   (fn [{:keys [next-id entries] :as state}]
+                                     (if (lookup entries)
+                                       state
+                                       {:next-id (inc next-id)
+                                        :entries (conj entries [r next-id])})))))))))
+
+(def ^:private raw-cache-limit
+  "Max entries in the raw-form cache. On overflow the whole cache is cleared
+  (evict-all — simplest correct bound; a miss after eviction just recompiles)."
+  1024)
+
+(def ^:private raw-cache
+  "Bounded global cache of compiled fns for raw forms:
+  {[form registry-id] {:validator f :explainer g}}."
+  (atom {}))
+
+(defn- raw-cache-put!
+  "Store compiled fn `f` under cache key `k` (a [form registry-id] pair) and
+  slot (:validator or :explainer), evicting everything first when the cache is
+  full and `k` is a brand-new key. Returns `f`."
+  [k slot f]
+  (swap! raw-cache
+         (fn [c]
+           (let [c (if (and (>= (count c) raw-cache-limit)
+                            (not (contains? c k)))
+                     {}
+                     c)]
+             (assoc-in c [k slot] f))))
+  f)
+
+(defn- compile-validator!
+  "Compile a validator for schema object `s`, caching it under :validator in
+  the schema's :cache atom."
+  [s]
+  (let [f (c/compile-validator (:ast s) (:registry s))]
+    (swap! (:cache s) assoc :validator f)
+    f))
+
+(defn- compile-explainer!
+  "Compile an explainer for schema object `s` — a 1-arg fn returning nil on
+  success or {:schema <original form> :value <input> :errors [...]} — caching
+  it under :explainer in the schema's :cache atom."
+  [s]
+  (let [ef (c/compile-explainer (:ast s) (:registry s))
+        root-form (:form s)
+        f (fn [value]
+            (let [errors (ef value [] [])]
+              (when (seq errors)
+                {:schema root-form :value value :errors errors})))]
+    (swap! (:cache s) assoc :explainer f)
+    f))
+
+(defn validator
+  "Compiled 1-arg boolean validator for `s` (raw form or schema object).
+  `opts` supports {:registry r} and is ignored when `s` is already a schema
+  object."
+  ([s] (validator s {}))
+  ([s opts]
+   (if (schema? s)
+     (or (:validator @(:cache s))
+         (compile-validator! s))
+     ;; raw form: bounded global cache keyed by [form registry-id]
+     (let [k [s (registry-id (:registry opts))]]
+       (or (get-in @raw-cache [k :validator])
+           (raw-cache-put! k :validator (validator (schema s opts))))))))
+
+(defn explainer
+  "Compiled 1-arg explainer for `s` (raw form or schema object): returns nil
+  on success, else {:schema <original form> :value <input> :errors [...]}
+  where each error is {:path :in :schema <form fragment> :value :type}.
+  `opts` supports {:registry r} and is ignored when `s` is already a schema
+  object. Cached like `validator`."
+  ([s] (explainer s {}))
+  ([s opts]
+   (if (schema? s)
+     (or (:explainer @(:cache s))
+         (compile-explainer! s))
+     ;; raw form: bounded global cache keyed by [form registry-id]
+     (let [k [s (registry-id (:registry opts))]]
+       (or (get-in @raw-cache [k :explainer])
+           (raw-cache-put! k :explainer (explainer (schema s opts))))))))
+
+(defn validate
+  "Validate `value` against `s` (raw form or schema object). Returns boolean.
+  `opts` supports {:registry r} and is ignored when `s` is a schema object."
+  ([s value] ((validator s) value))
+  ([s value opts] ((validator s opts) value)))
+
+(defn explain
+  "Explain why `value` fails `s` (raw form or schema object). Returns nil when
+  valid, else {:schema <original form> :value <input> :errors [...]}.
+  `opts` supports {:registry r} and is ignored when `s` is a schema object."
+  ([s value] ((explainer s) value))
+  ([s value opts] ((explainer s opts) value)))
+
+(defn assert-valid
+  "Return `value` when it validates against `s`, else throw ex-info
+  \"Validation failed\" carrying the explain map plus
+  {:type :balli.core/invalid-input}."
+  ([s value] (assert-valid s value {}))
+  ([s value opts]
+   (if-let [ex (explain s value opts)]
+     (throw (ex-info "Validation failed" (assoc ex :type :balli.core/invalid-input)))
+     value)))

@@ -1,0 +1,7 @@
+(ns tests.test-toolchain
+  "Phase 0 smoke test: balli.core resolves from the test runner."
+  (:require [basilisp.test :refer [deftest is]]
+            [balli.core :as b]))
+
+(deftest smoke
+  (is (= "0.1.0" b/version)))

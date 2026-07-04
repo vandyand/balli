@@ -1,0 +1,488 @@
+(ns balli.compile
+  "AST -> compiled validator + explainer closures.
+
+  Entry points:
+    (compile-validator ast registry) -> 1-arg fn returning boolean
+    (compile-explainer ast registry) -> fn [value path in] returning a vector
+      of error maps {:path :in :schema <original-form-fragment> :value :type}
+
+  Compilation walks the AST once, producing a closure tree — no per-call
+  interpretation. Refs resolve eagerly at compile time (unresolved refs throw
+  ex-info {:type :balli.core/unresolved-ref}) but their targets compile lazily
+  through a per-compilation cache atom (fn indirection), so recursive schemas
+  (Phase 5) terminate on finite data."
+  (:require [balli.normalize :as norm]
+            [balli.registry :as reg]))
+
+(declare compile-node explain-node)
+
+;; ---------------------------------------------------------------------------
+;; Helpers
+
+(defn- with-bounds
+  "Wrap `pred` with inclusive :min/:max bounds from `props`, measuring the
+  value via `measure` (identity for numeric value bounds, count for string
+  length / collection size). Bounds only apply when pred passes."
+  [pred props measure]
+  (let [mn (:min props)
+        mx (:max props)]
+    (cond
+      (and mn mx) (fn [x] (and (pred x) (<= mn (measure x) mx)))
+      mn (fn [x] (and (pred x) (<= mn (measure x))))
+      mx (fn [x] (and (pred x) (<= (measure x) mx)))
+      :else pred)))
+
+(defn- number-value?
+  [x]
+  (or (int? x) (float? x)))
+
+;; ---------------------------------------------------------------------------
+;; Per-type compilers
+
+(defn- compile-scalar
+  [{:keys [type properties]}]
+  (case type
+    :any (fn [_] true)
+    :nil nil?
+    :string (with-bounds string? properties count)
+    :int (with-bounds int? properties identity)
+    (:float :double) (with-bounds float? properties identity)
+    :number (with-bounds number-value? properties identity)
+    :boolean boolean?
+    :keyword keyword?
+    :symbol symbol?
+    :uuid uuid?))
+
+(defn- compile-coll
+  "Validator for a homogeneous collection: `coll-pred` on the whole value,
+  every element valid per the single child schema, :min/:max count bounds."
+  [coll-pred node registry cache]
+  (let [child (compile-node (first (:children node)) registry cache)]
+    (with-bounds (fn [x] (and (coll-pred x) (every? child x)))
+      (:properties node)
+      count)))
+
+(defn- compile-tuple
+  [node registry cache]
+  (let [fns (mapv #(compile-node % registry cache) (:children node))
+        n (count fns)]
+    (fn [x]
+      (and (vector? x)
+           (= n (count x))
+           (loop [i 0]
+             (cond
+               (>= i n) true
+               ((nth fns i) (nth x i)) (recur (inc i))
+               :else false))))))
+
+(defn- compile-map
+  [node registry cache]
+  (let [entries (mapv (fn [{:keys [key properties schema]}]
+                        {:k key
+                         :optional (boolean (:optional properties))
+                         :vf (compile-node schema registry cache)})
+                      (:children node))
+        closed (boolean (:closed (:properties node)))
+        known (set (map :k entries))]
+    (fn [x]
+      (and (map? x)
+           (every? (fn [{:keys [k optional vf]}]
+                     (if (contains? x k)
+                       (vf (get x k))
+                       optional))
+                   entries)
+           (or (not closed)
+               (every? #(contains? known %) (keys x)))))))
+
+(defn- compile-map-of
+  [node registry cache]
+  (let [kf (compile-node (nth (:children node) 0) registry cache)
+        vf (compile-node (nth (:children node) 1) registry cache)]
+    (with-bounds (fn [x]
+                   (and (map? x)
+                        (every? (fn [[k v]] (and (kf k) (vf v))) x)))
+      (:properties node)
+      count)))
+
+(defn- compile-multi
+  [node registry cache]
+  (let [d (:dispatch (:properties node))
+        dispatch-fn (if (keyword? d) (fn [x] (get x d)) d)
+        table (into {}
+                    (map (fn [c] [(:key c) (compile-node (:schema c) registry cache)]))
+                    (:children node))]
+    (fn [x]
+      (try
+        (let [dv (dispatch-fn x)]
+          (if (contains? table dv)
+            ((get table dv) x)
+            false))
+        (catch python/Exception _ false)))))
+
+(defn- compile-ref
+  "Refs resolve AND their targets compile eagerly at compile time, so
+  unresolved refs anywhere in the reachable graph fail fast. The `cache`
+  (keyed by ref keyword) doubles as the recursion guard: a ref already
+  being compiled is marked in the cache before its target compiles, and
+  the returned fn resolves the real compiled fn by late lookup — fn
+  indirection so recursive schemas don't loop during compilation."
+  [node registry cache]
+  (let [k (:ref node)
+        target (reg/resolve-ref registry k)]
+    (when (nil? target)
+      (throw (ex-info "Unresolved ref" {:type :balli.core/unresolved-ref :ref k})))
+    (when-not (contains? @cache k)
+      (swap! cache assoc k ::compiling)
+      (swap! cache assoc k
+             (compile-node (norm/normalize target {:registry registry})
+                           registry cache)))
+    (fn [x] ((get @cache k) x))))
+
+(defn- compile-node
+  [node registry cache]
+  (case (:type node)
+    (:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid)
+    (compile-scalar node)
+
+    :enum
+    (let [allowed (set (:children node))]
+      (fn [x] (contains? allowed x)))
+
+    :=
+    (let [v (first (:children node))]
+      (fn [x] (= v x)))
+
+    :maybe
+    (let [f (compile-node (first (:children node)) registry cache)]
+      (fn [x] (or (nil? x) (f x))))
+
+    :not
+    (let [f (compile-node (first (:children node)) registry cache)]
+      (fn [x] (not (f x))))
+
+    :and
+    (let [fns (mapv #(compile-node % registry cache) (:children node))]
+      (fn [x] (every? #(% x) fns)))
+
+    :or
+    (let [fns (mapv #(compile-node % registry cache) (:children node))]
+      (fn [x] (boolean (some #(% x) fns))))
+
+    :vector (compile-coll vector? node registry cache)
+    :sequential (compile-coll sequential? node registry cache)
+    :set (compile-coll set? node registry cache)
+
+    :tuple (compile-tuple node registry cache)
+    :map (compile-map node registry cache)
+    :map-of (compile-map-of node registry cache)
+
+    :fn
+    (let [pred (first (:children node))]
+      (fn [x]
+        (try
+          (boolean (pred x))
+          (catch python/Exception _ false))))
+
+    :re
+    (let [pattern (first (:children node))]
+      (fn [x] (boolean (and (string? x) (re-matches pattern x)))))
+
+    :multi (compile-multi node registry cache)
+    :ref (compile-ref node registry cache)))
+
+(defn compile-validator
+  "Compile AST node `ast` against `registry` into a 1-arg validator fn
+  returning a boolean. Refs are resolved via the registry; unresolved refs
+  throw ex-info {:type :balli.core/unresolved-ref}."
+  [ast registry]
+  (compile-node ast registry (atom {})))
+
+;; ===========================================================================
+;; Explainers
+;;
+;; An explainer is a fn [value path in] -> vector of error maps
+;;   {:path <schema path> :in <value path> :schema <original form fragment>
+;;    :value <failing value> :type <error type kw>}
+;; An empty vector means valid. Path semantics:
+;;   - map entry key         -> appended to both :path and :in
+;;   - vector/seq/set elem   -> element index to :in, 0 to :path (sets aren't
+;;                              indexed in Basilisp — the element's ordinal
+;;                              position in seq order is used for :in)
+;;   - tuple element         -> index to both :path and :in
+;;   - :map-of key failure   -> key to :in, 0 to :path (key schema is child 0)
+;;   - :map-of value failure -> key to :in, 1 to :path (value schema is child 1)
+;;   - :and/:or branch       -> branch index to :path only
+;;   - :maybe child          -> 0 to :path only (transparent in :in)
+;;   - :multi child          -> dispatch key to :path only (transparent in :in)
+;;   - :or all-branches-fail -> single :balli.core/invalid error at the :or
+;;                              node (documented simplification vs Malli's
+;;                              per-branch errors)
+;;   - :re non-match on a string -> :balli.core/invalid (non-strings get
+;;                              :balli.core/invalid-type)
+
+(defn- err
+  [path in form value type]
+  {:path path :in in :schema form :value value :type type})
+
+(defn- into!
+  "conj! every element of `errors` into transient `acc`."
+  [acc errors]
+  (reduce conj! acc errors))
+
+(defn- explain-scalar
+  [{:keys [type properties form]}]
+  (if (= type :any)
+    (fn [_ _ _] [])
+    (let [[pred measure]
+          (case type
+            :nil [nil? nil]
+            :string [string? count]
+            :int [int? identity]
+            (:float :double) [float? identity]
+            :number [number-value? identity]
+            :boolean [boolean? nil]
+            :keyword [keyword? nil]
+            :symbol [symbol? nil]
+            :uuid [uuid? nil])
+          mn (:min properties)
+          mx (:max properties)]
+      (fn [x path in]
+        (cond
+          (not (pred x))
+          [(err path in form x :balli.core/invalid-type)]
+
+          (and measure
+               (or (and mn (< (measure x) mn))
+                   (and mx (> (measure x) mx))))
+          [(err path in form x :balli.core/limits)]
+
+          :else [])))))
+
+(defn- explain-coll
+  "Explainer for a homogeneous collection: type error at the node, :min/:max
+  count violations as :balli.core/limits at the node, element failures at
+  :path (conj path 0), :in (conj in <ordinal>)."
+  [coll-pred node registry cache]
+  (let [child (explain-node (first (:children node)) registry cache)
+        props (:properties node)
+        mn (:min props)
+        mx (:max props)
+        form (:form node)]
+    (fn [x path in]
+      (if-not (coll-pred x)
+        [(err path in form x :balli.core/invalid-type)]
+        (let [n (count x)
+              acc (transient [])
+              acc (if (or (and mn (< n mn)) (and mx (> n mx)))
+                    (conj! acc (err path in form x :balli.core/limits))
+                    acc)
+              child-path (conj path 0)]
+          (persistent!
+           (reduce (fn [acc [i v]]
+                     (into! acc (child v child-path (conj in i))))
+                   acc
+                   (map-indexed vector x))))))))
+
+(defn- explain-tuple
+  [node registry cache]
+  (let [fns (mapv #(explain-node % registry cache) (:children node))
+        n (count fns)
+        form (:form node)]
+    (fn [x path in]
+      (cond
+        (not (vector? x))
+        [(err path in form x :balli.core/invalid-type)]
+
+        (not= n (count x))
+        [(err path in form x :balli.core/limits)]
+
+        :else
+        (persistent!
+         (reduce (fn [acc i]
+                   (into! acc ((nth fns i) (nth x i) (conj path i) (conj in i))))
+                 (transient [])
+                 (range n)))))))
+
+(defn- explain-map
+  [node registry cache]
+  (let [entries (mapv (fn [{:keys [key properties schema]}]
+                        {:k key
+                         :optional (boolean (:optional properties))
+                         :ef (explain-node schema registry cache)
+                         :entry-form (:form schema)})
+                      (:children node))
+        closed (boolean (:closed (:properties node)))
+        known (set (map :k entries))
+        form (:form node)]
+    (fn [x path in]
+      (if-not (map? x)
+        [(err path in form x :balli.core/invalid-type)]
+        (let [acc (reduce
+                   (fn [acc {:keys [k optional ef entry-form]}]
+                     (cond
+                       (contains? x k)
+                       (into! acc (ef (get x k) (conj path k) (conj in k)))
+
+                       optional acc
+
+                       :else
+                       (conj! acc (err (conj path k) (conj in k)
+                                       entry-form nil :balli.core/missing-key))))
+                   (transient [])
+                   entries)
+              acc (if closed
+                    (reduce (fn [acc [k v]]
+                              (if (contains? known k)
+                                acc
+                                (conj! acc (err (conj path k) (conj in k)
+                                                form v :balli.core/extra-key))))
+                            acc
+                            x)
+                    acc)]
+          (persistent! acc))))))
+
+(defn- explain-map-of
+  [node registry cache]
+  (let [kf (explain-node (nth (:children node) 0) registry cache)
+        vf (explain-node (nth (:children node) 1) registry cache)
+        props (:properties node)
+        mn (:min props)
+        mx (:max props)
+        form (:form node)]
+    (fn [x path in]
+      (if-not (map? x)
+        [(err path in form x :balli.core/invalid-type)]
+        (let [acc (transient [])
+              acc (if (or (and mn (< (count x) mn)) (and mx (> (count x) mx)))
+                    (conj! acc (err path in form x :balli.core/limits))
+                    acc)]
+          (persistent!
+           (reduce (fn [acc [k v]]
+                     (-> acc
+                         (into! (kf k (conj path 0) (conj in k)))
+                         (into! (vf v (conj path 1) (conj in k)))))
+                   acc
+                   x)))))))
+
+(defn- explain-multi
+  [node registry cache]
+  (let [d (:dispatch (:properties node))
+        dispatch-fn (if (keyword? d) (fn [x] (get x d)) d)
+        table (into {}
+                    (map (fn [c] [(:key c) (explain-node (:schema c) registry cache)]))
+                    (:children node))
+        form (:form node)]
+    (fn [x path in]
+      (let [dv (try
+                 (dispatch-fn x)
+                 (catch python/Exception _ ::dispatch-threw))]
+        (if (contains? table dv)
+          ((get table dv) x (conj path dv) in)
+          [(err path in form x :balli.core/invalid-dispatch-value)])))))
+
+(defn- explain-ref
+  "Same eager-compile + fn-indirection pattern as compile-ref, caching
+  explainers keyed by ref keyword. Transparent in both :path and :in."
+  [node registry cache]
+  (let [k (:ref node)
+        target (reg/resolve-ref registry k)]
+    (when (nil? target)
+      (throw (ex-info "Unresolved ref" {:type :balli.core/unresolved-ref :ref k})))
+    (when-not (contains? @cache k)
+      (swap! cache assoc k ::compiling)
+      (swap! cache assoc k
+             (explain-node (norm/normalize target {:registry registry})
+                           registry cache)))
+    (fn [x path in] ((get @cache k) x path in))))
+
+(defn- explain-node
+  [node registry cache]
+  (case (:type node)
+    (:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid)
+    (explain-scalar node)
+
+    :enum
+    (let [allowed (set (:children node))
+          form (:form node)]
+      (fn [x path in]
+        (if (contains? allowed x)
+          []
+          [(err path in form x :balli.core/enum-mismatch)])))
+
+    :=
+    (let [v (first (:children node))
+          form (:form node)]
+      (fn [x path in]
+        (if (= v x)
+          []
+          [(err path in form x :balli.core/not-eq)])))
+
+    :maybe
+    (let [f (explain-node (first (:children node)) registry cache)]
+      (fn [x path in]
+        (if (nil? x)
+          []
+          (f x (conj path 0) in))))
+
+    :not
+    (let [f (explain-node (first (:children node)) registry cache)
+          form (:form node)]
+      (fn [x path in]
+        (if (empty? (f x path in))
+          [(err path in form x :balli.core/invalid)]
+          [])))
+
+    :and
+    (let [fns (mapv #(explain-node % registry cache) (:children node))]
+      (fn [x path in]
+        (persistent!
+         (reduce (fn [acc [i f]]
+                   (into! acc (f x (conj path i) in)))
+                 (transient [])
+                 (map-indexed vector fns)))))
+
+    :or
+    (let [fns (mapv #(explain-node % registry cache) (:children node))
+          form (:form node)]
+      (fn [x path in]
+        (if (some (fn [f] (empty? (f x path in))) fns)
+          []
+          [(err path in form x :balli.core/invalid)])))
+
+    :vector (explain-coll vector? node registry cache)
+    :sequential (explain-coll sequential? node registry cache)
+    :set (explain-coll set? node registry cache)
+
+    :tuple (explain-tuple node registry cache)
+    :map (explain-map node registry cache)
+    :map-of (explain-map-of node registry cache)
+
+    :fn
+    (let [pred (first (:children node))
+          form (:form node)]
+      (fn [x path in]
+        (if (try
+              (boolean (pred x))
+              (catch python/Exception _ false))
+          []
+          [(err path in form x :balli.core/invalid)])))
+
+    :re
+    (let [pattern (first (:children node))
+          form (:form node)]
+      (fn [x path in]
+        (cond
+          (not (string? x)) [(err path in form x :balli.core/invalid-type)]
+          (re-matches pattern x) []
+          :else [(err path in form x :balli.core/invalid)])))
+
+    :multi (explain-multi node registry cache)
+    :ref (explain-ref node registry cache)))
+
+(defn compile-explainer
+  "Compile AST node `ast` against `registry` into an explainer fn
+  [value path in] returning a vector of error maps (empty when valid).
+  Error :schema carries the original form fragment stored on the AST node
+  as :form, not the AST itself."
+  [ast registry]
+  (explain-node ast registry (atom {})))
