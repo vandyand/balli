@@ -1,0 +1,367 @@
+(ns tests.test-core
+  "Phase 2: validate happy/sad paths for every MVP type, property bounds,
+  closed maps, optional keys, nested structures, :multi dispatch, and the
+  schema-object API."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.registry :as reg]))
+
+;; ---------------------------------------------------------------------------
+;; Scalars
+
+(deftest any-and-nil
+  (is (true? (b/validate :any nil)))
+  (is (true? (b/validate :any 42)))
+  (is (true? (b/validate :any {:a 1})))
+  (is (true? (b/validate :nil nil)))
+  (is (false? (b/validate :nil 0)))
+  (is (false? (b/validate :nil false))))
+
+(deftest string-type
+  (is (true? (b/validate :string "hi")))
+  (is (true? (b/validate :string "")))
+  (is (false? (b/validate :string :hi)))
+  (is (false? (b/validate :string 5)))
+  (is (false? (b/validate :string nil)))
+  (testing "length bounds via count, inclusive"
+    (is (true? (b/validate [:string {:min 2 :max 4}] "ab")))
+    (is (true? (b/validate [:string {:min 2 :max 4}] "abcd")))
+    (is (false? (b/validate [:string {:min 2 :max 4}] "a")))
+    (is (false? (b/validate [:string {:min 2 :max 4}] "abcde")))
+    (is (true? (b/validate [:string {:min 1}] "x")))
+    (is (false? (b/validate [:string {:min 1}] "")))
+    (is (true? (b/validate [:string {:max 2}] "ab")))
+    (is (false? (b/validate [:string {:max 2}] "abc")))))
+
+(deftest int-type
+  (is (true? (b/validate :int 5)))
+  (is (true? (b/validate :int -3)))
+  (is (false? (b/validate :int 5.0)))
+  (is (false? (b/validate :int "5")))
+  (is (false? (b/validate :int true)))
+  (is (false? (b/validate :int nil)))
+  (testing "value bounds, inclusive"
+    (is (true? (b/validate [:int {:min 1 :max 5}] 1)))
+    (is (true? (b/validate [:int {:min 1 :max 5}] 5)))
+    (is (false? (b/validate [:int {:min 1 :max 5}] 0)))
+    (is (false? (b/validate [:int {:min 1 :max 5}] 6)))))
+
+(deftest float-and-double-types
+  (is (true? (b/validate :float 1.5)))
+  (is (false? (b/validate :float 1)))
+  (is (false? (b/validate :float "1.5")))
+  (is (true? (b/validate :double 1.5)))
+  (is (false? (b/validate :double 1)))
+  (testing "value bounds"
+    (is (true? (b/validate [:float {:min 0.5 :max 2.0}] 1.0)))
+    (is (false? (b/validate [:float {:min 0.5 :max 2.0}] 0.4)))
+    (is (false? (b/validate [:double {:max 1.0}] 1.5)))))
+
+(deftest number-type
+  (testing ":number accepts int and float"
+    (is (true? (b/validate :number 1)))
+    (is (true? (b/validate :number 1.5)))
+    (is (false? (b/validate :number "1")))
+    (is (false? (b/validate :number true)))
+    (is (false? (b/validate :number nil))))
+  (testing "bounds across int and float"
+    (is (true? (b/validate [:number {:min 1 :max 5}] 2.5)))
+    (is (true? (b/validate [:number {:min 1 :max 5}] 5)))
+    (is (false? (b/validate [:number {:min 1 :max 5}] 0.9)))
+    (is (false? (b/validate [:number {:min 1 :max 5}] 6)))))
+
+(deftest boolean-keyword-symbol-uuid
+  (is (true? (b/validate :boolean true)))
+  (is (true? (b/validate :boolean false)))
+  (is (false? (b/validate :boolean 1)))
+  (is (false? (b/validate :boolean nil)))
+  (is (true? (b/validate :keyword :a)))
+  (is (true? (b/validate :keyword :ns/a)))
+  (is (false? (b/validate :keyword "a")))
+  (is (true? (b/validate :symbol 'foo)))
+  (is (false? (b/validate :symbol :foo)))
+  (is (true? (b/validate :uuid (random-uuid))))
+  (is (false? (b/validate :uuid "not-a-uuid"))))
+
+;; ---------------------------------------------------------------------------
+;; :enum / :=
+
+(deftest enum-type
+  (is (true? (b/validate [:enum "A" "B"] "A")))
+  (is (true? (b/validate [:enum "A" "B"] "B")))
+  (is (false? (b/validate [:enum "A" "B"] "C")))
+  (is (false? (b/validate [:enum "A" "B"] nil)))
+  (is (true? (b/validate [:enum :s :m :l] :m)))
+  (testing "map literal as enum value"
+    (is (true? (b/validate [:enum {:a 1}] {:a 1})))
+    (is (false? (b/validate [:enum {:a 1}] {:a 2})))))
+
+(deftest eq-type
+  (is (true? (b/validate [:= :dm] :dm)))
+  (is (false? (b/validate [:= :dm] :group)))
+  (is (true? (b/validate [:= 5] 5)))
+  (is (false? (b/validate [:= 5] 6)))
+  (is (true? (b/validate [:= nil] nil)))
+  (is (false? (b/validate [:= nil] 0))))
+
+;; ---------------------------------------------------------------------------
+;; :maybe / :not / :and / :or
+
+(deftest maybe-type
+  (is (true? (b/validate [:maybe :string] nil)))
+  (is (true? (b/validate [:maybe :string] "x")))
+  (is (false? (b/validate [:maybe :string] 5))))
+
+(deftest not-type
+  (is (true? (b/validate [:not :string] 5)))
+  (is (false? (b/validate [:not :string] "x")))
+  (is (true? (b/validate [:not [:int {:min 0}]] -1))))
+
+(deftest and-type
+  (is (true? (b/validate [:and :int [:fn even?]] 4)))
+  (is (false? (b/validate [:and :int [:fn even?]] 3)))
+  (is (false? (b/validate [:and :int [:fn even?]] "4")))
+  (is (true? (b/validate [:and [:int {:min 0}] [:int {:max 10}]] 5))))
+
+(deftest or-type
+  (is (true? (b/validate [:or :string :int] "x")))
+  (is (true? (b/validate [:or :string :int] 5)))
+  (is (false? (b/validate [:or :string :int] :kw)))
+  (is (false? (b/validate [:or :string :int] nil))))
+
+;; ---------------------------------------------------------------------------
+;; Collections: :vector / :sequential / :set
+
+(deftest vector-type
+  (is (true? (b/validate [:vector :int] [1 2 3])))
+  (is (true? (b/validate [:vector :int] [])))
+  (is (false? (b/validate [:vector :int] [1 "x"])))
+  (is (false? (b/validate [:vector :int] (list 1 2))))
+  (is (false? (b/validate [:vector :int] #{1 2})))
+  (is (false? (b/validate [:vector :int] "12")))
+  (testing "count bounds, inclusive"
+    (is (true? (b/validate [:vector {:min 1 :max 2} :int] [1])))
+    (is (true? (b/validate [:vector {:min 1 :max 2} :int] [1 2])))
+    (is (false? (b/validate [:vector {:min 1 :max 2} :int] [])))
+    (is (false? (b/validate [:vector {:min 1 :max 2} :int] [1 2 3])))))
+
+(deftest sequential-type
+  (testing "accepts vectors and lists/seqs"
+    (is (true? (b/validate [:sequential :int] [1 2])))
+    (is (true? (b/validate [:sequential :int] (list 1 2))))
+    (is (true? (b/validate [:sequential :int] '()))))
+  (is (false? (b/validate [:sequential :int] #{1 2})))
+  (is (false? (b/validate [:sequential :int] [1 "x"])))
+  (is (false? (b/validate [:sequential :int] "12")))
+  (testing "count bounds"
+    (is (true? (b/validate [:sequential {:min 2} :int] (list 1 2))))
+    (is (false? (b/validate [:sequential {:min 2} :int] (list 1))))))
+
+(deftest set-type
+  (is (true? (b/validate [:set :keyword] #{:a :b})))
+  (is (true? (b/validate [:set :keyword] #{})))
+  (is (false? (b/validate [:set :keyword] #{:a "b"})))
+  (is (false? (b/validate [:set :keyword] [:a :b])))
+  (testing "count bounds"
+    (is (true? (b/validate [:set {:min 1 :max 2} :keyword] #{:a})))
+    (is (false? (b/validate [:set {:min 1 :max 2} :keyword] #{})))
+    (is (false? (b/validate [:set {:min 1 :max 2} :keyword] #{:a :b :c})))))
+
+;; ---------------------------------------------------------------------------
+;; :tuple
+
+(deftest tuple-type
+  (is (true? (b/validate [:tuple :string :int] ["a" 1])))
+  (testing "positional schemas"
+    (is (false? (b/validate [:tuple :string :int] [1 "a"])))
+    (is (false? (b/validate [:tuple :string :int] ["a" "b"]))))
+  (testing "exact arity"
+    (is (false? (b/validate [:tuple :string :int] ["a"])))
+    (is (false? (b/validate [:tuple :string :int] ["a" 1 2]))))
+  (is (false? (b/validate [:tuple :string :int] (list "a" 1))))
+  (testing "empty tuple"
+    (is (true? (b/validate [:tuple] [])))
+    (is (false? (b/validate [:tuple] [1])))))
+
+;; ---------------------------------------------------------------------------
+;; :map
+
+(deftest map-type
+  (is (true? (b/validate [:map [:id :string]] {:id "x"})))
+  (is (false? (b/validate [:map [:id :string]] {:id 5})))
+  (is (false? (b/validate [:map [:id :string]] {})))
+  (is (false? (b/validate [:map [:id :string]] [:id "x"])))
+  (is (false? (b/validate [:map [:id :string]] nil)))
+  (testing "open by default: extra keys allowed"
+    (is (true? (b/validate [:map [:id :string]] {:id "x" :extra 1}))))
+  (testing "closed maps reject extra keys"
+    (is (true? (b/validate [:map {:closed true} [:id :string]] {:id "x"})))
+    (is (false? (b/validate [:map {:closed true} [:id :string]] {:id "x" :extra 1}))))
+  (testing "optional keys"
+    (let [s [:map [:id :string] [:age {:optional true} :int]]]
+      (is (true? (b/validate s {:id "x"})))
+      (is (true? (b/validate s {:id "x" :age 3})))
+      (is (false? (b/validate s {:id "x" :age "3"})))
+      (is (false? (b/validate s {:age 3})))))
+  (testing "optional key counts as known in closed map"
+    (is (true? (b/validate [:map {:closed true} [:a {:optional true} :int]] {:a 1})))
+    (is (true? (b/validate [:map {:closed true} [:a {:optional true} :int]] {})))
+    (is (false? (b/validate [:map {:closed true} [:a {:optional true} :int]] {:b 1})))))
+
+(deftest nested-structures
+  (let [s [:map {:closed true}
+           [:user [:map
+                   [:name [:string {:min 1}]]
+                   [:tags [:set :keyword]]]]
+           [:scores [:vector [:tuple :keyword :int]]]]]
+    (is (true? (b/validate s {:user {:name "a" :tags #{:x}}
+                              :scores [[:math 90] [:art 80]]})))
+    (is (false? (b/validate s {:user {:name "" :tags #{:x}}
+                               :scores []})))
+    (is (false? (b/validate s {:user {:name "a" :tags #{"x"}}
+                               :scores []})))
+    (is (false? (b/validate s {:user {:name "a" :tags #{:x}}
+                               :scores [[:math "90"]]})))
+    (is (false? (b/validate s {:user {:name "a" :tags #{:x}}
+                               :scores []
+                               :extra 1})))))
+
+;; ---------------------------------------------------------------------------
+;; :map-of
+
+(deftest map-of-type
+  (is (true? (b/validate [:map-of :keyword :int] {:a 1 :b 2})))
+  (is (true? (b/validate [:map-of :keyword :int] {})))
+  (is (false? (b/validate [:map-of :keyword :int] {:a "1"})))
+  (is (false? (b/validate [:map-of :keyword :int] {"a" 1})))
+  (is (false? (b/validate [:map-of :keyword :int] [[:a 1]])))
+  (testing "nested value schemas"
+    (is (true? (b/validate [:map-of :string [:vector :int]] {"a" [1] "b" []})))
+    (is (false? (b/validate [:map-of :string [:vector :int]] {"a" [1 "x"]})))))
+
+;; ---------------------------------------------------------------------------
+;; :fn
+
+(deftest fn-type
+  (is (true? (b/validate [:fn even?] 2)))
+  (is (false? (b/validate [:fn even?] 3)))
+  (testing "thrown exception means invalid"
+    (is (false? (b/validate [:fn even?] "not-a-number")))
+    (is (false? (b/validate [:fn (fn [_] (throw (ex-info "boom" {})))] 1))))
+  (testing "props form with :error/message"
+    (is (true? (b/validate [:fn {:error/message "must be even"} even?] 2)))
+    (is (false? (b/validate [:fn {:error/message "must be even"} even?] 3)))))
+
+;; ---------------------------------------------------------------------------
+;; :re
+
+(deftest re-type
+  (testing "full-match semantics (re-matches)"
+    (is (true? (b/validate [:re #"a+"] "aaa")))
+    (is (false? (b/validate [:re #"a+"] "aaab")))
+    (is (false? (b/validate [:re #"a+"] "baaa"))))
+  (testing "string pattern"
+    (is (true? (b/validate [:re "\\d{3}"] "123")))
+    (is (false? (b/validate [:re "\\d{3}"] "12"))))
+  (testing "non-string is invalid"
+    (is (false? (b/validate [:re #"a+"] 5)))
+    (is (false? (b/validate [:re #"a+"] nil)))
+    (is (false? (b/validate [:re #"a+"] :aaa)))))
+
+;; ---------------------------------------------------------------------------
+;; :multi
+
+(deftest multi-keyword-dispatch
+  (let [s [:multi {:dispatch :kind}
+           [:dm [:map [:kind [:= :dm]] [:text :string]]]
+           [:group [:map [:kind [:= :group]] [:members [:vector :string]]]]]]
+    (is (true? (b/validate s {:kind :dm :text "hi"})))
+    (is (true? (b/validate s {:kind :group :members ["a"]})))
+    (is (false? (b/validate s {:kind :dm :text 5})))
+    (testing "unknown dispatch value is invalid"
+      (is (false? (b/validate s {:kind :email :text "hi"})))
+      (is (false? (b/validate s {:text "hi"}))))
+    (testing "non-map values do not blow up"
+      (is (false? (b/validate s 5)))
+      (is (false? (b/validate s nil))))))
+
+(deftest multi-fn-dispatch
+  (let [s [:multi {:dispatch (fn [x] (if (string? x) :s :i))}
+           [:s :string]
+           [:i :int]]]
+    (is (true? (b/validate s "x")))
+    (is (true? (b/validate s 5)))
+    (is (false? (b/validate s :kw))))
+  (testing "throwing dispatch fn is invalid, not an error"
+    (is (false? (b/validate [:multi {:dispatch (fn [_] (throw (ex-info "boom" {})))}
+                             [:a :int]]
+                            1)))))
+
+;; ---------------------------------------------------------------------------
+;; :ref + registry
+
+(deftest ref-resolution
+  (let [r (reg/registry {:user/id [:string {:min 1}]})]
+    (is (true? (b/validate [:ref :user/id] "abc" {:registry r})))
+    (is (false? (b/validate [:ref :user/id] "" {:registry r})))
+    (is (false? (b/validate [:ref :user/id] 5 {:registry r})))
+    (testing "registered bare keyword works as a ref"
+      (is (true? (b/validate [:map [:id :user/id]] {:id "abc"} {:registry r})))
+      (is (false? (b/validate [:map [:id :user/id]] {:id ""} {:registry r}))))))
+
+(deftest unresolved-ref-throws-at-compile-time
+  (is (= :balli.core/unresolved-ref
+         (try
+           (b/validator [:ref :nope])
+           nil
+           (catch python/Exception e (:type (ex-data e))))))
+  (is (= :balli.core/unresolved-ref
+         (try
+           (b/validate [:ref :nope] 1)
+           nil
+           (catch python/Exception e (:type (ex-data e)))))))
+
+;; ---------------------------------------------------------------------------
+;; Schema-object API
+
+(deftest schema-object-api
+  (let [s (b/schema [:map {:closed true} [:id :string]])]
+    (is (true? (b/schema? s)))
+    (is (false? (b/schema? [:map [:id :string]])))
+    (is (false? (b/schema? {:balli/schema false})))
+    (is (= [:map {:closed true} [:id :string]] (b/form s)))
+    (is (= {:closed true} (b/properties s)))
+    (is (= 1 (count (b/children s))))
+    (is (= :id (:key (first (b/children s)))))
+    (testing "schema of a schema returns it unchanged"
+      (is (identical? s (b/schema s))))
+    (testing "validate accepts schema objects"
+      (is (true? (b/validate s {:id "x"})))
+      (is (false? (b/validate s {:id "x" :extra 1}))))))
+
+(deftest raw-form-accessors
+  (is (= :string (b/form :string)))
+  (is (= {:min 1} (b/properties [:string {:min 1}])))
+  (is (= 2 (count (b/children [:tuple :string :int])))))
+
+(deftest validator-fn-and-caching
+  (testing "validator returns a reusable fn"
+    (let [v (b/validator [:vector :int])]
+      (is (true? (v [1 2])))
+      (is (false? (v [1 "x"])))))
+  (testing "schema-object validators are cached in the :cache atom"
+    (let [s (b/schema :int)
+          v1 (b/validator s)
+          v2 (b/validator s)]
+      (is (identical? v1 v2))
+      (is (identical? v1 (:validator @(:cache s))))))
+  (testing "raw default-registry forms hit the global cache"
+    (let [v1 (b/validator [:vector :string])
+          v2 (b/validator [:vector :string])]
+      (is (identical? v1 v2))))
+  (testing "custom-registry compiles bypass the raw cache but still work"
+    (let [r1 (reg/registry {:x/id :string})
+          r2 (reg/registry {:x/id :int})]
+      (is (true? (b/validate [:ref :x/id] "s" {:registry r1})))
+      (is (true? (b/validate [:ref :x/id] 5 {:registry r2})))
+      (is (false? (b/validate [:ref :x/id] "s" {:registry r2}))))))

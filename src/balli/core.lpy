@@ -1,4 +1,92 @@
 (ns balli.core
-  "Public API for balli - Malli-inspired data-driven schemas for Basilisp.")
+  "Public API for balli - Malli-inspired data-driven schemas for Basilisp.
+
+  Schemas are plain data (Malli vector syntax). `schema` wraps a form into a
+  schema object {:balli/schema true :form ... :ast ... :registry ... :cache
+  (atom {})}; `validator`/`validate` accept either a raw form or a schema
+  object. Compiled validators are cached: on the schema object's :cache atom,
+  or (for raw forms against the default registry) in a global cache keyed by
+  form. Raw forms compiled against a custom registry skip the global cache —
+  registry-aware caching is refined in Phase 5."
+  (:require [balli.compile :as c]
+            [balli.normalize :as norm]
+            [balli.registry :as reg]))
 
 (def version "0.1.0")
+
+(defn schema?
+  "True when `x` is a balli schema object."
+  [x]
+  (boolean (and (map? x) (:balli/schema x))))
+
+(defn schema
+  "Wrap schema `form` into a schema object. `opts` supports {:registry r};
+  defaults to the builtin registry. Passing an existing schema object returns
+  it unchanged (its baked-in registry wins)."
+  ([form] (schema form {}))
+  ([form opts]
+   (if (schema? form)
+     form
+     (let [registry (or (:registry opts) (reg/default-registry))]
+       {:balli/schema true
+        :form form
+        :ast (norm/normalize form {:registry registry})
+        :registry registry
+        :cache (atom {})}))))
+
+(defn form
+  "The original schema form of `s` (raw form or schema object)."
+  [s]
+  (:form (schema s)))
+
+(defn properties
+  "The properties map of the root of `s` (raw form or schema object)."
+  [s]
+  (:properties (:ast (schema s))))
+
+(defn children
+  "The AST children of the root of `s` (raw form or schema object)."
+  [s]
+  (:children (:ast (schema s))))
+
+(def ^:private raw-validator-cache
+  "Global cache of compiled validators for raw forms compiled against the
+  default registry, keyed by form. Unbounded for now; bounded + registry-aware
+  in Phase 5."
+  (atom {}))
+
+(defn- compile-and-cache!
+  "Compile a validator for schema object `s`, caching it under :validator in
+  the schema's :cache atom."
+  [s]
+  (let [f (c/compile-validator (:ast s) (:registry s))]
+    (swap! (:cache s) assoc :validator f)
+    f))
+
+(defn validator
+  "Compiled 1-arg boolean validator for `s` (raw form or schema object).
+  `opts` supports {:registry r} and is ignored when `s` is already a schema
+  object."
+  ([s] (validator s {}))
+  ([s opts]
+   (cond
+     (schema? s)
+     (or (:validator @(:cache s))
+         (compile-and-cache! s))
+
+     ;; raw form + custom registry: compile fresh, skip the global cache
+     (:registry opts)
+     (validator (schema s opts))
+
+     ;; raw form + default registry: global cache keyed by form
+     :else
+     (or (get @raw-validator-cache s)
+         (let [f (validator (schema s))]
+           (swap! raw-validator-cache assoc s f)
+           f)))))
+
+(defn validate
+  "Validate `value` against `s` (raw form or schema object). Returns boolean.
+  `opts` supports {:registry r} and is ignored when `s` is a schema object."
+  ([s value] ((validator s) value))
+  ([s value opts] ((validator s opts) value)))

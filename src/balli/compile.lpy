@@ -1,0 +1,195 @@
+(ns balli.compile
+  "AST -> compiled validator closures.
+
+  Entry point: (compile-validator ast registry) -> 1-arg fn returning boolean.
+
+  Compilation walks the AST once, producing a closure tree — no per-call
+  interpretation. Refs resolve eagerly at compile time (unresolved refs throw
+  ex-info {:type :balli.core/unresolved-ref}) but their targets compile lazily
+  through a per-compilation cache atom (fn indirection), so recursive schemas
+  (Phase 5) terminate on finite data.
+
+  Phase 3 adds compile-explainer alongside this, reusing the same AST."
+  (:require [balli.normalize :as norm]
+            [balli.registry :as reg]))
+
+(declare compile-node)
+
+;; ---------------------------------------------------------------------------
+;; Helpers
+
+(defn- with-bounds
+  "Wrap `pred` with inclusive :min/:max bounds from `props`, measuring the
+  value via `measure` (identity for numeric value bounds, count for string
+  length / collection size). Bounds only apply when pred passes."
+  [pred props measure]
+  (let [mn (:min props)
+        mx (:max props)]
+    (cond
+      (and mn mx) (fn [x] (and (pred x) (<= mn (measure x) mx)))
+      mn (fn [x] (and (pred x) (<= mn (measure x))))
+      mx (fn [x] (and (pred x) (<= (measure x) mx)))
+      :else pred)))
+
+(defn- number-value?
+  [x]
+  (or (int? x) (float? x)))
+
+;; ---------------------------------------------------------------------------
+;; Per-type compilers
+
+(defn- compile-scalar
+  [{:keys [type properties]}]
+  (case type
+    :any (fn [_] true)
+    :nil nil?
+    :string (with-bounds string? properties count)
+    :int (with-bounds int? properties identity)
+    (:float :double) (with-bounds float? properties identity)
+    :number (with-bounds number-value? properties identity)
+    :boolean boolean?
+    :keyword keyword?
+    :symbol symbol?
+    :uuid uuid?))
+
+(defn- compile-coll
+  "Validator for a homogeneous collection: `coll-pred` on the whole value,
+  every element valid per the single child schema, :min/:max count bounds."
+  [coll-pred node registry cache]
+  (let [child (compile-node (first (:children node)) registry cache)]
+    (with-bounds (fn [x] (and (coll-pred x) (every? child x)))
+      (:properties node)
+      count)))
+
+(defn- compile-tuple
+  [node registry cache]
+  (let [fns (mapv #(compile-node % registry cache) (:children node))
+        n (count fns)]
+    (fn [x]
+      (and (vector? x)
+           (= n (count x))
+           (loop [i 0]
+             (cond
+               (>= i n) true
+               ((nth fns i) (nth x i)) (recur (inc i))
+               :else false))))))
+
+(defn- compile-map
+  [node registry cache]
+  (let [entries (mapv (fn [{:keys [key properties schema]}]
+                        {:k key
+                         :optional (boolean (:optional properties))
+                         :vf (compile-node schema registry cache)})
+                      (:children node))
+        closed (boolean (:closed (:properties node)))
+        known (set (map :k entries))]
+    (fn [x]
+      (and (map? x)
+           (every? (fn [{:keys [k optional vf]}]
+                     (if (contains? x k)
+                       (vf (get x k))
+                       optional))
+                   entries)
+           (or (not closed)
+               (every? #(contains? known %) (keys x)))))))
+
+(defn- compile-map-of
+  [node registry cache]
+  (let [kf (compile-node (nth (:children node) 0) registry cache)
+        vf (compile-node (nth (:children node) 1) registry cache)]
+    (with-bounds (fn [x]
+                   (and (map? x)
+                        (every? (fn [[k v]] (and (kf k) (vf v))) x)))
+      (:properties node)
+      count)))
+
+(defn- compile-multi
+  [node registry cache]
+  (let [d (:dispatch (:properties node))
+        dispatch-fn (if (keyword? d) (fn [x] (get x d)) d)
+        table (into {}
+                    (map (fn [c] [(:key c) (compile-node (:schema c) registry cache)]))
+                    (:children node))]
+    (fn [x]
+      (try
+        (let [dv (dispatch-fn x)]
+          (if (contains? table dv)
+            ((get table dv) x)
+            false))
+        (catch python/Exception _ false)))))
+
+(defn- compile-ref
+  "Refs resolve at compile time (fail fast on unresolved), but the target
+  compiles lazily through `cache` (keyed by ref keyword) at first call —
+  fn indirection so recursive schemas don't loop during compilation."
+  [node registry cache]
+  (let [k (:ref node)
+        target (reg/resolve-ref registry k)]
+    (when (nil? target)
+      (throw (ex-info "Unresolved ref" {:type :balli.core/unresolved-ref :ref k})))
+    (fn [x]
+      (let [f (or (get @cache k)
+                  (let [f (compile-node (norm/normalize target {:registry registry})
+                                        registry cache)]
+                    (swap! cache assoc k f)
+                    f))]
+        (f x)))))
+
+(defn- compile-node
+  [node registry cache]
+  (case (:type node)
+    (:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid)
+    (compile-scalar node)
+
+    :enum
+    (let [allowed (set (:children node))]
+      (fn [x] (contains? allowed x)))
+
+    :=
+    (let [v (first (:children node))]
+      (fn [x] (= v x)))
+
+    :maybe
+    (let [f (compile-node (first (:children node)) registry cache)]
+      (fn [x] (or (nil? x) (f x))))
+
+    :not
+    (let [f (compile-node (first (:children node)) registry cache)]
+      (fn [x] (not (f x))))
+
+    :and
+    (let [fns (mapv #(compile-node % registry cache) (:children node))]
+      (fn [x] (every? #(% x) fns)))
+
+    :or
+    (let [fns (mapv #(compile-node % registry cache) (:children node))]
+      (fn [x] (boolean (some #(% x) fns))))
+
+    :vector (compile-coll vector? node registry cache)
+    :sequential (compile-coll sequential? node registry cache)
+    :set (compile-coll set? node registry cache)
+
+    :tuple (compile-tuple node registry cache)
+    :map (compile-map node registry cache)
+    :map-of (compile-map-of node registry cache)
+
+    :fn
+    (let [pred (first (:children node))]
+      (fn [x]
+        (try
+          (boolean (pred x))
+          (catch python/Exception _ false))))
+
+    :re
+    (let [pattern (first (:children node))]
+      (fn [x] (boolean (and (string? x) (re-matches pattern x)))))
+
+    :multi (compile-multi node registry cache)
+    :ref (compile-ref node registry cache)))
+
+(defn compile-validator
+  "Compile AST node `ast` against `registry` into a 1-arg validator fn
+  returning a boolean. Refs are resolved via the registry; unresolved refs
+  throw ex-info {:type :balli.core/unresolved-ref}."
+  [ast registry]
+  (compile-node ast registry (atom {})))
