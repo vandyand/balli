@@ -118,6 +118,8 @@
           :balli.core/enum-mismatch (str "should be one of: " (str/join ", " children))
           :balli.core/not-eq (str "should be equal to " (first children))
           :balli.core/invalid-dispatch-value "invalid dispatch value"
+          :balli.core/end-of-input "end of input"
+          :balli.core/input-remaining "unexpected input"
           (:balli.error/misspelled-key :balli.error/misspelled-value)
           (str "should be spelled "
                (str/join " or " (map (comp str last)

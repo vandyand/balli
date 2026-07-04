@@ -232,7 +232,10 @@
 (deftest registry-basics
   (is (contains? reg/builtin-types :map))
   (is (contains? reg/builtin-types :=))
-  (is (= 28 (count reg/builtin-types)))
+  ;; 28 MVP types + Phase 6: :cat :catn :alt :altn :? :* :+ :repeat :schema
+  (is (= 37 (count reg/builtin-types)))
+  (is (contains? reg/builtin-types :cat))
+  (is (contains? reg/builtin-types :schema))
   (is (= {} (:schemas (reg/default-registry))))
   (is (= reg/builtin-types (:types (reg/default-registry))))
   (let [r (reg/registry {:user/id :string} {:user/age :int})]

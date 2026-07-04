@@ -398,7 +398,7 @@
       (contains? walk-leaf-types t)
       (f (:form node) path)
 
-      (contains? #{:map :multi :orn} t)
+      (contains? #{:map :multi :orn :catn :altn} t)
       (let [entries (mapv (fn [{:keys [key properties schema]}]
                             (let [v (walk-ast schema (conj path key) f)]
                               (if (seq properties)
@@ -412,7 +412,7 @@
 
       :else
       ;; indexed children: :maybe :not :vector :sequential :set :and :or
-      ;; :tuple :map-of
+      ;; :tuple :map-of :cat :alt :? :* :+ :repeat :schema
       (let [children (into []
                            (map-indexed (fn [i c] (walk-ast c (conj path i) f))
                                         (:children node)))
@@ -425,9 +425,9 @@
   `(f rebuilt-form path)` is called; f's return value replaces the node's
   form in its parent. Returns f's result at the root. `opts` supports
   {:registry r} for raw forms (ignored when `s` is a schema object). :map,
-  :multi, and :orn entry value schemas are visited with (conj path key);
-  indexed children with (conj path i); refs are not entered (leaf, form
-  unchanged)."
+  :multi, :orn, :catn, and :altn entry value schemas are visited with
+  (conj path key); indexed children (incl. :cat/:alt/:?/:*/:+/:repeat and
+  :schema) with (conj path i); refs are not entered (leaf, form unchanged)."
   ([s f] (walk s f {}))
   ([s f opts]
    (let [ast (if (schema? s)

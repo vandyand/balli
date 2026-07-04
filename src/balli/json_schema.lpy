@@ -158,7 +158,22 @@
       ;; :re children hold a compiled python re.Pattern; .-pattern is source
       :re {"type" "string" "pattern" (.-pattern (first children))}
       :map (transform-map node registry ctx)
-      :ref (transform-ref node registry ctx))))
+      :ref (transform-ref node registry ctx)
+      ;; :schema is transparent
+      :schema (child (first children))
+      ;; Sequence (regex) schemas export as a best-effort LOSSY array --
+      ;; JSON Schema has no regex-of-sequences. "items" is attached only
+      ;; when every (branch) child maps to ONE distinct schema; ordering,
+      ;; arity, and per-position typing are all lost.
+      (:? :* :+ :repeat) {"type" "array" "items" (child (first children))}
+      (:cat :alt) (let [items (vec (distinct (mapv child children)))]
+                    (if (= 1 (count items))
+                      {"type" "array" "items" (first items)}
+                      {"type" "array"}))
+      (:catn :altn) (let [items (vec (distinct (mapv #(child (:schema %)) children)))]
+                      (if (= 1 (count items))
+                        {"type" "array" "items" (first items)}
+                        {"type" "array"})))))
 
 (defn- -transform
   "AST node -> JSON Schema map. Property layering per the ns docstring:

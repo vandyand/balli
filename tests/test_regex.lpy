@@ -1,0 +1,448 @@
+(ns tests.test-regex
+  "Phase 6: sequence (regex) schemas per malli-semantics section F.
+  Validate/explain/parse/unparse for every combinator, splicing + nesting,
+  [:schema ...] item semantics, greedy backtracking, the pathological
+  nullable-memo case ([:* [:* :int]] on 30 elements, timed), catn Tags
+  round-trips, furthest-position explain with end-of-input/input-remaining,
+  :repeat bounds, ref-in-seqex compile errors, regex-min-max, and additive
+  integration into walk/util/json-schema/transformers/humanize."
+  (:import time)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.compile :as bc]
+            [balli.core :as b]
+            [balli.error :as be]
+            [balli.json-schema :as bjs]
+            [balli.normalize :as norm]
+            [balli.registry :as reg]
+            [balli.transform :as bt]
+            [balli.util :as u]))
+
+(defn- round-trips?
+  "(unparse s (parse s x)) = x, and the parse itself was not invalid."
+  [s x]
+  (let [p (b/parse s x)]
+    (and (not (b/invalid? p))
+         (= x (b/unparse s p)))))
+
+(defn- invalid-schema?
+  [form]
+  (try
+    (norm/normalize form {})
+    false
+    (catch python/Exception e
+      (= :balli.core/invalid-schema (:type (ex-data e))))))
+
+(defn- error-types
+  [s x]
+  (mapv :type (:errors (b/explain s x))))
+
+;; ---------------------------------------------------------------------------
+;; Normalize + schema boundary
+
+(deftest normalize-seqex-boundaries
+  (testing ":cat allows zero children, :alt requires one"
+    (is (= :cat (:type (norm/normalize [:cat] {}))))
+    (is (= 0 (count (:children (norm/normalize [:cat] {})))))
+    (is (invalid-schema? [:alt]))
+    (is (invalid-schema? :alt)))
+  (testing ":catn/:altn take >=1 entry vectors"
+    (is (= [:n :s] (mapv :key (:children (norm/normalize [:catn [:n :int] [:s :string]] {})))))
+    (is (invalid-schema? [:catn]))
+    (is (invalid-schema? [:altn]))
+    (is (invalid-schema? [:catn :int]))
+    (is (invalid-schema? :catn)))
+  (testing ":? :* :+ :schema take exactly one child"
+    (doseq [t [:? :* :+ :schema]]
+      (is (invalid-schema? [t]))
+      (is (invalid-schema? [t :int :string]))
+      (is (= t (:type (norm/normalize [t :int] {}))))))
+  (testing ":repeat bounds are boundary-checked"
+    (is (= :repeat (:type (norm/normalize [:repeat {:min 1 :max 3} :int] {}))))
+    (is (= :repeat (:type (norm/normalize [:repeat :int] {}))))
+    (is (invalid-schema? [:repeat]))
+    (is (invalid-schema? [:repeat {:min "1"} :int]))
+    (is (invalid-schema? [:repeat {:max :three} :int]))
+    (is (invalid-schema? [:repeat {:min 3 :max 1} :int]))
+    (is (invalid-schema? [:repeat {:min -1} :int]))))
+
+;; ---------------------------------------------------------------------------
+;; Validators
+
+(deftest validate-cat
+  (is (true? (b/validate [:cat :int :string] [1 "a"])))
+  (is (true? (b/validate [:cat :int :string] (list 1 "a"))))
+  (is (false? (b/validate [:cat :int :string] [1 2])))
+  (is (false? (b/validate [:cat :int :string] [1])))
+  (is (false? (b/validate [:cat :int :string] [1 "a" 2])))
+  (testing "empty :cat matches exactly the empty sequence"
+    (is (true? (b/validate [:cat] [])))
+    (is (true? (b/validate [:cat] (list))))
+    (is (false? (b/validate [:cat] [1]))))
+  (testing "sequential? guard: strings/sets/maps/nil/python lists all reject"
+    (is (false? (b/validate [:cat :int] "a")))
+    (is (false? (b/validate [:cat :int] #{1})))
+    (is (false? (b/validate [:cat :int] {:a 1})))
+    (is (false? (b/validate [:cat :int] nil)))
+    (is (false? (b/validate [:cat :int] (python/list [1]))))))
+
+(deftest validate-alt-opt-star-plus
+  (is (true? (b/validate [:alt :int :string] [1])))
+  (is (true? (b/validate [:alt :int :string] ["a"])))
+  (is (false? (b/validate [:alt :int :string] [:kw])))
+  (is (false? (b/validate [:alt :int :string] [])))
+  (testing "alt branches may have different widths"
+    (let [s [:cat [:alt [:cat :int :int] :string] :keyword]]
+      (is (true? (b/validate s [1 2 :k])))
+      (is (true? (b/validate s ["a" :k])))
+      (is (false? (b/validate s [1 :k])))))
+  (is (true? (b/validate [:? :int] [])))
+  (is (true? (b/validate [:? :int] [1])))
+  (is (false? (b/validate [:? :int] [1 2])))
+  (is (true? (b/validate [:* :int] [])))
+  (is (true? (b/validate [:* :int] [1 2 3])))
+  (is (false? (b/validate [:* :int] [1 "x"])))
+  (is (false? (b/validate [:+ :int] [])))
+  (is (true? (b/validate [:+ :int] [1])))
+  (is (true? (b/validate [:+ :int] [1 2]))))
+
+(deftest validate-repeat-bounds
+  (let [s [:repeat {:min 2 :max 3} :int]]
+    (is (false? (b/validate s [])))
+    (is (false? (b/validate s [1])))
+    (is (true? (b/validate s [1 2])))
+    (is (true? (b/validate s [1 2 3])))
+    (is (false? (b/validate s [1 2 3 4]))))
+  (testing "missing bounds default to 0/unbounded"
+    (is (true? (b/validate [:repeat :int] [])))
+    (is (true? (b/validate [:repeat :int] [1 2 3 4 5])))
+    (is (true? (b/validate [:repeat {:min 2} :int] [1 2 3 4])))
+    (is (false? (b/validate [:repeat {:min 2} :int] [1])))
+    (is (true? (b/validate [:repeat {:max 2} :int] [])))
+    (is (false? (b/validate [:repeat {:max 2} :int] [1 2 3]))))
+  (testing "repeat of a multi-element child counts repetitions, not elements"
+    (let [s [:repeat {:min 1 :max 2} [:cat :int :string]]]
+      (is (true? (b/validate s [1 "a"])))
+      (is (true? (b/validate s [1 "a" 2 "b"])))
+      (is (false? (b/validate s [])))
+      (is (false? (b/validate s [1 "a" 2 "b" 3 "c"])))))
+  (testing "nullable child terminates (nullable-child guard)"
+    (is (true? (b/validate [:repeat {:min 2} [:cat]] [])))
+    (is (false? (b/validate [:repeat {:min 2} [:cat]] [1])))))
+
+(deftest validate-backtracking
+  (testing "greedy [:* :int] gives an element back to the trailing :int"
+    (is (true? (b/validate [:cat [:* :int] :int] [1 2 3])))
+    (is (true? (b/validate [:cat [:* :int] :int] [1])))
+    (is (false? (b/validate [:cat [:* :int] :int] [])))
+    (is (false? (b/validate [:cat [:* :int] :int] [1 2 "x"]))))
+  (testing "backtracking through nested alternatives"
+    (is (true? (b/validate [:cat [:alt [:cat :int :int] :int] :int] [1 2])))
+    (is (true? (b/validate [:cat [:alt [:cat :int :int] :int] :int] [1 2 3])))))
+
+(deftest validate-splicing-and-schema-wrapper
+  (testing "a seqex child splices into the parent's element stream"
+    (is (true? (b/validate [:* [:cat :int :string]] [1 "a" 2 "b"])))
+    (is (false? (b/validate [:* [:cat :int :string]] [1 "a" 2])))
+    (is (true? (b/validate [:cat :keyword [:* :int]] [:go 1 2 3]))))
+  (testing "[:schema <seqex>] forces single-element item semantics"
+    (is (true? (b/validate [:* [:schema [:cat :int :string]]] [[1 "a"] [2 "b"]])))
+    (is (false? (b/validate [:* [:schema [:cat :int :string]]] [1 "a"])))
+    (is (true? (b/validate [:cat :int [:schema [:cat :int :string]]] [1 [2 "b"]]))))
+  (testing "non-seqex children are single items"
+    (is (true? (b/validate [:cat :int [:vector :int]] [1 [2 3]])))
+    (is (false? (b/validate [:cat :int [:vector :int]] [1 2 3])))))
+
+(deftest validate-schema-type-transparent
+  (is (true? (b/validate [:schema :int] 5)))
+  (is (false? (b/validate [:schema :int] "x")))
+  (is (true? (b/validate [:schema {:description "wrapped"} [:vector :int]] [1 2])))
+  (testing "outside a seqex, [:schema <seqex>] validates the seqex itself"
+    (is (true? (b/validate [:schema [:cat :int :string]] [1 "a"])))
+    (is (false? (b/validate [:schema [:cat :int :string]] [1 2])))))
+
+(deftest pathological-memo-case
+  (testing "[:* [:* :int]] terminates fast on 30 elements (memo cache)"
+    (let [v (b/validator [:* [:* :int]])
+          data (vec (range 30))
+          start (time/perf-counter)
+          ok (v data)
+          bad (v (conj data "x"))
+          elapsed (- (time/perf-counter) start)]
+      (is (true? ok))
+      (is (false? bad))
+      (is (< elapsed 2.0) (str "pathological case took " elapsed "s")))))
+
+;; ---------------------------------------------------------------------------
+;; Explain
+
+(deftest explain-seqex-errors
+  (testing "valid input explains to nil"
+    (is (nil? (b/explain [:cat :int :string] [1 "a"])))
+    (is (nil? (b/explain [:cat] []))))
+  (testing "end-of-input when the sequence runs out"
+    (let [{:keys [errors]} (b/explain [:cat :int] [])]
+      (is (= 1 (count errors)))
+      (is (= :balli.core/end-of-input (:type (first errors))))
+      (is (= [0] (:path (first errors))))
+      (is (= [0] (:in (first errors))))
+      (is (nil? (:value (first errors)))))
+    (is (= [:balli.core/end-of-input] (error-types [:cat :int :string] [1]))))
+  (testing "input-remaining on trailing junk"
+    (let [{:keys [errors]} (b/explain [:cat :int] [1 2])]
+      (is (= 1 (count errors)))
+      (is (= :balli.core/input-remaining (:type (first errors))))
+      (is (= [] (:path (first errors))))
+      (is (= [1] (:in (first errors))))
+      (is (= 2 (:value (first errors))))))
+  (testing "invalid-type on non-sequential input"
+    (is (= [:balli.core/invalid-type] (error-types [:cat :int] 5)))
+    (is (= [:balli.core/invalid-type] (error-types [:* :int] "abc"))))
+  (testing "element errors carry the child index in :path, position in :in"
+    (let [{:keys [errors]} (b/explain [:cat :int :string] [1 2])]
+      (is (= 1 (count errors)))
+      (is (= :balli.core/invalid-type (:type (first errors))))
+      (is (= [1] (:path (first errors))))
+      (is (= [1] (:in (first errors))))
+      (is (= :string (:schema (first errors))))))
+  (testing ":catn/:altn use the entry TAG in :path"
+    (let [{:keys [errors]} (b/explain [:catn [:n :int] [:s :string]] [1 2])]
+      (is (= [[:s]] (mapv :path errors))))
+    (let [{:keys [errors]} (b/explain [:altn [:i :int] [:s :string]] [:kw])]
+      (is (= #{[:i] [:s]} (set (mapv :path errors))))))
+  (testing "furthest position wins; equal positions accumulate"
+    ;; both branches die at pos 1 -> both branch errors reported there
+    (let [{:keys [errors]} (b/explain [:alt [:cat :int :int] [:cat :int :string]] [1 :kw])]
+      (is (= [[1] [1]] (mapv :in errors)))
+      (is (= #{[0 1] [1 1]} (set (mapv :path errors)))))
+    ;; the branch reaching further (pos 1) shadows the one dying at pos 0
+    (let [{:keys [errors]} (b/explain [:alt [:cat :int :int] [:cat :string :string]] [1 :kw])]
+      (is (= [[1]] (mapv :in errors)))
+      (is (= [[0 1]] (mapv :path errors)))))
+  (testing "nested seqex paths accumulate through splices"
+    (let [{:keys [errors]} (b/explain [:cat :keyword [:* :int]] [:go 1 "x"])]
+      (is (= [:balli.core/invalid-type :balli.core/input-remaining]
+             (mapv :type errors)))
+      (is (= [1 0] (:path (first errors))))
+      (is (= [2] (:in (first errors)))))))
+
+(deftest humanize-seqex-errors
+  (is (= [["end of input"]] (be/humanize (b/explain [:cat :int] []))))
+  (is (= [nil ["unexpected input"]] (be/humanize (b/explain [:cat :int] [1 2]))))
+  (is (= [nil ["should be a string"]] (be/humanize (b/explain [:cat :int :string] [1 2]))))
+  (is (= {:args [nil nil ["should be an integer" "unexpected input"]]}
+         (be/humanize (b/explain [:map [:args [:cat :keyword [:* :int]]]]
+                                 {:args [:go 1 "x"]})))))
+
+;; ---------------------------------------------------------------------------
+;; Parse / unparse
+
+(deftest parse-shapes
+  (testing ":cat -> vector"
+    (is (= [1 "a"] (b/parse [:cat :int :string] [1 "a"])))
+    (is (= [] (b/parse [:cat] []))))
+  (testing ":catn -> Tags"
+    (let [p (b/parse [:catn [:n :int] [:s :string]] [1 "x"])]
+      (is (b/tags? p))
+      (is (= {:n 1 :s "x"} (:values p)))))
+  (testing ":alt -> matched value, first branch preferred"
+    (is (= 1 (b/parse [:alt :int :string] [1])))
+    (is (= "a" (b/parse [:alt :int :string] ["a"])))
+    (is (= 5 (b/parse [:alt :int :number] [5]))))
+  (testing ":altn -> Tag"
+    (let [p (b/parse [:altn [:i :int] [:s :string]] ["x"])]
+      (is (b/tag? p))
+      (is (= :s (:key p)))
+      (is (= "x" (:value p)))))
+  (testing ":? -> value or nil"
+    (is (= 5 (b/parse [:? :int] [5])))
+    (is (nil? (b/parse [:? :int] []))))
+  (testing ":* / :+ / :repeat -> vector"
+    (is (= [1 2] (b/parse [:* :int] [1 2])))
+    (is (= [] (b/parse [:* :int] [])))
+    (is (= [1] (b/parse [:+ :int] [1])))
+    (is (= [1 2] (b/parse [:repeat {:min 1 :max 3} :int] [1 2]))))
+  (testing "nested seqex parse nests"
+    (is (= [[1 "a"] [2 "b"]] (b/parse [:* [:cat :int :string]] [1 "a" 2 "b"])))
+    (is (= [:go [1 2]] (b/parse [:cat :keyword [:* :int]] [:go 1 2])))
+    (let [p (b/parse [:catn [:cmd :keyword] [:ns [:* :int]]] [:go 1 2])]
+      (is (b/tags? p))
+      (is (= {:cmd :go :ns [1 2]} (:values p)))))
+  (testing "[:schema <seqex>] parses its element via the child's own parse"
+    (is (= [[1 "a"]] (b/parse [:* [:schema [:cat :int :string]]] [[1 "a"]]))))
+  (testing "invalid input -> sentinel"
+    (is (b/invalid? (b/parse [:cat :int] [1 2])))
+    (is (b/invalid? (b/parse [:cat :int] ["x"])))
+    (is (b/invalid? (b/parse [:cat :int] 5)))
+    (is (b/invalid? (b/parse [:+ :int] [])))))
+
+(deftest unparse-and-round-trips
+  (testing "round-trips for every combinator"
+    (is (round-trips? [:cat :int :string] [1 "a"]))
+    (is (round-trips? [:cat] []))
+    (is (round-trips? [:catn [:n :int] [:s :string]] [1 "x"]))
+    (is (round-trips? [:alt :int :string] [1]))
+    (is (round-trips? [:altn [:i :int] [:s :string]] ["x"]))
+    (is (round-trips? [:? :int] [5]))
+    (is (round-trips? [:? :int] []))
+    (is (round-trips? [:* :int] [1 2 3]))
+    (is (round-trips? [:* :int] []))
+    (is (round-trips? [:+ :int] [1]))
+    (is (round-trips? [:repeat {:min 1 :max 3} :int] [1 2]))
+    (is (round-trips? [:schema [:cat :int :string]] [1 "a"])))
+  (testing "unparse re-splices nested parses (concat)"
+    (is (= [1 "a" 2 "b"] (b/unparse [:* [:cat :int :string]] [[1 "a"] [2 "b"]])))
+    (is (= [:go 1 2] (b/unparse [:cat :keyword [:* :int]] [:go [1 2]])))
+    (is (= [:go 1 2] (b/unparse [:catn [:cmd :keyword] [:ns [:* :int]]]
+                                (b/tags {:cmd :go :ns [1 2]}))))
+    (is (round-trips? [:* [:cat :int :string]] [1 "a" 2 "b"])))
+  (testing "unparse nil for :? with no match -> []"
+    (is (= [] (b/unparse [:? :int] nil))))
+  (testing "unparse shape mismatches -> sentinel"
+    (is (b/invalid? (b/unparse [:cat :int :string] [1])))
+    (is (b/invalid? (b/unparse [:cat :int :string] [1 2])))
+    (is (b/invalid? (b/unparse [:cat :int :string] "no")))
+    (is (b/invalid? (b/unparse [:catn [:n :int]] (b/tags {:wrong 1}))))
+    (is (b/invalid? (b/unparse [:catn [:n :int]] {:n 1})))
+    (is (b/invalid? (b/unparse [:altn [:i :int]] (b/tag :nope 1))))
+    (is (b/invalid? (b/unparse [:altn [:i :int]] 1)))
+    (is (b/invalid? (b/unparse [:+ :int] [])))
+    (is (b/invalid? (b/unparse [:repeat {:min 2 :max 3} :int] [1])))
+    (is (b/invalid? (b/unparse [:* :int] [1 "x"])))
+    (is (b/invalid? (b/unparse [:* :int] 5))))
+  (testing "repeat unparse counts repetitions, not elements"
+    (is (= [1 "a" 2 "b"] (b/unparse [:repeat {:min 1 :max 2} [:cat :int :string]]
+                                    [[1 "a"] [2 "b"]])))
+    (is (b/invalid? (b/unparse [:repeat {:min 1 :max 2} [:cat :int :string]]
+                               [[1 "a"] [2 "b"] [3 "c"]])))))
+
+(deftest parse-composition
+  (testing "seqex inside a :map entry round-trips"
+    (let [s [:map [:args [:cat :keyword [:* :int]]]]
+          v {:args [:go 1 2]}
+          p (b/parse s v)]
+      (is (= {:args [:go [1 2]]} p))
+      (is (= v (b/unparse s p)))))
+  (testing "catn inside a :map entry produces nested Tags"
+    (let [s [:map [:cmd [:catn [:op :keyword] [:n :int]]]]
+          p (b/parse s {:cmd [:inc 1]})]
+      (is (b/tags? (:cmd p)))
+      (is (= {:op :inc :n 1} (:values (:cmd p))))
+      (is (= {:cmd [:inc 1]} (b/unparse s p)))))
+  (testing ":and with a single transforming seqex child parses through it"
+    (let [s [:and [:cat :int :int] [:fn (fn [v] (= 2 (count v)))]]]
+      (is (= [1 2] (b/parse s [1 2])))
+      (is (= [1 2] (b/unparse s [1 2])))
+      (is (b/invalid? (b/parse s [1 2 3]))))))
+
+(deftest ref-in-seqex-throws
+  (let [r (reg/registry {:pos :int})]
+    (doseq [form [[:cat [:ref :pos]]
+                  [:* [:ref :pos]]
+                  [:alt [:ref :pos] :int]
+                  [:catn [:x [:ref :pos]]]]]
+      (is (= :balli.core/potentially-recursive-seqex
+             (try
+               (b/validator form {:registry r})
+               nil
+               (catch python/Exception e (:type (ex-data e)))))
+          (str "validator " form))
+      (is (= :balli.core/potentially-recursive-seqex
+             (try
+               (b/parser form {:registry r})
+               nil
+               (catch python/Exception e (:type (ex-data e)))))
+          (str "parser " form))))
+  (testing "[:schema [:ref ...]] is the escape hatch (item semantics)"
+    (let [r (reg/registry {:pos :int})]
+      (is (true? (b/validate [:cat [:schema [:ref :pos]] :string] [1 "a"] {:registry r})))
+      (is (false? (b/validate [:cat [:schema [:ref :pos]] :string] ["x" "a"] {:registry r}))))))
+
+;; ---------------------------------------------------------------------------
+;; regex-min-max (Phase 8 dependency)
+
+(deftest regex-min-max-bounds
+  (letfn [(mm [form] (bc/regex-min-max (norm/normalize form {})))]
+    (is (= {:min 1 :max 1} (mm :int)))
+    (is (= {:min 1 :max 1} (mm [:schema [:cat :int :int]])))
+    (is (= {:min 2 :max 2} (mm [:cat :int :string])))
+    (is (= {:min 0 :max 0} (mm [:cat])))
+    (is (= {:min 2 :max 2} (mm [:catn [:a :int] [:b :int]])))
+    (is (= {:min 1 :max 2} (mm [:alt [:cat :int :int] :string])))
+    (is (= {:min 1 :max 2} (mm [:altn [:two [:cat :int :int]] [:one :string]])))
+    (is (= {:min 0 :max 1} (mm [:? :int])))
+    (is (= {:min 0} (mm [:* :int])))
+    (is (= {:min 1} (mm [:+ :int])))
+    (is (= {:min 2} (mm [:+ [:cat :int :int]])))
+    (is (= {:min 4 :max 6} (mm [:repeat {:min 2 :max 3} [:cat :int :int]])))
+    (is (= {:min 2} (mm [:repeat {:min 2} :int])))
+    (is (= {:min 1} (mm [:cat :keyword [:* :int]])))
+    (is (= {:min 0 :max 3} (mm [:cat [:? :int] [:repeat {:min 0 :max 2} :int]])))))
+
+;; ---------------------------------------------------------------------------
+;; Cross-surface integration (additive)
+
+(deftest seqex-walk
+  (is (= [:cat :int [:* :string]]
+         (b/walk [:cat :int [:* :string]] (fn [form _path] form))))
+  (is (= [:catn [:n :int] [:s :string]]
+         (b/walk [:catn [:n :int] [:s :string]] (fn [form _path] form))))
+  (is (= [:schema :int] (b/walk [:schema :int] (fn [form _path] form))))
+  (testing "entry tags walk like :map keys, indexed children like :or's"
+    (let [paths (atom [])]
+      (b/walk [:catn [:n :int] [:s :string]]
+              (fn [form path] (swap! paths conj path) form))
+      (is (= [[:n] [:s] []] @paths)))
+    (let [paths (atom [])]
+      (b/walk [:cat :int [:* :string]]
+              (fn [form path] (swap! paths conj path) form))
+      (is (= [[0] [1 0] [1] []] @paths)))))
+
+(deftest seqex-util-get
+  (is (= :int (u/get [:cat :int :string] 0)))
+  (is (= :string (u/get [:cat :int :string] 1)))
+  (is (nil? (u/get [:cat :int :string] 2)))
+  (is (= :string (u/get [:catn [:n :int] [:s :string]] :s)))
+  (is (nil? (u/get [:catn [:n :int] [:s :string]] :nope)))
+  (is (= :int (u/get [:alt :int :string] 0)))
+  (is (= :string (u/get [:altn [:i :int] [:s :string]] :s)))
+  (is (= :int (u/get [:* :int] 0)))
+  (is (= :int (u/get [:schema :int] 0)))
+  (is (= :int (u/get-in [:map [:args [:cat :keyword [:* :int]]]] [:args 1 0]))))
+
+(deftest seqex-json-schema
+  (testing "seqex -> best-effort array (lossy; items only when one distinct child)"
+    (is (= {"type" "array" "items" {"type" "integer"}} (bjs/transform [:* :int])))
+    (is (= {"type" "array" "items" {"type" "integer"}} (bjs/transform [:+ :int])))
+    (is (= {"type" "array" "items" {"type" "integer"}} (bjs/transform [:? :int])))
+    (is (= {"type" "array" "items" {"type" "integer"}}
+           (bjs/transform [:repeat {:min 1 :max 3} :int])))
+    (is (= {"type" "array" "items" {"type" "integer"}} (bjs/transform [:cat :int :int])))
+    (is (= {"type" "array"} (bjs/transform [:cat :int :string])))
+    (is (= {"type" "array"} (bjs/transform [:cat])))
+    (is (= {"type" "array" "items" {"type" "integer"}}
+           (bjs/transform [:catn [:a :int] [:b :int]])))
+    (is (= {"type" "array"} (bjs/transform [:altn [:i :int] [:s :string]]))))
+  (testing ":schema is transparent"
+    (is (= {"type" "integer"} (bjs/transform [:schema :int])))
+    (is (= {"type" "integer" "title" "n"} (bjs/transform [:schema {:title "n"} :int])))))
+
+(deftest seqex-transformers-pass-through
+  (testing "seqex types and :schema decode/encode as identity pass-through"
+    (is (= ["1" "x"] (b/decode [:cat :int :string] ["1" "x"] (bt/string-transformer))))
+    (is (= ["1"] (b/decode [:* :int] ["1"] (bt/string-transformer))))
+    (is (= "1" (b/decode [:schema :int] "1" (bt/string-transformer))))
+    (is (= [1 2] (b/encode [:cat :int :int] [1 2] (bt/string-transformer)))))
+  (testing "seqex nested in a map does not block sibling transforms"
+    (is (= {:n 1 :args [:go "2"]}
+           (b/decode [:map [:n :int] [:args [:cat :keyword [:* :int]]]]
+                     {:n "1" :args [:go "2"]}
+                     (bt/string-transformer))))))
+
+(deftest seqex-validator-caching
+  (testing "schema objects cache seqex compilations like any other"
+    (let [s (b/schema [:cat :int [:* :string]])]
+      (is (true? (b/validate s [1 "a"])))
+      (is (identical? (b/validator s) (b/validator s)))
+      (is (false? (b/validate s [1 1])))
+      (is (= [1 ["a" "b"]] (b/parse s [1 "a" "b"])))
+      (is (= [1 "a" "b"] (b/unparse s [1 ["a" "b"]]))))))

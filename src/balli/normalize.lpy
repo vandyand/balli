@@ -233,6 +233,64 @@
       (node :re props [pattern] form))))
 
 ;; ---------------------------------------------------------------------------
+;; Sequence (regex) schemas: :cat :catn :alt :altn :? :* :+ :repeat -- plus
+;; :schema, the transparent single-child wrapper (in a seqex it forces
+;; single-element item semantics; everywhere else it is invisible).
+;;
+;; :cat/:alt children are plain schemas (never bare maps), so a leading map
+;; is always properties (split-props-leading). :catn/:altn children are entry
+;; vectors like :map/:orn.
+
+(defmethod normalize :cat [form opts]
+  (if (keyword? form)
+    (node :cat {} [] form)
+    (let [[props elems] (split-props-leading (rest form))]
+      (node :cat props (mapv #(normalize % opts) elems) form))))
+
+(defmethod normalize :alt [form opts]
+  (when (keyword? form)
+    (invalid! ":alt requires at least one child schema" form))
+  (let [[props elems] (split-props-leading (rest form))]
+    (when (empty? elems)
+      (invalid! ":alt requires at least one child schema" form))
+    (node :alt props (mapv #(normalize % opts) elems) form)))
+
+(defn- normalize-seqex-entries
+  [t form opts]
+  (when (keyword? form)
+    (invalid! (str t " requires at least one entry") form))
+  (let [[props elems] (split-props-leading (rest form))]
+    (when (empty? elems)
+      (invalid! (str t " requires at least one entry") form))
+    (node t props (mapv #(normalize-entry % opts) elems) form)))
+
+(defmethod normalize :catn [form opts] (normalize-seqex-entries :catn form opts))
+(defmethod normalize :altn [form opts] (normalize-seqex-entries :altn form opts))
+
+(defmethod normalize :? [form opts] (normalize-single-child form opts))
+(defmethod normalize :* [form opts] (normalize-single-child form opts))
+(defmethod normalize :+ [form opts] (normalize-single-child form opts))
+(defmethod normalize :schema [form opts] (normalize-single-child form opts))
+
+(defmethod normalize :repeat [form opts]
+  (when (keyword? form)
+    (invalid! ":repeat requires a child schema" form))
+  (let [[props elems] (split-props-leading (rest form))]
+    (when-not (= 1 (count elems))
+      (invalid! ":repeat expects exactly 1 child schema" form))
+    (doseq [k [:min :max]]
+      (let [v (get props k)]
+        (when (and (some? v) (not (or (int? v) (float? v))))
+          (invalid! (str ":repeat " k " must be a number") form))))
+    (let [mn (:min props)
+          mx (:max props)]
+      (when (and mn (neg? mn))
+        (invalid! ":repeat :min must be non-negative" form))
+      (when (and mn mx (> mn mx))
+        (invalid! ":repeat :min must be <= :max" form)))
+    (node :repeat props [(normalize (first elems) opts)] form)))
+
+;; ---------------------------------------------------------------------------
 ;; :ref
 
 (defmethod normalize :ref [form _opts]

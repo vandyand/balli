@@ -246,18 +246,20 @@
 ;; get / get-in
 
 (def ^:private indexed-child-types
-  #{:maybe :not :vector :sequential :set :and :or :tuple :map-of})
+  #{:maybe :not :vector :sequential :set :and :or :tuple :map-of
+    :cat :alt :? :* :+ :repeat :schema})
 
 (defn get
-  "Sub-schema form of `s` at key/index `k`: :map/:multi/:orn entries by entry
-  key, indexed children (:and/:or/:tuple/:maybe/:not/colls/:map-of) by integer
-  index. nil when absent. Refs are not dereferenced."
+  "Sub-schema form of `s` at key/index `k`: :map/:multi/:orn/:catn/:altn
+  entries by entry key (tag), indexed children (:and/:or/:tuple/:maybe/:not/
+  colls/:map-of/:cat/:alt/:?/:*/:+/:repeat/:schema) by integer index. nil
+  when absent. Refs are not dereferenced."
   ([s k] (get s k {}))
   ([s k opts]
    (let [ast (->ast s opts)
          t (:type ast)]
      (cond
-       (contains? #{:map :multi :orn} t)
+       (contains? #{:map :multi :orn :catn :altn} t)
        (some (fn [{:keys [key schema]}]
                (when (= key k) (:form schema)))
              (:children ast))

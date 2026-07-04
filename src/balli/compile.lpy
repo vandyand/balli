@@ -16,6 +16,7 @@
   through a per-compilation cache atom (fn indirection), so recursive schemas
   (Phase 5) terminate on finite data."
   (:require [balli.normalize :as norm]
+            [balli.regex :as rx]
             [balli.registry :as reg]))
 
 (declare compile-node explain-node)
@@ -157,6 +158,102 @@
                            registry cache)))
     (fn [x] ((get @cache k) x))))
 
+;; ---------------------------------------------------------------------------
+;; Sequence (regex) schemas
+;;
+;; Seqex nodes compile into balli.regex combinator trees. A child that is
+;; itself a seqex SPLICES (its combinator consumes from the parent's element
+;; stream); any other child gets single-element item semantics via its
+;; ordinary compiled validator/explainer/parser. [:schema <seqex>] therefore
+;; forces item semantics (compile-node on :schema derefs to the child's
+;; whole-input wrapper). A :ref directly in seqex child position throws
+;; :balli.core/potentially-recursive-seqex at compile time -- the engine's
+;; memo cache assumes a finite combinator tree, which recursion through the
+;; registry would break.
+
+(def ^:private regex-types
+  #{:cat :catn :alt :altn :? :* :+ :repeat})
+
+(defn regex-op?
+  "True when AST node `node` is a sequence (regex) operator whose combinator
+  splices into a parent seqex's element stream."
+  [node]
+  (contains? regex-types (:type node)))
+
+(defn- throw-recursive-seqex!
+  [node]
+  (throw (ex-info "Refs inside sequence schemas are potentially recursive; wrap the ref in [:schema ...] for single-element semantics"
+                  {:type :balli.core/potentially-recursive-seqex
+                   :ref (:ref node)
+                   :form (:form node)})))
+
+(defn- repeat-bounds
+  "[min max] for a :repeat node; missing :min -> 0, missing :max -> python
+  float inf (comparable with < in the engine)."
+  [node]
+  (let [props (:properties node)]
+    [(or (:min props) 0)
+     (or (:max props) (python/float "inf"))]))
+
+(defn- regex-validator
+  "Validator combinator for seqex AST `node` (raw -- not yet wrapped in the
+  engine's whole-input driver)."
+  [node registry cache]
+  (letfn [(child* [c]
+            (cond
+              (regex-op? c) (regex-validator c registry cache)
+              (= :ref (:type c)) (throw-recursive-seqex! c)
+              :else (rx/item-validator (compile-node c registry cache))))]
+    (case (:type node)
+      :cat (rx/cat* (mapv child* (:children node)))
+      :catn (rx/cat* (mapv #(child* (:schema %)) (:children node)))
+      :alt (rx/alt* (mapv child* (:children node)))
+      :altn (rx/alt* (mapv #(child* (:schema %)) (:children node)))
+      :? (rx/opt* (child* (first (:children node))))
+      :* (rx/star* (child* (first (:children node))))
+      :+ (rx/plus* (child* (first (:children node))))
+      :repeat (let [[mn mx] (repeat-bounds node)]
+                (rx/repeat* mn mx (child* (first (:children node))))))))
+
+(defn regex-min-max
+  "Matched-element count bounds for seqex AST node `ast`: {:min n :max m},
+  :max absent when unbounded (:*/:+/unbounded :repeat). Any non-seqex node
+  counts as one element {:min 1 :max 1} -- including [:schema ...] wrappers,
+  which is exactly their point. Phase 8 uses this for :=>/:function arities."
+  [ast]
+  (letfn [(entry-nodes [node]
+            (if (contains? #{:catn :altn} (:type node))
+              (mapv :schema (:children node))
+              (:children node)))
+          (mm [node]
+            (case (:type node)
+              (:cat :catn)
+              (reduce (fn [[amin amax] c]
+                        (let [[cmin cmax] (mm c)]
+                          [(+ amin cmin) (when (and amax cmax) (+ amax cmax))]))
+                      [0 0]
+                      (entry-nodes node))
+
+              (:alt :altn)
+              (reduce (fn [[amin amax] [cmin cmax]]
+                        [(min amin cmin) (when (and amax cmax) (max amax cmax))])
+                      (mapv mm (entry-nodes node)))
+
+              :? (let [[_ cmax] (mm (first (:children node)))]
+                   [0 cmax])
+              :* [0 nil]
+              :+ (let [[cmin _] (mm (first (:children node)))]
+                   [cmin nil])
+              :repeat (let [[cmin cmax] (mm (first (:children node)))
+                            props (:properties node)
+                            mn (or (:min props) 0)
+                            mx (:max props)]
+                        [(* mn cmin) (when (and mx cmax) (* mx cmax))])
+
+              [1 1]))]
+    (let [[mn mx] (mm ast)]
+      (if mx {:min mn :max mx} {:min mn}))))
+
 (defn- compile-node
   [node registry cache]
   (case (:type node)
@@ -213,7 +310,13 @@
       (fn [x] (boolean (and (string? x) (re-matches pattern x)))))
 
     :multi (compile-multi node registry cache)
-    :ref (compile-ref node registry cache)))
+    :ref (compile-ref node registry cache)
+
+    ;; transparent wrapper: validates exactly as its child
+    :schema (compile-node (first (:children node)) registry cache)
+
+    (:cat :catn :alt :altn :? :* :+ :repeat)
+    (rx/validator (regex-validator node registry cache))))
 
 (defn compile-validator
   "Compile AST node `ast` against `registry` into a 1-arg validator fn
@@ -423,6 +526,34 @@
                            registry cache)))
     (fn [x path in] ((get @cache k) x path in))))
 
+(defn- regex-explainer
+  "Explainer combinator for seqex AST `node`. `rel-path` is the node's
+  schema path relative to the seqex ROOT -- item errors report at
+  (into base-path rel-path) where base-path is only known at runtime (the
+  engine's driver carries it). :cat/:alt children get their index appended,
+  :catn/:altn children their entry TAG, single-child ops 0."
+  [node registry cache rel-path]
+  (letfn [(child* [c p]
+            (cond
+              (regex-op? c) (regex-explainer c registry cache p)
+              (= :ref (:type c)) (throw-recursive-seqex! c)
+              :else (rx/item-explainer (explain-node c registry cache) p (:form c))))
+          (indexed [children]
+            (vec (map-indexed (fn [i c] (child* c (conj rel-path i))) children)))
+          (tagged [entries]
+            (mapv (fn [{:keys [key schema]}] (child* schema (conj rel-path key)))
+                  entries))]
+    (case (:type node)
+      :cat (rx/cat* (indexed (:children node)))
+      :catn (rx/cat* (tagged (:children node)))
+      :alt (rx/alt* (indexed (:children node)))
+      :altn (rx/alt* (tagged (:children node)))
+      :? (rx/opt* (child* (first (:children node)) (conj rel-path 0)))
+      :* (rx/star* (child* (first (:children node)) (conj rel-path 0)))
+      :+ (rx/plus* (child* (first (:children node)) (conj rel-path 0)))
+      :repeat (let [[mn mx] (repeat-bounds node)]
+                (rx/repeat* mn mx (child* (first (:children node)) (conj rel-path 0)))))))
+
 (defn- explain-node
   [node registry cache]
   (case (:type node)
@@ -531,7 +662,13 @@
           :else [(err path in form x :balli.core/invalid)])))
 
     :multi (explain-multi node registry cache)
-    :ref (explain-ref node registry cache)))
+    :ref (explain-ref node registry cache)
+
+    ;; transparent wrapper: explains exactly as its child (no :path segment)
+    :schema (explain-node (first (:children node)) registry cache)
+
+    (:cat :catn :alt :altn :? :* :+ :repeat)
+    (rx/explainer (regex-explainer node registry cache []) (:form node))))
 
 (defn compile-explainer
   "Compile AST node `ast` against `registry` into an explainer fn
@@ -569,18 +706,18 @@
   (= -invalid x))
 
 (defn- transforming-parser?
-  "True when `node`'s parser produces structure (Tag/Tags) rather than the
-  value itself: :orn/:multi directly (Phase 6 hook: :catn/:altn and the seqex
-  types :cat/:alt/:?/:*/:+/:repeat join this set when their parsers land),
-  recursing through :and/:or/:maybe children and through refs via the
-  registry. `visited` is the set of ref keywords already under analysis -- a
-  ref cycle counts as NON-transforming (the analysis terminates instead of
-  looping)."
+  "True when `node`'s parser produces structure rather than the value
+  itself: :orn/:multi (Tag) and ALL seqex types (:catn -> Tags, :altn ->
+  Tag, :cat/:alt/:?/:*/:+/:repeat -> reshaped vectors/values -- matching
+  malli, which marks every seqex parser as transforming), recursing through
+  :and/:or/:maybe/:schema children and through refs via the registry.
+  `visited` is the set of ref keywords already under analysis -- a ref cycle
+  counts as NON-transforming (the analysis terminates instead of looping)."
   [node registry visited]
   (case (:type node)
-    (:orn :multi) true
+    (:orn :multi :cat :catn :alt :altn :? :* :+ :repeat) true
 
-    (:and :or :maybe)
+    (:and :or :maybe :schema)
     (boolean (some #(transforming-parser? % registry visited) (:children node)))
 
     :ref
@@ -805,6 +942,54 @@
                          registry cache mode)))
     (fn [x] ((get @cache k) x))))
 
+(defn- regex-parser
+  "Parser combinator for seqex AST `node`. Parse shapes: :cat -> vector,
+  :catn -> Tags, :alt -> matched value, :altn -> Tag, :? -> value-or-nil,
+  :*/:+/:repeat -> vector; nested seqex children nest (their parse shape
+  becomes one element of the parent's)."
+  [node registry cache]
+  (letfn [(child* [c]
+            (cond
+              (regex-op? c) (regex-parser c registry cache)
+              (= :ref (:type c)) (throw-recursive-seqex! c)
+              :else (rx/item-parser (coder-node c registry cache :parse))))
+          (tagged [entries]
+            (mapv (fn [{:keys [key schema]}] [key (child* schema)]) entries))]
+    (case (:type node)
+      :cat (rx/cat-parser (mapv child* (:children node)))
+      :catn (rx/catn-parser ->Tags (tagged (:children node)))
+      :alt (rx/alt-parser (mapv child* (:children node)))
+      :altn (rx/altn-parser ->Tag (tagged (:children node)))
+      :? (rx/opt-parser (child* (first (:children node))))
+      :* (rx/star-parser (child* (first (:children node))))
+      :+ (rx/plus-parser (child* (first (:children node))))
+      :repeat (let [[mn mx] (repeat-bounds node)]
+                (rx/repeat-parser mn mx (child* (first (:children node))))))))
+
+(defn- regex-unparser
+  "Unparser for seqex AST `node`: a plain fn inverting the parse (no engine
+  run) -- validates the parse shape, unparses each part, and concat-splices
+  child sequences back into a flat vector; :balli.core/invalid on any
+  mismatch. The root unparser's result IS the unparsed sequence."
+  [node registry cache]
+  (letfn [(child* [c]
+            (cond
+              (regex-op? c) (regex-unparser c registry cache)
+              (= :ref (:type c)) (throw-recursive-seqex! c)
+              :else (rx/item-unparser (coder-node c registry cache :unparse))))
+          (tagged [entries]
+            (mapv (fn [{:keys [key schema]}] [key (child* schema)]) entries))]
+    (case (:type node)
+      :cat (rx/cat-unparser (mapv child* (:children node)))
+      :catn (rx/catn-unparser (fn [x] (instance? Tags x)) (tagged (:children node)))
+      :alt (rx/alt-unparser (mapv child* (:children node)))
+      :altn (rx/altn-unparser (fn [x] (instance? Tag x)) (tagged (:children node)))
+      :? (rx/opt-unparser (child* (first (:children node))))
+      :* (rx/star-unparser (child* (first (:children node))))
+      :+ (rx/plus-unparser (child* (first (:children node))))
+      :repeat (let [[mn mx] (repeat-bounds node)]
+                (rx/repeat-unparser mn mx (child* (first (:children node))))))))
+
 (defn- coder-node
   [node registry cache mode]
   (case (:type node)
@@ -843,7 +1028,15 @@
     :tuple (coder-tuple node registry cache mode)
     :map (coder-map node registry cache mode)
     :map-of (coder-map-of node registry cache mode)
-    :ref (coder-ref node registry cache mode)))
+    :ref (coder-ref node registry cache mode)
+
+    ;; transparent wrapper: parses/unparses exactly as its child
+    :schema (coder-node (first (:children node)) registry cache mode)
+
+    (:cat :catn :alt :altn :? :* :+ :repeat)
+    (if (= :parse mode)
+      (rx/parser (regex-parser node registry cache))
+      (regex-unparser node registry cache))))
 
 (defn compile-parser
   "Compile AST node `ast` against `registry` into a 1-arg parser fn:
