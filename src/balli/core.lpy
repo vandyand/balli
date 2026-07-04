@@ -10,7 +10,8 @@
   registry map (default registry = token 0)."
   (:require [balli.compile :as c]
             [balli.normalize :as norm]
-            [balli.registry :as reg]))
+            [balli.registry :as reg]
+            [balli.transform :as bt]))
 
 (def version "0.1.0")
 
@@ -171,6 +172,89 @@
   `opts` supports {:registry r} and is ignored when `s` is a schema object."
   ([s value] ((explainer s) value))
   ([s value opts] ((explainer s opts) value)))
+
+;; ---------------------------------------------------------------------------
+;; decode/encode/coerce (Phase 1: transformers)
+;;
+;; Schema objects cache compiled coders in their own cache atom under
+;; [:decode <transformer-id>] / [:encode <transformer-id>] -- transformer
+;; identity comes from the :id token every transformer object carries (same
+;; pattern as registry-id for the raw cache). Raw-form calls with a
+;; transformer SKIP the global raw-form cache entirely (simplest correct:
+;; transformer identity would otherwise have to join the cache key, and
+;; ad-hoc inline transformers would poison/grow it) -- each raw-form call
+;; normalizes and compiles fresh. Hoist `(schema ...)` and the transformer
+;; into defs for hot paths.
+
+(defn- compile-coder
+  "Compile a decode/encode fn for schema object `s` and transformer `t`
+  (already coerced via into-transformer). nil compilation result collapses to
+  identity."
+  [s t method opts]
+  (or (bt/compile-transformer (:ast s) (:registry s) t method opts)
+      identity))
+
+(defn- coder
+  [s t method opts]
+  (let [t (bt/into-transformer t)]
+    (if (schema? s)
+      (let [k [method (if t (:id t) ::identity)]]
+        (or (get @(:cache s) k)
+            (let [f (compile-coder s t method opts)]
+              (swap! (:cache s) assoc k f)
+              f)))
+      ;; raw form + transformer: bypass the global raw-form cache (see above)
+      (compile-coder (schema s opts) t method opts))))
+
+(defn decoder
+  "Compiled 1-arg decode fn for `s` (raw form or schema object) using
+  transformer `t` (transformer object, chain-link map, 0-arg fn returning a
+  transformer, or nil for identity). `opts` supports {:registry r} for raw
+  forms (ignored when `s` is a schema object -- its baked-in registry wins)."
+  ([s t] (decoder s t {}))
+  ([s t opts] (coder s t :decode opts)))
+
+(defn encoder
+  "Compiled 1-arg encode fn for `s` using transformer `t`. See `decoder`."
+  ([s t] (encoder s t {}))
+  ([s t opts] (coder s t :encode opts)))
+
+(defn decode
+  "Decode `value` against `s` with transformer `t`. Never throws on
+  mismatching values -- coercions are lenient (unchanged on mismatch)."
+  ([s value t] ((decoder s t) value))
+  ([s value t opts] ((decoder s t opts) value)))
+
+(defn encode
+  "Encode `value` against `s` with transformer `t`. Lenient like `decode`."
+  ([s value t] ((encoder s t) value))
+  ([s value t opts] ((encoder s t opts) value)))
+
+(defn coercer
+  "Fn that decodes with `t` then validates: returns the decoded value when
+  valid, else throws ex-info {:type :balli.core/coercion :value <decoded>
+  :schema <form> :explain <explain map>}."
+  ([s t] (coercer s t {}))
+  ([s t opts]
+   (let [so (schema s opts)
+         d (decoder so t opts)
+         v (validator so)
+         e (explainer so)]
+     (fn [value]
+       (let [decoded (d value)]
+         (if (v decoded)
+           decoded
+           (throw (ex-info "Coercion failed"
+                           {:type :balli.core/coercion
+                            :value decoded
+                            :schema (:form so)
+                            :explain (e decoded)}))))))))
+
+(defn coerce
+  "One-shot `coercer`: decode `value` with `t`, return it when it validates
+  against `s`, else throw ex-info {:type :balli.core/coercion ...}."
+  ([s value t] ((coercer s t) value))
+  ([s value t opts] ((coercer s t opts) value)))
 
 (defn assert-valid
   "Return `value` when it validates against `s`, else throw ex-info

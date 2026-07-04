@@ -1,0 +1,697 @@
+(ns balli.transform
+  "Value transformers (decode/encode) for balli, per Malli 0.20 semantics.
+
+  A transformer is a plain map:
+    {:balli/transformer true
+     :id <int>                          ; identity token for caching in core
+     :chain [{:name <kw>
+              :decoders {type interceptor}
+              :encoders {type interceptor}
+              :default-decoder interceptor
+              :default-encoder interceptor} ...]}
+
+  An interceptor is one of:
+    - a plain fn                     -> {:enter f}
+    - {:enter f :leave g}            -> as-is (either key optional)
+    - {:compile (fn [ast opts] ..)}  -> compiled per schema node, result
+                                        normalized + merged (real fns, no eval)
+  Per schema node the chain folds IN ORDER: enter composes in chain order,
+  leave in reverse chain order (interceptor stack). Per link, the interceptor
+  resolves by priority: schema prop {:decode {:string f}} -> qualified prop
+  :decode/string -> per-type table -> :default-decoder/:default-encoder.
+
+  `compile-transformer` compiles an AST + registry + transformer + method into
+  a single 1-arg fn, or nil when the whole subtree has no transformations
+  (nil collapses to identity at the API layer -- no identity-fn wrapping)."
+  (:import uuid)
+  (:require [balli.compile :as c]
+            [balli.normalize :as norm]
+            [balli.registry :as reg]))
+
+;; ---------------------------------------------------------------------------
+;; Transformer construction
+
+(def ^:private transformer-id-counter
+  "Monotonic identity tokens for transformer objects; balli.core caches
+  compiled coders per [method id] in a schema object's cache atom."
+  (atom 0))
+
+(defn transformer?
+  "True when `x` is a balli transformer object."
+  [x]
+  (boolean (and (map? x) (:balli/transformer x))))
+
+(declare transformer)
+
+(defn into-transformer
+  "Coerce `x` into a transformer object: nil -> nil, transformer -> itself,
+  chain-link map -> single-link transformer, 0-arg callable -> its result."
+  [x]
+  (cond
+    (nil? x) nil
+    (transformer? x) x
+    (map? x) (transformer x)
+    (python/callable x) (into-transformer (x))
+    :else (throw (ex-info "Invalid transformer"
+                          {:type :balli.transform/invalid-transformer :value x}))))
+
+(defn transformer
+  "Compose `ts` (chain-link maps, transformers, 0-arg fns returning
+  transformers, or nils) into a single transformer by flattening every
+  argument's chain, in order. Returns nil when the resulting chain is empty."
+  [& ts]
+  (let [chain (vec (mapcat (fn [t]
+                             (cond
+                               (nil? t) nil
+                               (transformer? t) (:chain t)
+                               (map? t) [t]
+                               (python/callable t) (:chain (into-transformer t))
+                               :else (throw (ex-info "Invalid transformer"
+                                                     {:type :balli.transform/invalid-transformer
+                                                      :value t}))))
+                           ts))]
+    (when (seq chain)
+      {:balli/transformer true
+       :id (swap! transformer-id-counter inc)
+       :chain chain})))
+
+;; ---------------------------------------------------------------------------
+;; Interceptor machinery
+
+(def ^:private max-compile-depth
+  "Guard against {:compile ...} interceptors that keep returning further
+  {:compile ...} maps."
+  10)
+
+(defn -interceptor
+  "Normalize interceptor spec `x` against schema node `ast` into
+  {:enter f :leave g} (either key may be absent), or nil."
+  [x ast opts]
+  (cond
+    (nil? x) nil
+
+    (and (map? x) (contains? x :compile))
+    (let [depth (get opts :balli.transform/compile-depth 0)]
+      (when (>= depth max-compile-depth)
+        (throw (ex-info "Too deep transformer compilation"
+                        {:type :balli.transform/too-deep-compilation :interceptor x})))
+      (when-some [i (-interceptor ((:compile x) ast opts) ast
+                                  (assoc opts :balli.transform/compile-depth (inc depth)))]
+        (merge (dissoc x :compile) i)))
+
+    (and (map? x) (or (contains? x :enter) (contains? x :leave)))
+    x
+
+    ;; Maps are python-callable in Basilisp, so reject remaining maps before
+    ;; the callable branch.
+    (map? x)
+    (throw (ex-info "Invalid transformer interceptor"
+                    {:type :balli.transform/invalid-transformer :value x}))
+
+    (python/callable x) {:enter x}
+
+    :else (throw (ex-info "Invalid transformer interceptor"
+                          {:type :balli.transform/invalid-transformer :value x}))))
+
+(defn- fold-interceptors
+  "Fold interceptor `i2` (a later chain link) onto accumulated `i1`:
+  enter composes in chain order, leave in reverse chain order."
+  [i1 i2]
+  (let [e1 (:enter i1) e2 (:enter i2)
+        l1 (:leave i1) l2 (:leave i2)]
+    {:enter (if (and e1 e2) (fn [x] (e2 (e1 x))) (or e1 e2))
+     :leave (if (and l1 l2) (fn [x] (l1 (l2 x))) (or l1 l2))}))
+
+(defn -intercepting
+  "Combine an interceptor with a child transformer fn `f` into a single fn:
+  leave(f(enter(x))), eliding absent parts. Returns nil when everything is
+  absent (identity collapse)."
+  ([i] (-intercepting i nil))
+  ([{:keys [enter leave]} f]
+   (letfn [(comp-some [a b] (if (and a b) (fn [x] (a (b x))) (or a b)))]
+     (comp-some leave (comp-some f enter)))))
+
+(defn -value-transformer
+  "Resolve the value interceptor for schema node `ast` by reducing over
+  `chain` in order. Per link, resolution priority:
+    1. schema prop under the method map, e.g. {:decode {:string f}}
+    2. schema prop under the qualified name, e.g. :decode/string
+    3. the link's per-type table (:decoders/:encoders) keyed by node type
+    4. the link's :default-decoder/:default-encoder
+  Returns {:enter f :leave g} or nil."
+  [chain ast method opts]
+  (reduce
+   (fn [acc link]
+     (let [nm (:name link)
+           qname (when (and nm (nil? (namespace nm)))
+                   (keyword (name method) (name nm)))
+           props (:properties ast)
+           table (if (= :decode method) (:decoders link) (:encoders link))
+           default (if (= :decode method) (:default-decoder link) (:default-encoder link))
+           spec (or (when nm (get (get props method) nm))
+                    (when qname (get props qname))
+                    (get table (:type ast))
+                    default)
+           i (when (some? spec) (-interceptor spec ast opts))]
+       (cond
+         (nil? i) acc
+         (nil? acc) i
+         :else (fold-interceptors acc i))))
+   nil chain))
+
+;; ---------------------------------------------------------------------------
+;; Per-node compilation (leave . children . enter, nil sub-trees collapse)
+
+(declare transform-node)
+
+(defn- guard
+  "Apply `tf` only when `pred` holds, else pass through. nil tf stays nil."
+  [pred tf]
+  (when tf
+    (fn [x] (if (pred x) (tf x) x))))
+
+(defn- chain-fns
+  "Compose fns in `ts` left-to-right (first applied first)."
+  [ts]
+  (if (= 1 (count ts))
+    (first ts)
+    (fn [x] (reduce (fn [v t] (t v)) x ts))))
+
+(defn- children-in-order
+  "Transformer for :and/:maybe/:not -- all child transformers composed in
+  child order, applied to the same value."
+  [node registry chain method opts cache]
+  (let [ts (into [] (keep #(transform-node % registry chain method opts cache))
+                 (:children node))]
+    (when (seq ts)
+      (chain-fns ts))))
+
+(defn- transform-or
+  "Decode: try each child's transformer in order, return the first result
+  that validates against that child; none valid -> the FIRST child's
+  transformed result. Encode: first child whose validator accepts the raw
+  value gets its transformer; none match -> unchanged. Collapses to nil when
+  no child has a transformer (identity either way)."
+  [node registry chain method opts cache]
+  (let [children (:children node)
+        ts (mapv #(transform-node % registry chain method opts cache) children)]
+    (when (some some? ts)
+      (let [ts (mapv #(or % identity) ts)
+            vs (mapv #(c/compile-validator % registry) children)
+            n (count children)]
+        (if (= :decode method)
+          (fn [x]
+            (loop [i 0 first* ::none]
+              (if (< i n)
+                (let [x* ((nth ts i) x)]
+                  (if ((nth vs i) x*)
+                    x*
+                    (recur (inc i) (if (identical? ::none first*) x* first*))))
+                (if (identical? ::none first*) x first*))))
+          (fn [x]
+            (loop [i 0]
+              (if (< i n)
+                (if ((nth vs i) x)
+                  ((nth ts i) x)
+                  (recur (inc i)))
+                x))))))))
+
+(defn- transform-multi
+  "Dispatch on the (post-enter) value; matching branch's transformer, no
+  matching branch -> pass-through."
+  [node registry chain method opts cache]
+  (let [d (:dispatch (:properties node))
+        dispatch-fn (if (keyword? d) (fn [x] (get x d)) d)
+        table (reduce (fn [acc {:keys [key schema]}]
+                        (if-some [t (transform-node schema registry chain method opts cache)]
+                          (assoc acc key t)
+                          acc))
+                      {}
+                      (:children node))]
+    (when (seq table)
+      (fn [x]
+        (let [dv (try
+                   (dispatch-fn x)
+                   (catch python/Exception _ ::dispatch-threw))]
+          (if-some [t (get table dv)]
+            (t x)
+            x))))))
+
+(defn- transform-map
+  "Transform only PRESENT declared keys; missing keys untouched; guarded by
+  map? (non-maps pass through)."
+  [node registry chain method opts cache]
+  (let [kts (into [] (keep (fn [{:keys [key schema]}]
+                             (when-some [t (transform-node schema registry chain method opts cache)]
+                               [key t])))
+                  (:children node))]
+    (when (seq kts)
+      (guard map?
+             (fn [x]
+               (reduce (fn [m [k t]]
+                         (if (contains? m k)
+                           (assoc m k (t (get m k)))
+                           m))
+                       x kts))))))
+
+(defn- transform-map-of
+  [node registry chain method opts cache]
+  (let [kt (transform-node (nth (:children node) 0) registry chain method opts cache)
+        vt (transform-node (nth (:children node) 1) registry chain method opts cache)]
+    (when (or kt vt)
+      (let [kt (or kt identity)
+            vt (or vt identity)]
+        (guard map?
+               (fn [x] (reduce-kv (fn [acc k v] (assoc acc (kt k) (vt v))) {} x)))))))
+
+(defn- transform-coll
+  [node registry chain method opts cache]
+  (let [t (transform-node (first (:children node)) registry chain method opts cache)]
+    (when t
+      (guard #(or (sequential? %) (set? %))
+             (case (:type node)
+               :vector (fn [x] (into [] (map t) x))
+               :set (fn [x] (into #{} (map t) x))
+               :sequential (fn [x] (mapv t x)))))))
+
+(defn- transform-tuple
+  [node registry chain method opts cache]
+  (let [its (into [] (comp (map-indexed vector)
+                           (keep (fn [[i child]]
+                                   (when-some [t (transform-node child registry chain method opts cache)]
+                                     [i t]))))
+                  (:children node))]
+    (when (seq its)
+      (guard vector?
+             (fn [x]
+               ;; Lenient deviation from malli: indexes beyond (count x) are
+               ;; skipped instead of throwing on too-short vectors.
+               (reduce (fn [v [i t]]
+                         (if (< i (count v))
+                           (assoc v i (t (nth v i)))
+                           v))
+                       x its))))))
+
+(defn- transform-ref
+  "Lazy memoized target transformer: the ref resolves (and throws on an
+  unresolved target) at compile time, but the target's transformer compiles
+  on first use through the per-compilation `cache` atom -- recursion-safe,
+  since nested refs only force after the outer entry is already cached."
+  [node registry chain method opts cache]
+  (let [k (:ref node)
+        target (reg/resolve-ref registry k)]
+    (when (nil? target)
+      (throw (ex-info "Unresolved ref" {:type :balli.core/unresolved-ref :ref k})))
+    (fn [x]
+      (let [t (or (get @cache k)
+                  (let [t* (or (transform-node (norm/normalize target {:registry registry})
+                                               registry chain method opts cache)
+                               ::identity)]
+                    (swap! cache assoc k t*)
+                    t*))]
+        (if (identical? ::identity t) x (t x))))))
+
+(defn- transform-children
+  "Per-type descent: the child part of a node's transformer, or nil when the
+  subtree has no transformations."
+  [node registry chain method opts cache]
+  (case (:type node)
+    (:any :nil :string :int :float :double :number :boolean :keyword :symbol
+          :uuid :enum := :fn :re)
+    nil
+
+    (:maybe :and :not)
+    (children-in-order node registry chain method opts cache)
+
+    :or (transform-or node registry chain method opts cache)
+    :multi (transform-multi node registry chain method opts cache)
+    :map (transform-map node registry chain method opts cache)
+    :map-of (transform-map-of node registry chain method opts cache)
+    (:vector :sequential :set) (transform-coll node registry chain method opts cache)
+    :tuple (transform-tuple node registry chain method opts cache)
+    :ref (transform-ref node registry chain method opts cache)))
+
+(defn- transform-node
+  "Node combinator: leave(children(enter(x))), absent parts elided; whole
+  subtree nil => nil (identity pass-through)."
+  [node registry chain method opts cache]
+  (let [this-t (-value-transformer chain node method opts)
+        child-t (transform-children node registry chain method opts cache)]
+    (if this-t
+      (-intercepting this-t child-t)
+      child-t)))
+
+(defn compile-transformer
+  "Compile `ast` + `registry` + transformer `t` + `method` (:decode/:encode)
+  into a single 1-arg fn, or nil when nothing transforms (identity). `opts`
+  is passed through to {:compile ...} interceptors, augmented with the
+  registry under :registry."
+  [ast registry t method opts]
+  (when-some [t (into-transformer t)]
+    (transform-node ast registry (:chain t) method
+                    (assoc opts :registry registry)
+                    (atom {}))))
+
+;; ---------------------------------------------------------------------------
+;; Scalar coercions (all LENIENT: mismatching input returned unchanged)
+
+(defn -string->long [x]
+  (if (string? x)
+    (try (python/int x) (catch python/Exception _ x))
+    x))
+
+(defn -string->double [x]
+  (if (string? x)
+    (try (python/float x) (catch python/Exception _ x))
+    x))
+
+(def -string->float -string->double)
+
+(defn -number->long [x]
+  (cond
+    (int? x) x
+    (and (float? x) (.is-integer x)) (int x)
+    :else x))
+
+(defn -number->double [x]
+  (cond
+    (float? x) x
+    (int? x) (float x)
+    :else x))
+
+(def -number->float -number->double)
+
+(defn -string->boolean [x]
+  (if (string? x)
+    (cond
+      (= "true" x) true
+      (= "false" x) false
+      :else x)
+    x))
+
+(defn -string->keyword [x]
+  (if (string? x) (keyword x) x))
+
+(defn -string->symbol [x]
+  (if (string? x) (symbol x) x))
+
+(def ^:private uuid-re
+  (re-pattern "(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
+
+(defn -string->uuid [x]
+  (if (and (string? x) (re-matches uuid-re x))
+    (try (uuid/UUID x) (catch python/Exception _ x))
+    x))
+
+(defn -keyword->string [x]
+  (if (keyword? x)
+    (if-let [nn (namespace x)]
+      (str nn "/" (name x))
+      (name x))
+    x))
+
+(defn -any->string [x]
+  (when-not (nil? x) (str x)))
+
+(defn -sequential->set [x]
+  (cond (set? x) x
+        (sequential? x) (set x)
+        :else x))
+
+(defn -sequential->vector [x]
+  (cond (vector? x) x
+        (sequential? x) (vec x)
+        :else x))
+
+(defn -sequential-or-set->vector [x]
+  (cond (vector? x) x
+        (or (set? x) (sequential? x)) (vec x)
+        :else x))
+
+(defn -sequential-or-set->seq [x]
+  ;; Deviation from malli (which returns nil for empty colls via `seq`):
+  ;; empty input stays an empty sequential, so :sequential still validates.
+  (cond (or (vector? x) (set? x)) (apply list x)
+        :else x))
+
+(defn -transform-map-keys
+  "Fn transforming map keys with `f`; non-maps pass through."
+  [f]
+  (fn [x]
+    (if (map? x)
+      (reduce-kv (fn [acc k v] (assoc acc (f k) v)) {} x)
+      x)))
+
+;; ---------------------------------------------------------------------------
+;; :enum/:= type inference (compile-based, reuses the same link's coders)
+
+(defn- infer-type
+  "Infer a schema type from the first :enum/:= child value."
+  [v]
+  (cond
+    (boolean? v) :boolean
+    (int? v) :int
+    (float? v) :double
+    (keyword? v) :keyword
+    (string? v) :string
+    :else nil))
+
+(defn- infer-child-compiler
+  "{:compile ...} interceptor that infers the child-value type of an
+  :enum/:= node and reuses that type's coder from `coders`."
+  [coders]
+  {:compile (fn [ast _opts]
+              (when-some [t (infer-type (first (:children ast)))]
+                (get coders t)))})
+
+(defn- add-child-compilers
+  [coders]
+  (assoc coders
+         :enum (infer-child-compiler coders)
+         := (infer-child-compiler coders)))
+
+;; ---------------------------------------------------------------------------
+;; Built-in coder tables
+
+(defn- base-json-decoders []
+  {:keyword -string->keyword
+   :symbol -string->symbol
+   :uuid -string->uuid
+   :float -number->float
+   :double -number->double
+   :int -number->long
+   :set -sequential->set})
+
+(defn -string-decoders []
+  (add-child-compilers
+   (merge (base-json-decoders)
+          {:int -string->long
+           :float -string->float
+           :double -string->double
+           :number -string->double
+           :boolean -string->boolean
+           ;; :map-of key decoding under the string transformer happens via
+           ;; ordinary key-schema descent (string decoders parse strings);
+           ;; this enter interceptor only stringifies keyword keys, matching
+           ;; malli. The json transformer needs the explicit key-decoding
+           ;; compile hook below because json decoders lack string->number.
+           :map-of (-transform-map-keys -keyword->string)
+           :vector -sequential->vector})))
+
+(defn- base-json-encoders []
+  {:keyword -keyword->string
+   :symbol -any->string
+   :uuid -any->string})
+
+(defn -json-encoders []
+  (add-child-compilers (base-json-encoders)))
+
+(defn -string-encoders []
+  (add-child-compilers
+   (merge (base-json-encoders)
+          {:int -any->string
+           :float -any->string
+           :double -any->string
+           :number -any->string
+           ;; booleans intentionally NOT stringified (malli parity)
+           })))
+
+(defn- transform-if-valid
+  "Wrap key-coercion `f`: keep the decoded key only when it validates per the
+  key schema, else keep the original key."
+  [f key-ast registry]
+  (let [valid? (c/compile-validator key-ast registry)]
+    (fn [k]
+      (let [k* (f k)]
+        (if (valid? k*) k* k)))))
+
+(defn- map-of-key-decoder
+  "The json :map-of decoder: JSON object keys are always strings, so keys are
+  decoded with the key-schema's STRING decoder (per semantics section A), kept
+  only when valid per the key schema. Falls back to keyword->string keys when
+  the key type has no string decoder."
+  [map-of-key-decoders]
+  {:compile
+   (fn [ast opts]
+     (let [registry (or (:registry opts) (reg/default-registry))
+           key-ast (first (:children ast))
+           f (some-> (get map-of-key-decoders (:type key-ast))
+                     (-interceptor key-ast opts)
+                     (-intercepting))]
+       (if f
+         (-transform-map-keys
+          (transform-if-valid (fn [k] (f (-keyword->string k))) key-ast registry))
+         (-transform-map-keys -keyword->string))))})
+
+(defn -json-decoders
+  ([] (-json-decoders (-string-decoders)))
+  ([map-of-key-decoders]
+   (add-child-compilers
+    (assoc (base-json-decoders)
+           :map-of (map-of-key-decoder map-of-key-decoders)))))
+
+;; ---------------------------------------------------------------------------
+;; Built-in transformers
+
+(defn string-transformer
+  "Decode scalars from strings (int/double/boolean/keyword/symbol/uuid/enum),
+  sequentials into vectors/sets; encode scalars to strings (booleans
+  excepted)."
+  []
+  (transformer
+   {:name :string
+    :decoders (-string-decoders)
+    :encoders (-string-encoders)}))
+
+(defn json-transformer
+  "Assumes JSON-parsed input: NO string->number/boolean coercions. Decodes
+  keyword/symbol/uuid from string, int from integral number, float/double
+  from number, sets from sequentials; :map-of keys decode via string rules
+  (JSON object keys are always strings)."
+  ([] (json-transformer nil))
+  ([{:keys [map-of-key-decoders] :or {map-of-key-decoders (-string-decoders)}}]
+   (transformer
+    {:name :json
+     :decoders (-json-decoders map-of-key-decoders)
+     :encoders (-json-encoders)})))
+
+(defn strip-extra-keys-transformer
+  "On :map -- dissoc keys not among the declared entry keys; applies when the
+  :closed property is nil or true (NOT when explicitly {:closed false}).
+  On :map-of -- keep only entries valid per the key AND value schemas
+  (leave phase for decode, enter phase for encode, matching malli)."
+  ([] (strip-extra-keys-transformer nil))
+  ([{:keys [accept]
+     :or {accept (fn [ast]
+                   (let [closed (:closed (:properties ast))]
+                     (or (nil? closed) (true? closed))))}}]
+   (let [strip-map {:compile (fn [ast _opts]
+                               (when (accept ast)
+                                 (let [ks (set (map :key (:children ast)))]
+                                   {:enter (fn [x]
+                                             (if (map? x)
+                                               (reduce (fn [acc k]
+                                                         (if (contains? ks k)
+                                                           acc
+                                                           (dissoc acc k)))
+                                                       x (keys x))
+                                               x))})))}
+         strip-map-of (fn [stage]
+                        {:compile
+                         (fn [ast opts]
+                           (let [registry (or (:registry opts) (reg/default-registry))
+                                 key-valid? (c/compile-validator (nth (:children ast) 0) registry)
+                                 val-valid? (c/compile-validator (nth (:children ast) 1) registry)]
+                             {stage (fn [x]
+                                      (if (map? x)
+                                        (reduce-kv (fn [acc k v]
+                                                     (if (and (key-valid? k) (val-valid? v))
+                                                       (assoc acc k v)
+                                                       acc))
+                                                   {} x)
+                                        x))}))})]
+     (transformer
+      {:decoders {:map strip-map :map-of (strip-map-of :leave)}
+       :encoders {:map strip-map :map-of (strip-map-of :enter)}}))))
+
+(defn key-transformer
+  "{:decode f :encode g :types <set-or-:default>} -- map keys transformed with
+  f at decode enter, g at encode leave. Default types #{:map}; :types :default
+  installs the key transforms as the chain link's default coders."
+  [{:keys [decode encode types] :or {types #{:map}}}]
+  (let [wrap (fn [f stage] (when f {stage (-transform-map-keys f)}))]
+    (transformer
+     (cond
+       (set? types) {:decoders (zipmap types (repeat (wrap decode :enter)))
+                     :encoders (zipmap types (repeat (wrap encode :leave)))}
+       (= :default types) {:default-decoder (wrap decode :enter)
+                           :default-encoder (wrap encode :leave)}))))
+
+(defn default-value-transformer
+  "Every schema: nil replaced by the :default property (contains?-based
+  lookup, so an explicit nil default counts) or (get defaults (:type ast))
+  applied to the ast. :map additionally fills MISSING non-optional keys whose
+  entry properties or value-schema properties carry the default -- opt
+  :add-optional-keys fills optional entries too. Applies on both decode and
+  encode. Opts: {:key <prop-kw> :defaults {type (fn [ast] default)}
+  :add-optional-keys <bool>}. Value-schema default wins over entry-props
+  default (malli parity); a :ref value schema is dereffed for its default."
+  ([] (default-value-transformer nil))
+  ([{:keys [defaults add-optional-keys] :as opts-map}]
+   (let [dkey (get opts-map :key :default)
+         get-default (fn [ast entry-props]
+                       (let [props (:properties ast)]
+                         (cond
+                           (contains? props dkey)
+                           (let [v (get props dkey)] (fn [] v))
+
+                           (and entry-props (contains? entry-props dkey))
+                           (let [v (get entry-props dkey)] (fn [] v))
+
+                           :else
+                           (when-some [f (get defaults (:type ast))]
+                             (fn [] (f ast))))))
+         entry-default (fn [ast entry-props registry]
+                         (or (get-default ast entry-props)
+                             (when (= :ref (:type ast))
+                               (when-some [target (reg/resolve-ref registry (:ref ast))]
+                                 (get-default (norm/normalize target {:registry registry})
+                                              entry-props)))))
+         set-default {:compile (fn [ast _opts]
+                                 (when-some [f (get-default ast nil)]
+                                   (fn [x] (if (nil? x) (f) x))))}
+         add-defaults {:compile
+                       (fn [ast opts]
+                         (let [registry (or (:registry opts) (reg/default-registry))
+                               ds (into []
+                                        (keep (fn [{k :key p :properties v :schema}]
+                                                (when (or (not (:optional p)) add-optional-keys)
+                                                  (when-some [f (entry-default v p registry)]
+                                                    [k f]))))
+                                        (:children ast))]
+                           (when (seq ds)
+                             (fn [x]
+                               (if (map? x)
+                                 (reduce (fn [acc [k f]]
+                                           (if (contains? acc k)
+                                             acc
+                                             (assoc acc k (f))))
+                                         x ds)
+                                 x)))))}]
+     (transformer
+      {:default-decoder set-default
+       :default-encoder set-default}
+      {:decoders {:map add-defaults}
+       :encoders {:map add-defaults}}))))
+
+(defn collection-transformer
+  "Coerce between collection kinds: :vector/:tuple from sequential-or-set,
+  :set from sequential, :sequential from vector/set. Both decode and encode."
+  []
+  (let [coders {:vector -sequential-or-set->vector
+                :sequential -sequential-or-set->seq
+                :set -sequential->set
+                :tuple -sequential->vector}]
+    (transformer
+     {:decoders coders
+      :encoders coders})))
