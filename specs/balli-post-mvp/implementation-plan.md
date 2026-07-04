@@ -166,8 +166,8 @@ Goal: §G.
 
 Goal: §I, `src/balli/provider.lpy`.
 
-- [ ] `provide [samples]` / `[samples opts]`: stats fold + synthesis per §I; scalar preference order `[:int :double :keyword :symbol :string :boolean :uuid]`; `:maybe`/`[:or]` merging; optional-key detection; `:map-of` heuristic (`:map-of-threshold` default 3, equal key+val schemas, distinct-keys > n^0.7); empty coll → `[:vector :any]`; vectors of equal arity NOT tuple-ized (skip malli's tuple hint — document)
-- [ ] `tests/test_provider.lpy`: scalars, mixed → `:or`, nil-mixed → `:maybe`, nested maps with optional keys, map-of detection (id→val dicts) vs record maps, colls, **composition: `(b/validate (bp/provide samples) sample)` for every sample in a gnarly fixture**
+- [x] `provide [samples]` / `[samples opts]`: stats fold + synthesis per §I; scalar preference order `[:int :double :keyword :symbol :string :boolean :uuid]`; `:maybe`/`[:or]` merging; optional-key detection; `:map-of` heuristic (`:map-of-threshold` default 3, equal key+val schemas, distinct-keys > n^0.7); empty coll → `[:vector :any]`; vectors of equal arity NOT tuple-ized (skip malli's tuple hint — document) (commit: 9dc4d26)
+- [x] `tests/test_provider.lpy`: scalars, mixed → `:or`, nil-mixed → `:maybe`, nested maps with optional keys, map-of detection (id→val dicts) vs record maps, colls, **composition: `(b/validate (bp/provide samples) sample)` for every sample in a gnarly fixture** (commit: 9dc4d26)
 
 **Checkpoints:**
 - `(bp/provide [{:x 1} {:x 2 :y "a"}])` → `[:map [:x :int] [:y {:optional true} :string]]`
