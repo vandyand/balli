@@ -1,8 +1,32 @@
 (ns balli.registry
-  "Builtin type table, custom registries, and ref resolution for balli.
+  "Builtin type table, custom registries, the MUTABLE default registry, and
+  ref resolution for balli.
 
   A registry is a plain map {:types #{...builtin type keywords...}
-                             :schemas {qualified-kw schema-form}}.")
+                             :schemas {qualified-kw schema-form}}.
+
+  Composite design note: `composite` EAGERLY merges its member registries
+  into one plain registry map (first member wins on :schemas conflicts,
+  :types unioned) rather than a lazy ordered wrapper such as
+  {:balli/composite [r1 r2]}. A consumer audit (normalize/compile/transform/
+  generator/json-schema/util/core) found registries only flow as plain maps
+  read via `resolve-ref` and `(:schemas r)`, and nothing consumes :types at
+  lookup time -- a second lazy representation would force accessor
+  indirection into every consumer for zero behavioral gain. Mutable-default
+  semantics do NOT depend on composite laziness: live lookup happens through
+  the `default-registry*` atom deref (`default-registry` is called at
+  raw-form call time), never through a merged snapshot.
+
+  Mutation contract: `set-default-registry!` and `register!` replace/extend
+  the CURRENT default and bump the public `mutation-epoch` atom.
+  balli.core's raw-form compilation cache records the epoch it was filled
+  under and clears itself when the epoch moves, so raw-form calls never
+  serve stale compiled fns. Schema OBJECTS bake their registry at
+  construction and keep the old meaning (immutable snapshots).
+
+  Skipped malli registry flavors (documented): var-registry,
+  dynamic-registry (no dynamic-binding story worth it), lazy-registry
+  (provider-on-miss).")
 
 (def builtin-types
   "The set of schema type keywords balli supports natively. Predicate schemas
@@ -16,14 +40,76 @@
     :cat :catn :alt :altn :? :* :+ :repeat :schema
     :=> :function})
 
+(defn- check-registry!
+  "Throw :balli.core/invalid-registry unless `r` has the registry shape
+  {:types <set> :schemas <map>}."
+  [r]
+  (when-not (and (map? r) (set? (:types r)) (map? (:schemas r)))
+    (throw (ex-info "Registry must be a map {:types <set> :schemas <map>}"
+                    {:type :balli.core/invalid-registry :registry r}))))
+
+(def mutation-epoch
+  "Public monotonic counter (starts 0) bumped by every default-registry
+  mutation (`set-default-registry!` / `register!`). balli.core's raw-form
+  cache compares this against the epoch it was filled under and clears
+  itself on mismatch (see the ns docstring's mutation contract)."
+  (atom 0))
+
+(def default-registry*
+  "Atom holding the CURRENT default registry map. Mutate only via
+  `set-default-registry!` / `register!` (they bump `mutation-epoch`)."
+  (atom {:types builtin-types :schemas {}}))
+
 (defn default-registry
-  "Returns the default registry: builtin types, no custom schemas."
+  "Returns the CURRENT default registry — a live view: every raw-form
+  schema/validate call picks up prior mutations."
   []
-  {:types builtin-types :schemas {}})
+  @default-registry*)
+
+(defn composite
+  "Merge registries `rs` into one plain registry map with first-hit lookup
+  semantics: on :schemas key conflicts the EARLIEST registry wins; :types
+  are unioned. Eager by design (see the ns docstring's composite note)."
+  [& rs]
+  (run! check-registry! rs)
+  {:types (into #{} (mapcat :types) rs)
+   :schemas (reduce merge {} (map :schemas (reverse rs)))})
+
+(defn set-default-registry!
+  "Replace the default registry with registry map `r` ({:types <set>
+  :schemas <map>} — e.g. built via `composite`). Bumps `mutation-epoch` so
+  raw-form calls immediately see the new default; existing schema objects
+  keep their construction-time snapshot. Returns `r`."
+  [r]
+  (check-registry! r)
+  (reset! default-registry* r)
+  (swap! mutation-epoch inc)
+  r)
+
+(defn register!
+  "Merge schema forms into the CURRENT default registry's :schemas:
+  (register! kw form) or (register! {kw form ...}). Keys must be keywords;
+  forms are validated lazily at use, like any registry entry. Bumps
+  `mutation-epoch` so raw-form calls immediately see the new meaning;
+  existing schema objects keep their construction-time snapshot. Returns
+  nil."
+  ([m]
+   (when-not (and (map? m) (every? keyword? (keys m)))
+     (throw (ex-info "register! takes a keyword+form or a {keyword form ...} map"
+                     {:type :balli.core/invalid-registry :value m})))
+   (swap! default-registry* update :schemas merge m)
+   (swap! mutation-epoch inc)
+   nil)
+  ([k form]
+   (when-not (keyword? k)
+     (throw (ex-info "register! takes a keyword+form or a {keyword form ...} map"
+                     {:type :balli.core/invalid-registry :value k})))
+   (register! {k form})))
 
 (defn registry
-  "Layer custom {keyword schema-form} maps over the default registry's
-  :schemas. With no args, returns the default registry."
+  "Layer custom {keyword schema-form} maps over the CURRENT default
+  registry's :schemas (the default is read live, at call time). With no
+  args, returns the current default registry."
   [& schema-maps]
   (update (default-registry) :schemas #(apply merge % schema-maps)))
 

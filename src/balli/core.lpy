@@ -7,7 +7,11 @@
   object. Compiled validators/explainers are cached: on the schema object's
   :cache atom, or (for raw forms) in a bounded global cache keyed by
   [form registry-id], where registry-id is an identity token assigned per
-  registry map (default registry = token 0)."
+  registry map (default registry = token 0). The raw cache records the
+  balli.registry/mutation-epoch it was filled under and clears itself when
+  the default registry is mutated (register!/set-default-registry!), so raw
+  forms always compile against the live default; schema objects keep their
+  construction-time registry snapshot."
   (:require [balli.compile :as c]
             [balli.normalize :as norm]
             [balli.registry :as reg]
@@ -22,12 +26,17 @@
 
 (defn schema
   "Wrap schema `form` into a schema object. `opts` supports {:registry r}
-  (defaults to the builtin registry) and {:balli.core/function-checker chk}
-  -- a function checker (see balli.generator/function-checker) BAKED into the
-  object at construction: every validator/explainer compiled for this object
-  checks :=>/:function generatively. Passing an existing schema object
-  returns it unchanged (its baked-in registry AND checker win; opts are
-  ignored)."
+  (defaults to the CURRENT default registry) and
+  {:balli.core/function-checker chk} -- a function checker (see
+  balli.generator/function-checker) BAKED into the object at construction:
+  every validator/explainer compiled for this object checks :=>/:function
+  generatively. Passing an existing schema object returns it unchanged (its
+  baked-in registry AND checker win; opts are ignored).
+
+  Snapshot semantics: schema objects bake their registry at construction —
+  mutating the default registry (balli.registry/register! /
+  set-default-registry!) does NOT affect existing schema objects; raw-form
+  calls always see the live default."
   ([form] (schema form {}))
   ([form opts]
    (if (schema? form)
@@ -69,6 +78,17 @@
 ;; entries. Simplest-correct trade-off: the token table holds strong
 ;; references to registries, which is fine for the expected pattern of a few
 ;; long-lived registries (Malli-style def-once usage).
+;;
+;; Mutation invalidation (cycle-free; balli.registry gains no requires): the
+;; cache atom holds {:epoch e :entries {...}} where e is the value of
+;; balli.registry/mutation-epoch when the entries were filled. Every lookup
+;; and put first syncs against the live epoch — a mismatch clears ALL
+;; entries (register!/set-default-registry! moved the default; [form 0] keys
+;; would otherwise serve stale fns, and wholesale clearing is the simplest
+;; correct bound — custom-registry entries just pay one recompile). The
+;; registry-tokens table is NOT cleared: custom tokens are identity-based
+;; and stay valid; the default token stays the constant 0 by design, which
+;; is exactly why the epoch clear is required.
 
 (def ^:private registry-tokens
   "Identity-token table: {:next-id 1 :entries [[registry id] ...]}."
@@ -97,21 +117,38 @@
 
 (def ^:private raw-cache
   "Bounded global cache of compiled fns for raw forms:
-  {[form registry-id] {:validator f :explainer g}}."
-  (atom {}))
+  {:epoch <balli.registry/mutation-epoch at fill time>
+   :entries {[form registry-id] {:validator f :explainer g}}}."
+  (atom {:epoch 0 :entries {}}))
+
+(defn- raw-cache-get
+  "Compiled fn under cache key `k` (a [form registry-id] pair) and slot, or
+  nil. Syncs the cache against the live default-registry mutation epoch
+  first: a moved epoch clears every entry (see the section comment)."
+  [k slot]
+  (let [live @reg/mutation-epoch
+        state (swap! raw-cache
+                     (fn [{:keys [epoch] :as state}]
+                       (if (= epoch live)
+                         state
+                         {:epoch live :entries {}})))]
+    (get-in (:entries state) [k slot])))
 
 (defn- raw-cache-put!
   "Store compiled fn `f` under cache key `k` (a [form registry-id] pair) and
-  slot (:validator or :explainer), evicting everything first when the cache is
-  full and `k` is a brand-new key. Returns `f`."
+  slot (:validator or :explainer), stamping the live mutation epoch —
+  entries filled under an older epoch are dropped first, as is everything
+  when the cache is full and `k` is a brand-new key. Returns `f`."
   [k slot f]
-  (swap! raw-cache
-         (fn [c]
-           (let [c (if (and (>= (count c) raw-cache-limit)
-                            (not (contains? c k)))
-                     {}
-                     c)]
-             (assoc-in c [k slot] f))))
+  (let [live @reg/mutation-epoch]
+    (swap! raw-cache
+           (fn [{:keys [epoch entries]}]
+             (let [entries (if (= epoch live) entries {})
+                   entries (if (and (>= (count entries) raw-cache-limit)
+                                    (not (contains? entries k)))
+                             {}
+                             entries)]
+               {:epoch live :entries (assoc-in entries [k slot] f)}))))
   f)
 
 (defn- compile-validator!
@@ -161,7 +198,7 @@
      ;; raw form: bounded global cache keyed by [form registry-id]
      :else
      (let [k [s (registry-id (:registry opts))]]
-       (or (get-in @raw-cache [k :validator])
+       (or (raw-cache-get k :validator)
            (raw-cache-put! k :validator (validator (schema s opts))))))))
 
 (defn explainer
@@ -185,7 +222,7 @@
      ;; raw form: bounded global cache keyed by [form registry-id]
      :else
      (let [k [s (registry-id (:registry opts))]]
-       (or (get-in @raw-cache [k :explainer])
+       (or (raw-cache-get k :explainer)
            (raw-cache-put! k :explainer (explainer (schema s opts))))))))
 
 (defn validate
@@ -359,7 +396,7 @@
          (compile-parser! s))
      ;; raw form: bounded global cache keyed by [form registry-id]
      (let [k [s (registry-id (:registry opts))]]
-       (or (get-in @raw-cache [k :parser])
+       (or (raw-cache-get k :parser)
            (raw-cache-put! k :parser (parser (schema s opts))))))))
 
 (defn unparser
@@ -373,7 +410,7 @@
          (compile-unparser! s))
      ;; raw form: bounded global cache keyed by [form registry-id]
      (let [k [s (registry-id (:registry opts))]]
-       (or (get-in @raw-cache [k :unparser])
+       (or (raw-cache-get k :unparser)
            (raw-cache-put! k :unparser (unparser (schema s opts))))))))
 
 (defn parse
