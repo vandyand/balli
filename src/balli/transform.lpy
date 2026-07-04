@@ -223,41 +223,61 @@
 
 (defn- transform-multi
   "Dispatch on the (post-enter) value; matching branch's transformer, no
-  matching branch -> pass-through."
+  matching branch -> the :balli.core/default branch's transformer when the
+  node has one, else pass-through. The MATCHED-BRANCH set is all declared
+  branch keys (a branch whose subtree happens not to transform still blocks
+  the default fallback -- dispatch matched it)."
   [node registry chain method opts cache]
   (let [d (:dispatch (:properties node))
         dispatch-fn (if (keyword? d) (fn [x] (get x d)) d)
+        branch-keys (set (map :key (:children node)))
         table (reduce (fn [acc {:keys [key schema]}]
                         (if-some [t (transform-node schema registry chain method opts cache)]
                           (assoc acc key t)
                           acc))
                       {}
-                      (:children node))]
-    (when (seq table)
+                      (:children node))
+        dt (when-some [de (:default-entry node)]
+             (transform-node (:schema de) registry chain method opts cache))]
+    (when (or (seq table) dt)
       (fn [x]
         (let [dv (try
                    (dispatch-fn x)
                    (catch python/Exception _ ::dispatch-threw))]
-          (if-some [t (get table dv)]
-            (t x)
-            x))))))
+          (if (contains? branch-keys dv)
+            (if-some [t (get table dv)]
+              (t x)
+              x)
+            (if dt (dt x) x)))))))
 
 (defn- transform-map
   "Transform only PRESENT declared keys; missing keys untouched; guarded by
-  map? (non-maps pass through)."
+  map? (non-maps pass through). A :balli.core/default entry's transformer
+  runs once on the RESIDUAL map (value minus declared keys), its result
+  merged UNDER the untouched declared-key values (declared entries then
+  transform via the normal per-key descent and win)."
   [node registry chain method opts cache]
   (let [kts (into [] (keep (fn [{:keys [key schema]}]
                              (when-some [t (transform-node schema registry chain method opts cache)]
                                [key t])))
-                  (:children node))]
-    (when (seq kts)
+                  (:children node))
+        dt (when-some [de (:default-entry node)]
+             (transform-node (:schema de) registry chain method opts cache))
+        known (set (map :key (:children node)))]
+    (when (or (seq kts) dt)
       (guard map?
              (fn [x]
-               (reduce (fn [m [k t]]
-                         (if (contains? m k)
-                           (assoc m k (t (get m k)))
-                           m))
-                       x kts))))))
+               (let [x (if dt
+                         (let [residual (reduce dissoc x known)
+                               r* (dt residual)]
+                           (merge (if (map? r*) r* residual)
+                                  (select-keys x known)))
+                         x)]
+                 (reduce (fn [m [k t]]
+                           (if (contains? m k)
+                             (assoc m k (t (get m k)))
+                             m))
+                         x kts)))))))
 
 (defn- transform-map-of
   [node registry chain method opts cache]
@@ -661,14 +681,17 @@
 
 (defn strip-extra-keys-transformer
   "On :map -- dissoc keys not among the declared entry keys; applies when the
-  :closed property is nil or true (NOT when explicitly {:closed false}).
+  :closed property is nil or true (NOT when explicitly {:closed false}), and
+  NEVER when the map has a :balli.core/default entry (the default entry
+  claims every undeclared key, so nothing is extra -- strip nothing).
   On :map-of -- keep only entries valid per the key AND value schemas
   (leave phase for decode, enter phase for encode, matching malli)."
   ([] (strip-extra-keys-transformer nil))
   ([{:keys [accept]
      :or {accept (fn [ast]
-                   (let [closed (:closed (:properties ast))]
-                     (or (nil? closed) (true? closed))))}}]
+                   (and (nil? (:default-entry ast))
+                        (let [closed (:closed (:properties ast))]
+                          (or (nil? closed) (true? closed)))))}}]
    (let [strip-map {:compile (fn [ast _opts]
                                (when (accept ast)
                                  (let [ks (set (map :key (:children ast)))]

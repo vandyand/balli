@@ -179,9 +179,35 @@
           (swap! (:definitions ctx) assoc ref-name (-transform ast tr ctx))))
       {"$ref" (str "#/definitions/" (escape-pointer ref-name))})))
 
+(defn- merge-default-export
+  "Merge a :map node's :balli.core/default entry export `d` into the map's
+  base export (tier-3 Phase 4, semantics section 2 / post-mvp section B).
+  A :map-of-shaped export ({\"additionalProperties\" X}, no \"properties\")
+  contributes its \"additionalProperties\"; a :map-shaped export merges its
+  \"properties\" and \"required\" (deduped); anything else becomes the
+  \"additionalProperties\" value wholesale."
+  [base d]
+  (cond
+    (and (map? d)
+         (contains? d "additionalProperties")
+         (not (contains? d "properties")))
+    (assoc base "additionalProperties" (get d "additionalProperties"))
+
+    (and (map? d) (contains? d "properties"))
+    (let [required (vec (distinct (concat (get base "required" [])
+                                          (get d "required" []))))]
+      (cond-> (update base "properties" merge (get d "properties"))
+        (seq required) (assoc "required" required)))
+
+    :else
+    (assoc base "additionalProperties" d)))
+
 (defn- transform-map
   "\"properties\" from entry values, \"required\" from non-optional keys
-  (omitted when empty), \"additionalProperties\" false when {:closed true}."
+  (omitted when empty), \"additionalProperties\" false when {:closed true}.
+  A :balli.core/default entry disables the :closed-derived
+  \"additionalProperties\" false and merges its own export instead (see
+  merge-default-export)."
   [node registry ctx]
   (let [entries (:children node)
         properties (into {}
@@ -189,10 +215,13 @@
                                 [(render-value key) (-transform schema registry ctx)])
                               entries))
         required (mapv #(render-value (:key %))
-                       (remove #(:optional (:properties %)) entries))]
-    (cond-> {"type" "object" "properties" properties}
-      (seq required) (assoc "required" required)
-      (:closed (:properties node)) (assoc "additionalProperties" false))))
+                       (remove #(:optional (:properties %)) entries))
+        base (cond-> {"type" "object" "properties" properties}
+               (seq required) (assoc "required" required))]
+    (if-some [de (:default-entry node)]
+      (merge-default-export base (-transform (:schema de) registry ctx))
+      (cond-> base
+        (:closed (:properties node)) (assoc "additionalProperties" false)))))
 
 (defn- -accept
   "The generated JSON Schema fragment for AST `node` (the §B type mapping
@@ -223,7 +252,10 @@
       ;; entry tags are a parse-time concern -- JSON Schema sees the branches
       :orn {"anyOf" (mapv #(child (:schema %)) children)}
       :maybe {"oneOf" [(child (first children)) {"type" "null"}]}
-      :multi {"oneOf" (mapv #(child (:schema %)) children)}
+      ;; a :balli.core/default branch is one more oneOf alternative
+      :multi {"oneOf" (cond-> (mapv #(child (:schema %)) children)
+                        (:default-entry node)
+                        (conj (child (:schema (:default-entry node)))))}
       :map-of (with-min-max {"type" "object"
                              "additionalProperties" (child (second children))}
                 props "minProperties" "maxProperties")

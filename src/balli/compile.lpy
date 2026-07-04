@@ -123,6 +123,13 @@
                ((nth fns i) (nth x i)) (recur (inc i))
                :else false))))))
 
+(defn- residual-map
+  "The value map minus the explicit entry keys — what a :map node's
+  :balli.core/default entry schema validates/parses/transforms ONCE (tier-3
+  Phase 4, semantics section 2)."
+  [x known]
+  (reduce dissoc x known))
+
 (defn- compile-map
   [node registry cache]
   (let [entries (mapv (fn [{:keys [key properties schema]}]
@@ -130,7 +137,10 @@
                          :optional (boolean (:optional properties))
                          :vf (compile-node schema registry cache)})
                       (:children node))
-        closed (boolean (:closed (:properties node)))
+        default-vf (when-some [de (:default-entry node)]
+                     (compile-node (:schema de) registry cache))
+        ;; a default entry DISABLES :closed enforcement entirely
+        closed (and (nil? default-vf) (boolean (:closed (:properties node))))
         known (set (map :k entries))]
     (fn [x]
       (and (map? x)
@@ -139,8 +149,10 @@
                        (vf (get x k))
                        optional))
                    entries)
-           (or (not closed)
-               (every? #(contains? known %) (keys x)))))))
+           (if default-vf
+             (default-vf (residual-map x known))
+             (or (not closed)
+                 (every? #(contains? known %) (keys x))))))))
 
 (defn- compile-map-of
   [node registry cache]
@@ -158,13 +170,21 @@
         dispatch-fn (if (keyword? d) (fn [x] (get x d)) d)
         table (into {}
                     (map (fn [c] [(:key c) (compile-node (:schema c) registry cache)]))
-                    (:children node))]
+                    (:children node))
+        ;; dispatch miss falls back to the default branch (whole value)
+        default-vf (when-some [de (:default-entry node)]
+                     (compile-node (:schema de) registry cache))]
     (fn [x]
       (try
-        (let [dv (dispatch-fn x)]
-          (if (contains? table dv)
-            ((get table dv) x)
-            false))
+        ;; a throwing dispatch is a MISS (falls back to the default branch),
+        ;; matching the explainer/coder ::dispatch-threw handling
+        (let [dv (try
+                   (dispatch-fn x)
+                   (catch python/Exception _ ::dispatch-threw))]
+          (cond
+            (contains? table dv) ((get table dv) x)
+            default-vf (default-vf x)
+            :else false))
         (catch python/Exception _ false)))))
 
 (defn- compile-ref
@@ -512,7 +532,10 @@
                          :ef (explain-node schema registry cache)
                          :entry-form (:form schema)})
                       (:children node))
-        closed (boolean (:closed (:properties node)))
+        default-ef (when-some [de (:default-entry node)]
+                     (explain-node (:schema de) registry cache))
+        ;; a default entry DISABLES :closed enforcement entirely
+        closed (and (nil? default-ef) (boolean (:closed (:properties node))))
         known (set (map :k entries))
         form (:form node)]
     (fn [x path in]
@@ -531,6 +554,14 @@
                                        entry-form nil :balli.core/missing-key))))
                    (transient [])
                    entries)
+              ;; default explainer: schema-path gets :balli.core/default
+              ;; appended, value is the RESIDUAL map, :in stays the ORIGINAL
+              ;; (sub-schemas append their own keys — e.g. :map-of conj's the
+              ;; failing key onto :in — so nested :in works naturally)
+              acc (if default-ef
+                    (into! acc (default-ef (residual-map x known)
+                                           (conj path :balli.core/default) in))
+                    acc)
               acc (if closed
                     (reduce (fn [acc [k v]]
                               (if (contains? known k)
@@ -572,14 +603,17 @@
         table (into {}
                     (map (fn [c] [(:key c) (explain-node (:schema c) registry cache)]))
                     (:children node))
+        default-ef (when-some [de (:default-entry node)]
+                     (explain-node (:schema de) registry cache))
         form (:form node)]
     (fn [x path in]
       (let [dv (try
                  (dispatch-fn x)
                  (catch python/Exception _ ::dispatch-threw))]
-        (if (contains? table dv)
-          ((get table dv) x (conj path dv) in)
-          [(err path in form x :balli.core/invalid-dispatch-value)])))))
+        (cond
+          (contains? table dv) ((get table dv) x (conj path dv) in)
+          default-ef (default-ef x (conj path :balli.core/default) in)
+          :else [(err path in form x :balli.core/invalid-dispatch-value)])))))
 
 (defn- explain-ref
   "Same eager-resolve + fn-indirection pattern as compile-ref (see its
@@ -928,18 +962,27 @@
 (defn- coder-multi
   "Parse: Tag(dispatch-value, branch-parse); no matching branch or invalid
   branch parse -> invalid. Unparse: the Tag :key IS the dispatch value --
-  unparse the :value via that branch."
+  unparse the :value via that branch. A :balli.core/default entry catches
+  dispatch misses on the WHOLE value: parse tags it
+  Tag(:balli.core/default, parsed); unparse routes that Tag key through the
+  default branch."
   [node registry cache mode]
-  (let [table (into {}
-                    (map (fn [c] [(:key c) (coder-node (:schema c) registry cache mode)]))
-                    (:children node))]
+  (let [default-f (when-some [de (:default-entry node)]
+                    (coder-node (:schema de) registry cache mode))
+        table (cond-> (into {}
+                            (map (fn [c] [(:key c) (coder-node (:schema c) registry cache mode)]))
+                            (:children node))
+                default-f (assoc :balli.core/default default-f))]
     (if (= :parse mode)
       (let [d (:dispatch (:properties node))
             dispatch-fn (if (keyword? d) (fn [x] (get x d)) d)]
         (fn [x]
           (let [dv (try
                      (dispatch-fn x)
-                     (catch python/Exception _ ::dispatch-threw))]
+                     (catch python/Exception _ ::dispatch-threw))
+                dv (if (or (contains? table dv) (nil? default-f))
+                     dv
+                     :balli.core/default)]
             (if-some [f (get table dv)]
               (let [r (f x)]
                 (if (-invalid? r)
@@ -958,7 +1001,10 @@
   through untouched). The guard excludes Tag/Tags records explicitly --
   records satisfy map? in Basilisp, so parsed :orn/:multi output could
   otherwise masquerade as plain map data. Validate semantics carry through:
-  missing required key or a closed map with extra keys -> invalid."
+  missing required key or a closed map with extra keys -> invalid. A
+  :balli.core/default entry codes the RESIDUAL map (value minus explicit
+  keys) once -- an invalid residual propagates, success merges the coded
+  entry values back over the coded residual; :closed is disabled."
   [node registry cache mode]
   (let [entries (mapv (fn [{:keys [key properties schema]}]
                         {:k key
@@ -966,7 +1012,9 @@
                          :f (coder-node schema registry cache mode)})
                       (:children node))
         n (count entries)
-        closed (boolean (:closed (:properties node)))
+        default-f (when-some [de (:default-entry node)]
+                    (coder-node (:schema de) registry cache mode))
+        closed (and (nil? default-f) (boolean (:closed (:properties node))))
         known (set (map :k entries))]
     (fn [x]
       (if (and (map? x)
@@ -974,19 +1022,24 @@
                (not (instance? Tags x))
                (or (not closed)
                    (every? #(contains? known %) (keys x))))
-        (loop [i 0
-               acc x]
-          (if (>= i n)
-            acc
-            (let [{:keys [k optional f]} (nth entries i)]
-              (if (contains? acc k)
-                (let [r (f (get acc k))]
-                  (if (-invalid? r)
-                    -invalid
-                    (recur (inc i) (assoc acc k r))))
-                (if optional
-                  (recur (inc i) acc)
-                  -invalid)))))
+        (let [base (if default-f
+                     (default-f (residual-map x known))
+                     x)]
+          (if (-invalid? base)
+            -invalid
+            (loop [i 0
+                   acc base]
+              (if (>= i n)
+                acc
+                (let [{:keys [k optional f]} (nth entries i)]
+                  (if (contains? x k)
+                    (let [r (f (get x k))]
+                      (if (-invalid? r)
+                        -invalid
+                        (recur (inc i) (assoc acc k r))))
+                    (if optional
+                      (recur (inc i) acc)
+                      -invalid)))))))
         -invalid))))
 
 (defn- coder-map-of

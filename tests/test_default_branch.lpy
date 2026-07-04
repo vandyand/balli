@@ -1,0 +1,301 @@
+(ns tests.test-default-branch
+  "Phase 4 (tier 3): :balli.core/default branches in :map and :multi.
+
+  Covers: residual-map semantics for :map default entries through
+  validate/explain/parse/unparse/decode (closed DISABLED by a default entry,
+  strip-extra-keys strips NOTHING, invalid residual propagates, parse
+  merge-back, transform merge-under with explicit keys winning), :multi
+  dispatch-miss fallback (validate/explain/parse tagging
+  :balli.core/default + unparse round-trip, matched-but-invalid branches NOT
+  rescued), schema-boundary rules (two default entries -> invalid-schema,
+  entry props allowed), explain :path (conj path :balli.core/default) with
+  the ORIGINAL :in, humanize rendering residual errors under their keys,
+  and composition: a default entry whose schema refs a local :registry
+  prop key, and schema objects through decode."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.error :as be]
+            [balli.json-schema :as bjs]
+            [balli.transform :as bt]))
+
+(defn- ex-type
+  [thunk]
+  (try
+    (thunk)
+    nil
+    (catch python/Exception e (:type (ex-data e)))))
+
+(def ^:private map-default
+  [:map [:x :int] [:balli.core/default [:map-of :keyword :string]]])
+
+(def ^:private closed-map-default
+  [:map {:closed true} [:x :int] [:balli.core/default [:map-of :keyword :string]]])
+
+(def ^:private multi-default
+  [:multi {:dispatch :kind}
+   [:a [:map [:kind [:= :a]]]]
+   [:balli.core/default :map]])
+
+;; ---------------------------------------------------------------------------
+;; :map — validate
+
+(deftest map-default-validate
+  (testing "residual map validates ONCE against the default schema"
+    (is (true? (b/validate map-default {:x 1})))
+    (is (true? (b/validate map-default {:x 1 :extra "ok" :more "yes"})))
+    (is (false? (b/validate map-default {:x 1 :extra 5})))
+    (is (false? (b/validate map-default {:x 1 "extra" "ok"}))))
+  (testing "explicit entries validate as usual, independent of the residual"
+    (is (false? (b/validate map-default {:x "nope" :extra "ok"})))
+    (is (false? (b/validate map-default {:extra "ok"}))))
+  (testing "checkpoint: a default entry DISABLES :closed entirely"
+    (is (true? (b/validate closed-map-default {:x 1 :extra "ok"})))
+    (is (false? (b/validate closed-map-default {:x 1 :extra 5})))))
+
+;; ---------------------------------------------------------------------------
+;; :map — explain (+ humanize)
+
+(deftest map-default-explain
+  (is (nil? (b/explain map-default {:x 1 :extra "ok"})))
+  (testing "schema-path is (conj path :balli.core/default); :in is ORIGINAL
+            (the residual sub-schema appends its own keys)"
+    (let [{:keys [errors]} (b/explain map-default {:x 1 :extra 5})]
+      (is (= 1 (count errors)))
+      (is (= [:balli.core/default 1] (:path (first errors))))
+      (is (= [:extra] (:in (first errors))))
+      (is (= 5 (:value (first errors))))
+      (is (= :balli.core/invalid-type (:type (first errors))))))
+  (testing "no :closed extra-key errors when a default entry is present"
+    (let [{:keys [errors]} (b/explain closed-map-default {:x 1 :extra 5})]
+      (is (= [:balli.core/invalid-type] (mapv :type errors)))))
+  (testing "humanize renders a residual :map-of error under its key"
+    (is (= {:extra ["should be a string"]}
+           (be/humanize (b/explain map-default {:x 1 :extra 5}))))))
+
+;; ---------------------------------------------------------------------------
+;; :map — parse / unparse
+
+(deftest map-default-parse-unparse
+  (testing "parse: default parser on the residual, merged back under the
+            explicit parsed entries"
+    (is (= {:x 1 :extra "ok"} (b/parse map-default {:x 1 :extra "ok"})))
+    (is (= {:x 1} (b/parse map-default {:x 1}))))
+  (testing "invalid residual propagates"
+    (is (= :balli.core/invalid (b/parse map-default {:x 1 :extra 5}))))
+  (testing "closed is disabled for parse too"
+    (is (= {:x 1 :extra "ok"} (b/parse closed-map-default {:x 1 :extra "ok"}))))
+  (testing "unparse round-trips"
+    (is (= {:x 1 :extra "ok"}
+           (b/unparse map-default (b/parse map-default {:x 1 :extra "ok"}))))
+    (is (= :balli.core/invalid (b/unparse map-default {:x 1 :extra 5})))))
+
+;; ---------------------------------------------------------------------------
+;; :map — transform (decode/encode) + strip-extra-keys
+
+(deftest map-default-decode
+  (testing "default transformer runs on the residual; explicit entries decode
+            via normal descent"
+    (is (= {:x 1 :extra 5}
+           (b/decode [:map [:x :int] [:balli.core/default [:map-of :keyword :int]]]
+                     {:x "1" :extra "5"}
+                     (bt/string-transformer)))))
+  (testing "merge-under: the untouched explicit-key value WINS over the
+            residual transform (explicit keys are never routed through the
+            default schema)"
+    ;; default would string->int decode :x too if it saw it; :x is a :string
+    ;; entry so its raw value must survive untouched.
+    (is (= {:x "1" :extra 5}
+           (b/decode [:map [:x :string] [:balli.core/default [:map-of :keyword :int]]]
+                     {:x "1" :extra "5"}
+                     (bt/string-transformer)))))
+  (testing "encode direction: the residual encodes exactly as a standalone
+            [:map-of :keyword :int] would (keyword keys encode to strings)"
+    (is (= {"extra" "5"}
+           (b/encode [:map-of :keyword :int] {:extra 5} (bt/string-transformer))))
+    (is (= {:x "1" "extra" "5"}
+           (b/encode [:map [:x :int] [:balli.core/default [:map-of :keyword :int]]]
+                     {:x 1 :extra 5}
+                     (bt/string-transformer))))))
+
+(deftest map-default-strip-nothing
+  (testing "strip-extra-keys strips NOTHING when a default entry is present"
+    (is (= {:x 1 :extra "ok"}
+           (b/decode map-default {:x 1 :extra "ok"} (bt/strip-extra-keys-transformer))))
+    (is (= {:x 1 :extra "ok"}
+           (b/decode closed-map-default {:x 1 :extra "ok"}
+                     (bt/strip-extra-keys-transformer)))))
+  (testing "maps WITHOUT a default entry still strip"
+    (is (= {:x 1}
+           (b/decode [:map [:x :int]] {:x 1 :extra "ok"}
+                     (bt/strip-extra-keys-transformer))))))
+
+;; ---------------------------------------------------------------------------
+;; :multi — fallback branch
+
+(deftest multi-default-validate
+  (testing "checkpoint: dispatch miss falls back to the default branch"
+    (is (true? (b/validate multi-default {:kind :zzz})))
+    (is (true? (b/validate multi-default {:kind :a}))))
+  (testing "default branch receives the WHOLE value"
+    (is (false? (b/validate [:multi {:dispatch :kind}
+                             [:a [:map [:kind [:= :a]]]]
+                             [:balli.core/default [:map [:kind :keyword] [:n :int]]]]
+                            {:kind :zzz}))))
+  (testing "a MATCHED branch that fails is not rescued by the default"
+    (is (false? (b/validate [:multi {:dispatch :kind}
+                             [:a [:map [:kind [:= :a]] [:n :int]]]
+                             [:balli.core/default :map]]
+                            {:kind :a :n "x"}))))
+  (testing "no default + miss stays invalid-dispatch-value"
+    (is (false? (b/validate [:multi {:dispatch :kind} [:a [:map [:kind [:= :a]]]]]
+                            {:kind :zzz})))
+    (is (= [:balli.core/invalid-dispatch-value]
+           (mapv :type (:errors (b/explain [:multi {:dispatch :kind}
+                                            [:a [:map [:kind [:= :a]]]]]
+                                           {:kind :zzz})))))))
+
+(deftest multi-default-explain
+  (is (nil? (b/explain multi-default {:kind :zzz})))
+  (testing "default-branch errors report at :path (conj path
+            :balli.core/default), :in as usual"
+    (let [{:keys [errors]} (b/explain [:multi {:dispatch :kind}
+                                       [:a [:map [:kind [:= :a]]]]
+                                       [:balli.core/default [:map [:kind :keyword] [:n :int]]]]
+                                      {:kind :zzz :n "x"})]
+      (is (= 1 (count errors)))
+      (is (= [:balli.core/default :n] (:path (first errors))))
+      (is (= [:n] (:in (first errors))))))
+  (testing "humanize of a default-branch error"
+    (is (= {:n ["should be an integer"]}
+           (be/humanize (b/explain [:multi {:dispatch :kind}
+                                    [:a [:map [:kind [:= :a]]]]
+                                    [:balli.core/default [:map [:kind :keyword] [:n :int]]]]
+                                   {:kind :zzz :n "x"}))))))
+
+(deftest multi-default-parse
+  (testing "checkpoint: parse tags the default branch :balli.core/default"
+    (let [p (b/parse multi-default {:kind :zzz})]
+      (is (b/tag? p))
+      (is (= :balli.core/default (:key p)))
+      (is (= {:kind :zzz} (:value p)))
+      (is (= {:kind :zzz} (b/unparse multi-default p)))))
+  (testing "matched branches keep their own tag"
+    (is (= :a (:key (b/parse multi-default {:kind :a})))))
+  (testing "invalid default-branch parse propagates"
+    (is (= :balli.core/invalid (b/parse multi-default [:not-a-map])))))
+
+(deftest multi-default-decode
+  (testing "dispatch miss decodes through the default branch"
+    (is (= {:kind :zzz :n 5}
+           (b/decode [:multi {:dispatch :kind}
+                      [:a [:map [:kind [:= :a]] [:n :string]]]
+                      [:balli.core/default [:map [:kind :keyword] [:n :int]]]]
+                     {:kind :zzz :n "5"}
+                     (bt/string-transformer)))))
+  (testing "matched branches decode via their own schema, not the default"
+    (is (= {:kind :a :n "5"}
+           (b/decode [:multi {:dispatch :kind}
+                      [:a [:map [:kind [:= :a]] [:n :string]]]
+                      [:balli.core/default [:map [:kind :keyword] [:n :int]]]]
+                     {:kind :a :n "5"}
+                     (bt/string-transformer))))))
+
+;; ---------------------------------------------------------------------------
+;; Schema boundary
+
+(deftest default-entry-schema-boundary
+  (testing "two default entries -> invalid-schema"
+    (is (= :balli.core/invalid-schema
+           (ex-type #(b/validate [:map
+                                  [:balli.core/default :map]
+                                  [:balli.core/default [:map-of :keyword :int]]]
+                                 {}))))
+    (is (= :balli.core/invalid-schema
+           (ex-type #(b/validate [:multi {:dispatch :kind}
+                                  [:balli.core/default :map]
+                                  [:balli.core/default :map]]
+                                 {})))))
+  (testing "entry props are allowed on a default entry (shape rules identical
+            to other entries)"
+    (is (true? (b/validate [:map [:x :int]
+                            [:balli.core/default {:doc "rest"} [:map-of :keyword :string]]]
+                           {:x 1 :extra "ok"}))))
+  (testing "malformed default entries fail like any other entry"
+    (is (= :balli.core/invalid-schema
+           (ex-type #(b/validate [:map [:balli.core/default]] {}))))))
+
+;; ---------------------------------------------------------------------------
+;; form / walk round-trip
+
+(deftest default-entry-form-walk
+  (is (= closed-map-default (b/form closed-map-default)))
+  (is (= map-default (b/walk map-default (b/schema-walker identity))))
+  (testing "walk visits the default entry schema at path
+            [... :balli.core/default]"
+    (let [paths (atom [])]
+      (b/walk map-default (fn [form path] (swap! paths conj path) form))
+      (is (some #(= [:balli.core/default] %) @paths)))))
+
+;; ---------------------------------------------------------------------------
+;; json-schema export
+
+(deftest default-entry-json-schema
+  (testing ":map-of default merges as additionalProperties; :closed-derived
+            additionalProperties false is overridden"
+    (is (= {"type" "object"
+            "properties" {"x" {"type" "integer"}}
+            "required" ["x"]
+            "additionalProperties" {"type" "string"}}
+           (bjs/transform closed-map-default))))
+  (testing ":map default merges properties + required (deduped)"
+    (is (= {"type" "object"
+            "properties" {"x" {"type" "integer"} "y" {"type" "string"}}
+            "required" ["x" "y"]}
+           (bjs/transform [:map [:x :int]
+                           [:balli.core/default [:map [:y :string]]]]))))
+  (testing "other default schemas become the additionalProperties value"
+    (is (= {"type" "object"
+            "properties" {}
+            "additionalProperties" {"type" "integer"}}
+           (bjs/transform [:map [:balli.core/default :int]]))))
+  (testing ":multi default branch joins the oneOf"
+    (is (= {"oneOf" [{"type" "object"
+                      "properties" {"kind" {"const" "a"}}
+                      "required" ["kind"]}
+                     {"type" "object" "properties" {}}]}
+           (bjs/transform multi-default)))))
+
+;; ---------------------------------------------------------------------------
+;; Composition
+
+(def ^:private local-registry-default
+  "Default entry whose schema refs a key from the node's own :registry prop."
+  [:map {:registry {::v :int}}
+   [:x :string]
+   [:balli.core/default [:map-of :keyword [:ref ::v]]]])
+
+(deftest default-entry-with-local-registry
+  (is (true? (b/validate local-registry-default {:x "a" :extra 5})))
+  (is (false? (b/validate local-registry-default {:x "a" :extra "not-an-int"})))
+  (testing "explain through the local ref keeps residual :in"
+    (let [{:keys [errors]} (b/explain local-registry-default {:x "a" :extra "b"})]
+      (is (= [[:extra]] (mapv :in errors)))))
+  (testing "decode through the local ref"
+    (is (= {:x "a" :extra 5}
+           (b/decode local-registry-default {:x "a" :extra "5"}
+                     (bt/string-transformer))))))
+
+(deftest default-entry-schema-object
+  (testing "schema objects (baked registry) through validate/parse/decode"
+    (let [so (b/schema closed-map-default)]
+      (is (b/schema? so))
+      (is (true? (b/validate so {:x 1 :extra "ok"})))
+      (is (= {:x 1 :extra "ok"} (b/parse so {:x 1 :extra "ok"})))
+      (is (= {:x 1 :extra 5}
+             (b/decode (b/schema [:map [:x :int]
+                                  [:balli.core/default [:map-of :keyword :int]]])
+                       {:x "1" :extra "5"}
+                       (bt/string-transformer))))))
+  (testing "schema object of the multi default through parse"
+    (let [so (b/schema multi-default)]
+      (is (= :balli.core/default (:key (b/parse so {:kind :zzz})))))))

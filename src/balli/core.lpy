@@ -466,12 +466,18 @@
       (f (:form node) path)
 
       (contains? #{:map :multi :orn :catn :altn} t)
-      (let [entries (mapv (fn [{:keys [key properties schema]}]
-                            (let [v (walk-ast schema (conj path key) f)]
-                              (if (seq properties)
-                                [key properties v]
-                                [key v])))
-                          (:children node))
+      (let [walk-entry (fn [{:keys [key properties schema]}]
+                         (let [v (walk-ast schema (conj path key) f)]
+                           (if (seq properties)
+                             [key properties v]
+                             [key v])))
+            entries (mapv walk-entry (:children node))
+            ;; a :map/:multi :balli.core/default entry is walked like any
+            ;; other entry; the rebuilt form appends it LAST regardless of
+            ;; its original position (documented deviation).
+            entries (if-some [de (:default-entry node)]
+                      (conj entries (walk-entry de))
+                      entries)
             form (if (and (= :map t) (empty? props) (empty? entries))
                    :map
                    (into (if (seq props) [t props] [t]) entries))]
