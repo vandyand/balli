@@ -1,0 +1,294 @@
+(ns tests.test-explain
+  "Phase 3: exact explain shapes — :path/:in semantics per type, error types,
+  missing/extra keys, multi dispatch, limits, tuple positions, map-of key vs
+  value errors, :or single-error simplification, :fn errors, and assert-valid."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]))
+
+;; ---------------------------------------------------------------------------
+;; Success -> nil
+
+(deftest success-returns-nil
+  (is (nil? (b/explain :string "ok")))
+  (is (nil? (b/explain :any nil)))
+  (is (nil? (b/explain [:map [:id :string] [:age {:optional true} :int]]
+                       {:id "x"})))
+  (is (nil? (b/explain [:vector :int] [1 2 3])))
+  (is (nil? (b/explain [:maybe :int] nil)))
+  (is (nil? (b/explain [:or :string :int] 5)))
+  (is (nil? (b/explain [:multi {:dispatch :kind}
+                        [:dm [:map [:kind [:= :dm]] [:text :string]]]]
+                       {:kind :dm :text "hi"}))))
+
+;; ---------------------------------------------------------------------------
+;; Root scalar failures
+
+(deftest root-scalar-invalid-type
+  (is (= {:schema :int
+          :value "x"
+          :errors [{:path [] :in [] :schema :int :value "x"
+                    :type :balli.core/invalid-type}]}
+         (b/explain :int "x"))))
+
+(deftest root-limits
+  (testing "string length min"
+    (is (= {:schema [:string {:min 3}]
+            :value "ab"
+            :errors [{:path [] :in [] :schema [:string {:min 3}] :value "ab"
+                      :type :balli.core/limits}]}
+           (b/explain [:string {:min 3}] "ab"))))
+  (testing "int value bounds"
+    (is (= [{:path [] :in [] :schema [:int {:min 1 :max 5}] :value 0
+             :type :balli.core/limits}]
+           (:errors (b/explain [:int {:min 1 :max 5}] 0))))
+    (is (= :balli.core/limits
+           (:type (first (:errors (b/explain [:int {:min 1 :max 5}] 6))))))
+    (is (nil? (b/explain [:int {:min 1 :max 5}] 3))))
+  (testing "wrong type wins over limits"
+    (is (= :balli.core/invalid-type
+           (:type (first (:errors (b/explain [:string {:min 3}] 42))))))))
+
+;; ---------------------------------------------------------------------------
+;; Vector / sequential / set elements
+
+(deftest vector-element-error
+  (is (= {:schema [:vector :int]
+          :value [1 "x"]
+          :errors [{:path [0] :in [1] :schema :int :value "x"
+                    :type :balli.core/invalid-type}]}
+         (b/explain [:vector :int] [1 "x"]))))
+
+(deftest vector-count-limits
+  (is (= [{:path [] :in [] :schema [:vector {:min 2} :int] :value [1]
+           :type :balli.core/limits}]
+         (:errors (b/explain [:vector {:min 2} :int] [1]))))
+  (testing "limits error and element errors accumulate"
+    (let [errors (:errors (b/explain [:vector {:min 3} :int] [1 "x"]))]
+      (is (= 2 (count errors)))
+      (is (= #{:balli.core/limits :balli.core/invalid-type}
+             (set (map :type errors)))))))
+
+(deftest vector-invalid-type
+  (is (= [{:path [] :in [] :schema [:vector :int] :value #{1}
+           :type :balli.core/invalid-type}]
+         (:errors (b/explain [:vector :int] #{1})))))
+
+(deftest set-element-error
+  ;; Basilisp sets aren't indexed; :in carries the element's ordinal position
+  ;; in seq order. With mixed contents that ordinal is unspecified, so assert
+  ;; everything except the exact index.
+  (let [errors (:errors (b/explain [:set :int] #{1 "x"}))
+        e (first errors)]
+    (is (= 1 (count errors)))
+    (is (= [0] (:path e)))
+    (is (= "x" (:value e)))
+    (is (= :int (:schema e)))
+    (is (= :balli.core/invalid-type (:type e)))
+    (is (contains? #{[0] [1]} (:in e)))))
+
+;; ---------------------------------------------------------------------------
+;; Nested map / vector
+
+(deftest nested-map-vector
+  (is (= {:schema [:map [:tags [:vector :string]]]
+          :value {:tags ["a" 1]}
+          :errors [{:path [:tags 0] :in [:tags 1] :schema :string :value 1
+                    :type :balli.core/invalid-type}]}
+         (b/explain [:map [:tags [:vector :string]]] {:tags ["a" 1]}))))
+
+(deftest map-invalid-type
+  (is (= [{:path [] :in [] :schema [:map [:id :string]] :value 42
+           :type :balli.core/invalid-type}]
+         (:errors (b/explain [:map [:id :string]] 42)))))
+
+;; ---------------------------------------------------------------------------
+;; Missing / extra keys
+
+(deftest missing-key
+  (is (= {:schema [:map [:id :string]]
+          :value {}
+          :errors [{:path [:id] :in [:id] :schema :string :value nil
+                    :type :balli.core/missing-key}]}
+         (b/explain [:map [:id :string]] {})))
+  (testing "optional keys don't produce missing-key errors"
+    (is (nil? (b/explain [:map [:id {:optional true} :string]] {})))))
+
+(deftest extra-key
+  (let [form [:map {:closed true} [:id :string]]]
+    (is (= {:schema form
+            :value {:id "x" :extra 1}
+            :errors [{:path [:extra] :in [:extra] :schema form :value 1
+                      :type :balli.core/extra-key}]}
+           (b/explain form {:id "x" :extra 1})))
+    (testing "open maps allow extra keys"
+      (is (nil? (b/explain [:map [:id :string]] {:id "x" :extra 1}))))))
+
+;; ---------------------------------------------------------------------------
+;; Tuple positional
+
+(deftest tuple-positional
+  (is (= {:schema [:tuple :string :int]
+          :value ["a" "b"]
+          :errors [{:path [1] :in [1] :schema :int :value "b"
+                    :type :balli.core/invalid-type}]}
+         (b/explain [:tuple :string :int] ["a" "b"])))
+  (testing "wrong size -> limits at the node"
+    (is (= [{:path [] :in [] :schema [:tuple :string :int] :value ["a"]
+             :type :balli.core/limits}]
+           (:errors (b/explain [:tuple :string :int] ["a"])))))
+  (testing "non-vector -> invalid-type"
+    (is (= :balli.core/invalid-type
+           (:type (first (:errors (b/explain [:tuple :string :int] "ab"))))))))
+
+;; ---------------------------------------------------------------------------
+;; :map-of key vs value errors
+
+(deftest map-of-key-vs-value
+  (testing "key failure: key to :in, 0 to :path, key schema + key value"
+    (is (= {:schema [:map-of :keyword :int]
+            :value {"s" 1}
+            :errors [{:path [0] :in ["s"] :schema :keyword :value "s"
+                      :type :balli.core/invalid-type}]}
+           (b/explain [:map-of :keyword :int] {"s" 1}))))
+  (testing "value failure: key to :in, 1 to :path, value schema + value"
+    (is (= [{:path [1] :in [:a] :schema :int :value "x"
+             :type :balli.core/invalid-type}]
+           (:errors (b/explain [:map-of :keyword :int] {:a "x"})))))
+  (testing "both fail -> key error then value error for that entry"
+    (is (= [{:path [0] :in ["s"] :schema :keyword :value "s"
+             :type :balli.core/invalid-type}
+            {:path [1] :in ["s"] :schema :int :value "x"
+             :type :balli.core/invalid-type}]
+           (:errors (b/explain [:map-of :keyword :int] {"s" "x"})))))
+  (testing "non-map -> invalid-type"
+    (is (= :balli.core/invalid-type
+           (:type (first (:errors (b/explain [:map-of :keyword :int] [1]))))))))
+
+;; ---------------------------------------------------------------------------
+;; :multi
+
+(deftest multi-dispatch-miss
+  (let [form [:multi {:dispatch :kind}
+              [:dm [:map [:kind [:= :dm]] [:text :string]]]]]
+    (is (= {:schema form
+            :value {:kind :other}
+            :errors [{:path [] :in [] :schema form :value {:kind :other}
+                      :type :balli.core/invalid-dispatch-value}]}
+           (b/explain form {:kind :other})))))
+
+(deftest multi-child-error-paths
+  ;; dispatch key goes to :path only; :in stays transparent
+  (let [form [:multi {:dispatch :kind}
+              [:dm [:map [:kind [:= :dm]] [:text :string]]]]
+        errors (:errors (b/explain form {:kind :dm :text 1}))]
+    (is (= [{:path [:dm :text] :in [:text] :schema :string :value 1
+             :type :balli.core/invalid-type}]
+           errors))))
+
+;; ---------------------------------------------------------------------------
+;; :enum / := / :maybe / :not / :and / :or / :fn / :re
+
+(deftest enum-mismatch
+  (is (= [{:path [] :in [] :schema [:enum "A" "B"] :value "C"
+           :type :balli.core/enum-mismatch}]
+         (:errors (b/explain [:enum "A" "B"] "C")))))
+
+(deftest eq-not-eq
+  (is (= [{:path [] :in [] :schema [:= 5] :value 4
+           :type :balli.core/not-eq}]
+         (:errors (b/explain [:= 5] 4)))))
+
+(deftest maybe-adds-zero-to-path-only
+  (is (= [{:path [0] :in [] :schema :int :value "x"
+           :type :balli.core/invalid-type}]
+         (:errors (b/explain [:maybe :int] "x")))))
+
+(deftest not-generic-invalid
+  (is (= [{:path [] :in [] :schema [:not :string] :value "s"
+           :type :balli.core/invalid}]
+         (:errors (b/explain [:not :string] "s"))))
+  (is (nil? (b/explain [:not :string] 5))))
+
+(deftest and-branch-index-in-path
+  (let [s [:fn even?]
+        form [:and :int s]]
+    (testing "only the failing branch reports, with branch index in :path"
+      (is (= [{:path [1] :in [] :schema s :value 3
+               :type :balli.core/invalid}]
+             (:errors (b/explain form 3)))))
+    (testing "all failing branches accumulate"
+      (is (= [{:path [0] :in [] :schema :int :value "x"
+               :type :balli.core/invalid-type}
+              {:path [1] :in [] :schema s :value "x"
+               :type :balli.core/invalid}]
+             (:errors (b/explain form "x")))))))
+
+(deftest or-single-error-at-node
+  ;; Documented MVP simplification: all branches failing emits ONE
+  ;; :balli.core/invalid error at the :or node, not per-branch errors.
+  (let [form [:or :string :int]]
+    (is (= {:schema form
+            :value :kw
+            :errors [{:path [] :in [] :schema form :value :kw
+                      :type :balli.core/invalid}]}
+           (b/explain form :kw)))))
+
+(deftest fn-error
+  (let [form [:fn even?]]
+    (is (= {:schema form
+            :value 3
+            :errors [{:path [] :in [] :schema form :value 3
+                      :type :balli.core/invalid}]}
+           (b/explain form 3)))
+    (testing "predicate throwing counts as invalid"
+      (is (= :balli.core/invalid
+             (:type (first (:errors (b/explain form "not-a-number")))))))
+    (is (nil? (b/explain form 4)))))
+
+(deftest re-errors
+  (let [form [:re "a+"]]
+    (is (= :balli.core/invalid-type
+           (:type (first (:errors (b/explain form 5))))))
+    (is (= :balli.core/invalid
+           (:type (first (:errors (b/explain form "bbb"))))))
+    (is (nil? (b/explain form "aaa")))))
+
+;; ---------------------------------------------------------------------------
+;; explainer fn + caching
+
+(deftest explainer-fn-and-caching
+  (testing "explainer returns a reusable fn: nil on success, map on failure"
+    (let [e (b/explainer [:vector :int])]
+      (is (nil? (e [1 2])))
+      (is (= :balli.core/invalid-type
+             (:type (first (:errors (e [1 "x"]))))))))
+  (testing "schema-object explainers are cached in the :cache atom"
+    (let [s (b/schema :int)
+          e1 (b/explainer s)
+          e2 (b/explainer s)]
+      (is (identical? e1 e2))
+      (is (identical? e1 (:explainer @(:cache s))))))
+  (testing "raw default-registry forms hit the global cache"
+    (let [e1 (b/explainer [:vector :string])
+          e2 (b/explainer [:vector :string])]
+      (is (identical? e1 e2)))))
+
+;; ---------------------------------------------------------------------------
+;; assert-valid
+
+(deftest assert-valid-behavior
+  (testing "returns the value unchanged on success"
+    (is (= {:id "x"} (b/assert-valid [:map [:id :string]] {:id "x"})))
+    (is (= 5 (b/assert-valid :int 5)))
+    (is (nil? (b/assert-valid [:maybe :int] nil))))
+  (testing "throws ex-info carrying the explain map plus :type"
+    (let [data (try
+                 (b/assert-valid :int "x")
+                 nil
+                 (catch python/Exception e (ex-data e)))]
+      (is (= :balli.core/invalid-input (:type data)))
+      (is (= :int (:schema data)))
+      (is (= "x" (:value data)))
+      (is (= [{:path [] :in [] :schema :int :value "x"
+               :type :balli.core/invalid-type}]
+             (:errors data))))))

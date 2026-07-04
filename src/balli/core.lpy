@@ -4,7 +4,7 @@
   Schemas are plain data (Malli vector syntax). `schema` wraps a form into a
   schema object {:balli/schema true :form ... :ast ... :registry ... :cache
   (atom {})}; `validator`/`validate` accept either a raw form or a schema
-  object. Compiled validators are cached: on the schema object's :cache atom,
+  object. Compiled validators/explainers are cached: on the schema object's :cache atom,
   or (for raw forms against the default registry) in a global cache keyed by
   form. Raw forms compiled against a custom registry skip the global cache —
   registry-aware caching is refined in Phase 5."
@@ -49,18 +49,32 @@
   [s]
   (:children (:ast (schema s))))
 
-(def ^:private raw-validator-cache
-  "Global cache of compiled validators for raw forms compiled against the
-  default registry, keyed by form. Unbounded for now; bounded + registry-aware
-  in Phase 5."
+(def ^:private raw-cache
+  "Global cache of compiled fns for raw forms compiled against the default
+  registry: {form {:validator f :explainer g}}. Unbounded for now; bounded +
+  registry-aware in Phase 5."
   (atom {}))
 
-(defn- compile-and-cache!
+(defn- compile-validator!
   "Compile a validator for schema object `s`, caching it under :validator in
   the schema's :cache atom."
   [s]
   (let [f (c/compile-validator (:ast s) (:registry s))]
     (swap! (:cache s) assoc :validator f)
+    f))
+
+(defn- compile-explainer!
+  "Compile an explainer for schema object `s` — a 1-arg fn returning nil on
+  success or {:schema <original form> :value <input> :errors [...]} — caching
+  it under :explainer in the schema's :cache atom."
+  [s]
+  (let [ef (c/compile-explainer (:ast s) (:registry s))
+        root-form (:form s)
+        f (fn [value]
+            (let [errors (ef value [] [])]
+              (when (seq errors)
+                {:schema root-form :value value :errors errors})))]
+    (swap! (:cache s) assoc :explainer f)
     f))
 
 (defn validator
@@ -72,7 +86,7 @@
    (cond
      (schema? s)
      (or (:validator @(:cache s))
-         (compile-and-cache! s))
+         (compile-validator! s))
 
      ;; raw form + custom registry: compile fresh, skip the global cache
      (:registry opts)
@@ -80,9 +94,33 @@
 
      ;; raw form + default registry: global cache keyed by form
      :else
-     (or (get @raw-validator-cache s)
+     (or (get-in @raw-cache [s :validator])
          (let [f (validator (schema s))]
-           (swap! raw-validator-cache assoc s f)
+           (swap! raw-cache assoc-in [s :validator] f)
+           f)))))
+
+(defn explainer
+  "Compiled 1-arg explainer for `s` (raw form or schema object): returns nil
+  on success, else {:schema <original form> :value <input> :errors [...]}
+  where each error is {:path :in :schema <form fragment> :value :type}.
+  `opts` supports {:registry r} and is ignored when `s` is already a schema
+  object. Cached like `validator`."
+  ([s] (explainer s {}))
+  ([s opts]
+   (cond
+     (schema? s)
+     (or (:explainer @(:cache s))
+         (compile-explainer! s))
+
+     ;; raw form + custom registry: compile fresh, skip the global cache
+     (:registry opts)
+     (explainer (schema s opts))
+
+     ;; raw form + default registry: global cache keyed by form
+     :else
+     (or (get-in @raw-cache [s :explainer])
+         (let [f (explainer (schema s))]
+           (swap! raw-cache assoc-in [s :explainer] f)
            f)))))
 
 (defn validate
@@ -90,3 +128,20 @@
   `opts` supports {:registry r} and is ignored when `s` is a schema object."
   ([s value] ((validator s) value))
   ([s value opts] ((validator s opts) value)))
+
+(defn explain
+  "Explain why `value` fails `s` (raw form or schema object). Returns nil when
+  valid, else {:schema <original form> :value <input> :errors [...]}.
+  `opts` supports {:registry r} and is ignored when `s` is a schema object."
+  ([s value] ((explainer s) value))
+  ([s value opts] ((explainer s opts) value)))
+
+(defn assert-valid
+  "Return `value` when it validates against `s`, else throw ex-info
+  \"Validation failed\" carrying the explain map plus
+  {:type :balli.core/invalid-input}."
+  ([s value] (assert-valid s value {}))
+  ([s value opts]
+   (if-let [ex (explain s value opts)]
+     (throw (ex-info "Validation failed" (assoc ex :type :balli.core/invalid-input)))
+     value)))
