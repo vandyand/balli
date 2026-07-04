@@ -18,6 +18,12 @@
      [:or ...] (first-seen classification order), and nil samples wrap the
      rest in [:maybe ...]. No samples at all -> :any.
 
+  Optional inference upgrades:
+  - {:infer-enums true :enum-threshold n} emits [:enum ...] for scalar sample
+    sets with at most n distinct values (default 8).
+  - {:infer-tuples true} emits [:tuple ...] for vector samples that all share
+    one arity.
+
   :map-of heuristic (opts key :map-of-threshold, default 3): at least
   threshold map samples AND every per-key value schema equal AND every key
   schema equal (keys inferred as scalar samples) AND distinct keys across
@@ -28,10 +34,8 @@
     number?: Balli's float? rejects ints ((float? 1) -> false), unlike JVM
     malli where double accepts any number, so no single scalar type accepts
     a mixed int/float sample set.
-  - Vectors whose samples all share the same arity are NOT tuple-ized --
-    malli's :tuple hint is skipped; homogeneous [:vector x] is always
-    produced.
-  - No :enum inference.
+  - Tuple and enum inference are opt-in so existing broad provider output
+    remains stable for users who do not request Malli's narrower hints.
   - Scalars none of the preference types accept (e.g. arbitrary Python
     objects) infer :any; :any among mixed branches collapses the whole
     union to :any."
@@ -75,18 +79,7 @@
   []
   {:total 0 :nil 0 :order [] :branches {}})
 
-(declare fold)
-
-(defn- fold-scalar
-  "Track the intersection of accepting type-sets across all scalar samples
-  plus the first-seen order of each sample's most specific type."
-  [branch x]
-  (let [branch (or branch {:intersect nil :seen []})
-        acc (accepting-types x)
-        best (preferred-type acc)]
-    (-> branch
-        (update :intersect (fn [i] (if (nil? i) acc (set (filter acc i)))))
-        (update :seen (fn [seen] (if (some #{best} seen) seen (conj seen best)))))))
+(declare fold fold-scalar)
 
 (defn- fold-map
   "Per-key stats recursion + per-key presence counts + total map count, plus
@@ -113,9 +106,25 @@
 
 (defn- fold-coll
   "Union element stats across every sample of this collection kind."
-  [branch xs]
+  [branch kind xs]
   (let [branch (-> (or branch {:count 0 :elem (empty-stats)})
-                   (update :count inc))]
+                   (update :count inc))
+        branch (if (= :vector kind)
+                 (let [n (count xs)
+                       branch (-> branch
+                                  (update :arities (fnil conj #{}) n)
+                                  (update :positions
+                                          (fn [ps]
+                                            (let [ps (vec (or ps []))]
+                                              (into ps
+                                                    (repeat (max 0 (- n (count ps)))
+                                                            (empty-stats)))))))]
+                   (reduce (fn [acc [i v]]
+                             (update-in acc [:positions i]
+                                        (fn [s] (fold (or s (empty-stats)) v))))
+                           branch
+                           (map-indexed vector xs)))
+                 branch)]
     (update branch :elem (fn [s] (reduce fold s xs)))))
 
 (defn- note-order
@@ -137,7 +146,7 @@
                (update-in [:branches :map] fold-map x))
       (:set :vector :sequential)
       (-> (note-order stats c)
-          (update-in [:branches c] fold-coll x)))))
+          (update-in [:branches c] fold-coll c x)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Pass 2: synthesis
@@ -147,11 +156,28 @@
 (defn- scalar-schemas
   "Schemas for the scalar branch. Non-empty accept-all intersection -> single
   most specific type; otherwise one schema per first-seen best type."
-  [branch]
-  (let [i (:intersect branch)]
-    (if (seq i)
-      [(preferred-type i)]
-      (:seen branch))))
+  [branch opts]
+  (let [enum? (:infer-enums opts)
+        max-enum (or (:enum-threshold opts) 8)
+        seen-values (:values branch)
+        i (:intersect branch)]
+    (if (and enum? (seq seen-values) (<= (count seen-values) max-enum))
+      [(into [:enum] seen-values)]
+      (if (seq i)
+        [(preferred-type i)]
+        (:seen branch)))))
+
+(defn- fold-scalar
+  "Track the intersection of accepting type-sets across all scalar samples
+  plus the first-seen order of each sample's most specific type."
+  [branch x]
+  (let [branch (or branch {:intersect nil :seen [] :values []})
+        acc (accepting-types x)
+        best (preferred-type acc)]
+    (-> branch
+        (update :intersect (fn [i] (if (nil? i) acc (set (filter acc i)))))
+        (update :seen (fn [seen] (if (some #{best} seen) seen (conj seen best))))
+        (update :values (fn [xs] (if (some #{x} xs) xs (conj xs x)))))))
 
 (defn- synthesize-map
   "[:map-of k v] when the heuristic holds, else [:map [k (props?) v] ...] with
@@ -185,13 +211,21 @@
 
 (defn- synthesize-coll
   [type-kw branch opts]
-  (let [elem (:elem branch)]
-    [type-kw (if (zero? (:total elem)) :any (synthesize elem opts))]))
+  (if (and (= :vector type-kw)
+           (:infer-tuples opts)
+           (= 1 (count (:arities branch))))
+    (let [n (first (:arities branch))]
+      (into [:tuple]
+            (map (fn [i]
+                   (synthesize (nth (:positions branch) i) opts)))
+            (range n)))
+    (let [elem (:elem branch)]
+      [type-kw (if (zero? (:total elem)) :any (synthesize elem opts))])))
 
 (defn- branch-schemas
   [k branch opts]
   (case k
-    :scalar (scalar-schemas branch)
+    :scalar (scalar-schemas branch opts)
     :map [(synthesize-map branch opts)]
     :set [(synthesize-coll :set branch opts)]
     :vector [(synthesize-coll :vector branch opts)]

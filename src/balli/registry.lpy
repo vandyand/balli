@@ -24,9 +24,9 @@
   serve stale compiled fns. Schema OBJECTS bake their registry at
   construction and keep the old meaning (immutable snapshots).
 
-  Skipped malli registry flavors (documented): var-registry,
-  dynamic-registry (no dynamic-binding story worth it), lazy-registry
-  (provider-on-miss).")
+  Balli also supports lightweight dynamic and lazy registry maps. A dynamic
+  registry derefs a source atom/fn on lookup; a lazy registry asks a provider
+  fn on cache miss and memoizes returned schema forms.")
 
 (def builtin-types
   "The set of schema type keywords balli supports natively. Predicate schemas
@@ -34,8 +34,10 @@
   FORMS a predicate schema is the fn/symbol itself (see balli.normalize's
   pred table)."
   #{:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid
-    :time/instant :time/local-date-time :time/local-date :time/local-time :time/duration
-    :map :map-of :vector :sequential :set :tuple :enum := :maybe :and :or :orn
+    :time/instant :time/offset-date-time :time/zoned-date-time
+    :time/local-date-time :time/local-date :time/local-time :time/offset-time
+    :time/duration :time/period :time/zone-id :time/zone-offset
+    :map :map-of :vector :sequential :set :tuple :enum := :maybe :and :andn :or :orn
     :not :fn :multi :re :ref
     :> :>= :< :<= :not=
     :cat :catn :alt :altn :? :* :+ :repeat :schema
@@ -114,11 +116,54 @@
   [& schema-maps]
   (update (default-registry) :schemas #(apply merge % schema-maps)))
 
+(defn dynamic-registry
+  "Registry whose backing registry is read at lookup time from `source`.
+  `source` may be an atom containing a registry map or schema map, or a
+  0-arg fn returning either shape. This is intentionally explicit instead
+  of relying on dynamic var binding."
+  [source]
+  {:types builtin-types
+   :schemas {}
+   :balli/dynamic-source source})
+
+(defn lazy-registry
+  "Registry that calls `(provider k)` when keyword `k` is not eagerly present.
+  A non-nil provider result is memoized for future lookups. With two args,
+  `base` is a registry map or plain schema map layered under the provider."
+  ([provider] (lazy-registry (registry) provider))
+  ([base provider]
+   (let [base (if (and (map? base) (contains? base :schemas))
+                base
+                (registry base))]
+     (assoc base
+            :balli/lazy-provider provider
+            :balli/lazy-cache (atom {})))))
+
+(defn- source-registry
+  [source]
+  (let [r (cond
+            (python/callable source) (source)
+            :else (try @source (catch python/Exception _ source)))]
+    (if (and (map? r) (contains? r :schemas))
+      r
+      (registry r))))
+
 (defn resolve-ref
   "Look up a registered schema form by keyword in registry `reg`.
   Returns nil when the keyword is not registered."
   [reg k]
-  (get (:schemas reg) k))
+  (or (when (contains? (:schemas reg) k)
+        (get (:schemas reg) k))
+      (when-some [source (:balli/dynamic-source reg)]
+        (resolve-ref (source-registry source) k))
+      (when-some [provider (:balli/lazy-provider reg)]
+        (let [cache (:balli/lazy-cache reg)]
+          (if (contains? @cache k)
+            (get @cache k)
+            (let [v (provider k)]
+              (when (some? v)
+                (swap! cache assoc k v)
+                v)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Layered registries (local :registry schema properties, tier-3 Phase 3)
@@ -155,13 +200,15 @@
   registry key caches identically whether or not any layering happened."
   [r local]
   (let [layers (or (:balli/layers r)
-                   [{:token 0 :local (:schemas r) :schemas (:schemas r)}])
+                   [{:token 0 :local (:schemas r) :schemas (:schemas r)
+                     :registry r}])
         merged (merge (:schemas (peek layers)) local)]
     (assoc r
            :schemas merged
            :balli/layers (conj layers {:token (swap! layer-token-counter inc)
                                        :local local
-                                       :schemas merged}))))
+                                       :schemas merged
+                                       :registry (assoc r :schemas merged)}))))
 
 (defn resolve-ref-layered
   "Resolve keyword `k` against registry (or chain) `r`, innermost layer
@@ -175,12 +222,16 @@
   (if-let [layers (:balli/layers r)]
     (loop [i (dec (count layers))]
       (when (>= i 0)
-        (let [{:keys [token local schemas]} (nth layers i)]
-          (if (contains? local k)
-            {:form (get local k)
+        (let [{:keys [token local schemas registry]} (nth layers i)
+              dynamic-hit (when (and (zero? i)
+                                     (not (contains? local k))
+                                     registry)
+                            (resolve-ref registry k))]
+          (if (or (contains? local k) (some? dynamic-hit))
+            {:form (if (contains? local k) (get local k) dynamic-hit)
              :token token
              :registry (assoc r :schemas schemas
                               :balli/layers (subvec layers 0 (inc i)))}
             (recur (dec i))))))
-    (when-let [form (get (:schemas r) k)]
+    (when-let [form (resolve-ref r k)]
       {:form form :token 0 :registry r})))

@@ -269,7 +269,7 @@
    (let [ast (->ast s opts)
          t (:type ast)]
      (cond
-       (contains? #{:map :multi :orn :catn :altn} t)
+       (contains? #{:map :multi :orn :andn :catn :altn} t)
        (some (fn [{:keys [key schema]}]
                (when (= key k) (:form schema)))
              (:children ast))

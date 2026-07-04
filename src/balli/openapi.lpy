@@ -1,0 +1,56 @@
+(ns balli.openapi
+  "OpenAPI 3 export helpers built on balli.json-schema.
+
+  `schema` exports a Balli schema as an OpenAPI Schema Object, moving JSON
+  Schema definitions under components/schemas and rewriting refs. `openapi`
+  wraps schemas into a minimal OpenAPI document."
+  (:require [balli.json-schema :as json-schema]))
+
+(defn- rewrite-refs
+  [x]
+  (cond
+    (map? x)
+    (into {}
+          (map (fn [[k v]]
+                 [k (if (and (= "$ref" k) (string? v) (.startswith v "#/definitions/"))
+                      (.replace v "#/definitions/" "#/components/schemas/" 1)
+                      (rewrite-refs v))]))
+          x)
+
+    (vector? x) (mapv rewrite-refs x)
+    (set? x) (set (map rewrite-refs x))
+    (seq? x) (mapv rewrite-refs x)
+    :else x))
+
+(defn schema
+  "Return an OpenAPI 3 schema object. Reached refs are emitted under
+  {\"components\" {\"schemas\" ...}} and $ref values point at
+  #/components/schemas/..."
+  ([s] (schema s {}))
+  ([s opts]
+   (let [out (json-schema/transform s opts)
+         defs (get out "definitions")
+         out (rewrite-refs (dissoc out "definitions"))]
+     (if (seq defs)
+       (assoc out "components" {"schemas" (rewrite-refs defs)})
+       out))))
+
+(defn openapi
+  "Build a minimal OpenAPI 3.1 document.
+  opts:
+    :info  string-keyed info map, default {\"title\" \"Balli API\" \"version\" \"1.0.0\"}
+    :paths string-keyed paths map, default {}
+    :components extra components map merged with generated schemas."
+  ([s] (openapi s {}))
+  ([s opts]
+   (let [sch (schema s opts)
+         generated (get sch "components")
+         root (dissoc sch "components")
+         components (merge-with merge generated (:components opts))]
+     (cond-> {"openapi" "3.1.0"
+              "info" (or (:info opts) {"title" "Balli API" "version" "1.0.0"})
+              "paths" (or (:paths opts) {})
+              "components" (merge-with merge
+                                       {"schemas" {"Root" root}}
+                                       components)}
+       (:servers opts) (assoc "servers" (:servers opts))))))

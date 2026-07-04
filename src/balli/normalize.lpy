@@ -154,9 +154,12 @@
 (defn- check-time-bounds!
   [type props form]
   (when (contains? time-types type)
-    (let [check (:check (bt/type-spec type))]
+    (let [spec (bt/type-spec type)
+          check (:check spec)]
       (doseq [k [:min :max]]
         (let [v (get props k)]
+          (when (and (some? v) (not (:bounded? spec)))
+            (invalid! (str type " does not support " k) form))
           (when (and (some? v) (not (check v)))
             (invalid! (str type " " k " must be a matching time value") form))))
       (when (and (some? (:min props)) (some? (:max props)))
@@ -237,10 +240,16 @@
 (defmethod normalize* :symbol [form opts] (normalize-scalar form opts))
 (defmethod normalize* :uuid [form opts] (normalize-scalar form opts))
 (defmethod normalize* :time/instant [form opts] (normalize-scalar form opts))
+(defmethod normalize* :time/offset-date-time [form opts] (normalize-scalar form opts))
+(defmethod normalize* :time/zoned-date-time [form opts] (normalize-scalar form opts))
 (defmethod normalize* :time/local-date-time [form opts] (normalize-scalar form opts))
 (defmethod normalize* :time/local-date [form opts] (normalize-scalar form opts))
 (defmethod normalize* :time/local-time [form opts] (normalize-scalar form opts))
+(defmethod normalize* :time/offset-time [form opts] (normalize-scalar form opts))
 (defmethod normalize* :time/duration [form opts] (normalize-scalar form opts))
+(defmethod normalize* :time/period [form opts] (normalize-scalar form opts))
+(defmethod normalize* :time/zone-id [form opts] (normalize-scalar form opts))
+(defmethod normalize* :time/zone-offset [form opts] (normalize-scalar form opts))
 
 ;; ---------------------------------------------------------------------------
 ;; Literal-value schemas: :enum / :=
@@ -361,6 +370,14 @@
     (when (empty? elems)
       (invalid! ":orn requires at least one entry" form))
     (node :orn props (mapv #(normalize-entry % opts) elems) form)))
+
+(defmethod normalize* :andn [form opts]
+  (when (keyword? form)
+    (invalid! ":andn requires at least one entry" form))
+  (let [[props elems] (split-props-leading (rest form))]
+    (when (empty? elems)
+      (invalid! ":andn requires at least one entry" form))
+    (node :andn props (mapv #(normalize-entry % opts) elems) form)))
 
 ;; ---------------------------------------------------------------------------
 ;; :map-of
@@ -636,7 +653,7 @@
 
 (defmethod normalize* :default [form opts]
   (let [registry (or (:registry opts) (reg/default-registry))]
-    (if (and (keyword? form) (contains? (:schemas registry) form))
+    (if (and (keyword? form) (some? (reg/resolve-ref registry form)))
       (assoc (node :ref {} [] form) :ref form)
       (invalid! "Unknown schema" form))))
 
@@ -663,12 +680,14 @@
 (def ^:private leading-props-types
   "Types whose leading map is ALWAYS properties (the split-props-leading
   users above)."
-  #{:map :multi :orn :cat :alt :catn :altn :repeat :=> :function})
+  #{:map :multi :orn :andn :cat :alt :catn :altn :repeat :=> :function})
 
 (def ^:private scalar-types
   "Types whose vector form is [t] or [t props] (the normalize-scalar users)."
   #{:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid
-    :time/instant :time/local-date-time :time/local-date :time/local-time :time/duration})
+    :time/instant :time/offset-date-time :time/zoned-date-time
+    :time/local-date-time :time/local-date :time/local-time :time/offset-time
+    :time/duration :time/period :time/zone-id :time/zone-offset})
 
 (defn- form-props
   "The properties map of vector-form `form`, or nil — replicating the

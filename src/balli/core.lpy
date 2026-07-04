@@ -17,7 +17,7 @@
             [balli.registry :as reg]
             [balli.transform :as bt]))
 
-(def version "0.3.0")
+(def version "0.4.0")
 
 (defn schema?
   "True when `x` is a balli schema object."
@@ -151,6 +151,10 @@
                {:epoch live :entries (assoc-in entries [k slot] f)}))))
   f)
 
+(defn- dynamic-registry?
+  [r]
+  (boolean (:balli/dynamic-source r)))
+
 (defn- compile-validator!
   "Compile a validator for schema object `s` (honoring its baked-in function
   checker, when any), caching it under :validator in the schema's :cache
@@ -195,6 +199,12 @@
      (some? (::function-checker opts))
      (validator (schema s opts))
 
+     ;; dynamic registries resolve refs against mutable/live sources, so a
+     ;; compiled raw-form fn would freeze one lookup result under a stable
+     ;; registry identity.
+     (dynamic-registry? (:registry opts))
+     (validator (schema s opts))
+
      ;; raw form: bounded global cache keyed by [form registry-id]
      :else
      (let [k [s (registry-id (:registry opts))]]
@@ -217,6 +227,9 @@
 
      ;; raw form + checker: bypass the global raw-form cache (see validator)
      (some? (::function-checker opts))
+     (explainer (schema s opts))
+
+     (dynamic-registry? (:registry opts))
      (explainer (schema s opts))
 
      ;; raw form: bounded global cache keyed by [form registry-id]
@@ -453,7 +466,9 @@
   plain values, refs are not entered). f receives the node's original form
   fragment."
   #{:any :nil :string :int :float :double :number :boolean :keyword :symbol
-    :uuid :time/instant :time/local-date-time :time/local-date :time/local-time :time/duration
+    :uuid :time/instant :time/offset-date-time :time/zoned-date-time
+    :time/local-date-time :time/local-date :time/local-time :time/offset-time
+    :time/duration :time/period :time/zone-id :time/zone-offset
     :enum := :fn :re :ref :balli/pred :> :>= :< :<= :not=})
 
 (defn- walk-ast
@@ -466,7 +481,7 @@
       (contains? walk-leaf-types t)
       (f (:form node) path)
 
-      (contains? #{:map :multi :orn :catn :altn} t)
+      (contains? #{:map :multi :orn :andn :catn :altn} t)
       (let [walk-entry (fn [{:keys [key properties schema]}]
                          (let [v (walk-ast schema (conj path key) f)]
                            (if (seq properties)

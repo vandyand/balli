@@ -1,0 +1,30 @@
+(ns balli.swagger
+  "Swagger/OpenAPI 2.0 export helpers built on balli.json-schema."
+  (:require [balli.json-schema :as json-schema]))
+
+(defn schema
+  "Return a Swagger 2.0-compatible schema object. Balli's JSON Schema export
+  already uses top-level definitions and #/definitions refs, which Swagger 2
+  accepts for schema definitions."
+  ([s] (schema s {}))
+  ([s opts]
+   (json-schema/transform s opts)))
+
+(defn swagger
+  "Build a minimal Swagger 2.0 document.
+  opts:
+    :info string-keyed info map, default {\"title\" \"Balli API\" \"version\" \"1.0.0\"}
+    :paths string-keyed paths map, default {}
+    :host, :basePath, :schemes are copied when present."
+  ([s] (swagger s {}))
+  ([s opts]
+   (let [sch (schema s opts)
+         defs (get sch "definitions")
+         root (dissoc sch "definitions")]
+     (cond-> {"swagger" "2.0"
+              "info" (or (:info opts) {"title" "Balli API" "version" "1.0.0"})
+              "paths" (or (:paths opts) {})
+              "definitions" (merge {"Root" root} defs)}
+       (:host opts) (assoc "host" (:host opts))
+       (:basePath opts) (assoc "basePath" (:basePath opts))
+       (:schemes opts) (assoc "schemes" (:schemes opts))))))

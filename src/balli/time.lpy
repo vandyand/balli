@@ -4,7 +4,7 @@
   This namespace is deliberately a leaf: no balli.* requires. Higher-level
   namespaces consume the `types` table for validation, transformation,
   generation, and JSON Schema wiring."
-  (:import datetime math re))
+  (:import datetime math re zoneinfo))
 
 (def ^:private duration-pattern
   (re/compile "^(-)?P(?:(\\d+(?:\\.\\d+)?)W)?(?:(\\d+(?:\\.\\d+)?)D)?(?:T(?:(\\d+(?:\\.\\d+)?)H)?(?:(\\d+(?:\\.\\d+)?)M)?(?:(\\d+(?:\\.\\d+)?)S)?)?$"))
@@ -13,6 +13,11 @@
   [x]
   (and (isinstance x datetime/datetime)
        (some? (.-tzinfo x))))
+
+(defn zoned-datetime?
+  [x]
+  (and (aware-datetime? x)
+       (isinstance (.-tzinfo x) zoneinfo/ZoneInfo)))
 
 (defn local-date-time?
   [x]
@@ -29,9 +34,32 @@
   (and (isinstance x datetime/time)
        (nil? (.-tzinfo x))))
 
+(defn offset-time?
+  [x]
+  (and (isinstance x datetime/time)
+       (some? (.-tzinfo x))))
+
 (defn duration?
   [x]
   (isinstance x datetime/timedelta))
+
+(defn period?
+  [x]
+  (and (map? x)
+       (every? #{:years :months :days} (keys x))
+       (every? int? (vals x))))
+
+(defn zone-id?
+  [x]
+  (and (string? x)
+       (try
+         (zoneinfo/ZoneInfo x)
+         true
+         (catch python/Exception _ false))))
+
+(defn zone-offset?
+  [x]
+  (isinstance x datetime/timezone))
 
 (defn- parse-float
   [s]
@@ -58,6 +86,48 @@
                          (or seconds 0.0))
                 total (if neg? (- total) total)]
             (datetime/timedelta ** :seconds total)))))))
+
+(def ^:private period-pattern
+  (re/compile "^(-)?P(?:(\\d+)Y)?(?:(\\d+)M)?(?:(\\d+)D)?$"))
+
+(defn- parse-int
+  [s]
+  (when (some? s) (python/int s)))
+
+(defn parse-period
+  "Parse an ISO-8601 calendar period subset (PnYnMnD) into
+  {:years y :months m :days d}. Weeks and time components are intentionally
+  not accepted; use :time/duration for elapsed time."
+  [s]
+  (when (string? s)
+    (when-let [m (.match period-pattern s)]
+      (let [neg? (some? (.group m 1))
+            years (parse-int (.group m 2))
+            months (parse-int (.group m 3))
+            days (parse-int (.group m 4))]
+        (when (some some? [years months days])
+          (let [sign (if neg? -1 1)]
+            {:years (* sign (or years 0))
+             :months (* sign (or months 0))
+             :days (* sign (or days 0))}))))))
+
+(declare trim-float)
+
+(defn format-period
+  [p]
+  (let [years (:years p 0)
+        months (:months p 0)
+        days (:days p 0)
+        neg? (some neg? [years months days])
+        years (math/fabs years)
+        months (math/fabs months)
+        days (math/fabs days)]
+    (str (when neg? "-")
+         "P"
+         (when (pos? years) (str (trim-float years) "Y"))
+         (when (pos? months) (str (trim-float months) "M"))
+         (when (pos? days) (str (trim-float days) "D"))
+         (when (and (zero? years) (zero? months) (zero? days)) "0D"))))
 
 (defn- trim-float
   [x]
@@ -98,6 +168,17 @@
       (when (pred v) v))
     (catch python/Exception _ nil)))
 
+(defn- decode-zoned-date-time
+  [s]
+  (try
+    (let [parts (.split s "[")
+          dt (datetime.datetime/fromisoformat (first parts))
+          zone (when (= 2 (count parts))
+                 (.rstrip (second parts) "]"))]
+      (when (and zone (aware-datetime? dt) (zone-id? zone))
+        (.replace dt ** :tzinfo (zoneinfo/ZoneInfo zone))))
+    (catch python/Exception _ nil)))
+
 (defn- decode-date
   [s]
   (try
@@ -111,49 +192,144 @@
       (when (local-time? v) v))
     (catch python/Exception _ nil)))
 
+(defn- decode-offset-time
+  [s]
+  (try
+    (let [v (datetime.time/fromisoformat s)]
+      (when (offset-time? v) v))
+    (catch python/Exception _ nil)))
+
+(def ^:private offset-pattern
+  (re/compile "^(Z|[+-]\\d\\d(?::?\\d\\d)?)$"))
+
+(defn parse-zone-offset
+  [s]
+  (when (string? s)
+    (when-let [m (.match offset-pattern s)]
+      (let [x (.group m 1)]
+        (if (= "Z" x)
+          datetime.timezone/utc
+          (let [sign (if (= "-" (subs x 0 1)) -1 1)
+                body (subs x 1)
+                body (.replace body ":" "")
+                hours (python/int (subs body 0 2))
+                minutes (if (> (count body) 2) (python/int (subs body 2 4)) 0)]
+            (datetime/timezone
+             (datetime/timedelta ** :minutes (* sign (+ (* hours 60) minutes))))))))))
+
+(defn format-zone-offset
+  [tz]
+  (if (= tz datetime.timezone/utc)
+    "Z"
+    (let [td (.utcoffset tz nil)
+          total (python/int (.total_seconds td))
+          sign (if (neg? total) "-" "+")
+          total (math/fabs total)
+          hours (python/int (math/floor (/ total 3600.0)))
+          minutes (python/int (math/floor (/ (- total (* hours 3600.0)) 60.0)))]
+      (str sign
+           (.zfill (str hours) 2)
+           ":"
+           (.zfill (str minutes) 2)))))
+
 (defn decode
   "Decode a string for time schema `type`, returning nil on parse/type miss."
   [type s]
   (when (string? s)
     (case type
       :time/instant (decode-datetime s aware-datetime?)
+      :time/offset-date-time (decode-datetime s aware-datetime?)
+      :time/zoned-date-time (decode-zoned-date-time s)
       :time/local-date-time (decode-datetime s local-date-time?)
       :time/local-date (decode-date s)
       :time/local-time (decode-time s)
-      :time/duration (parse-duration s))))
+      :time/offset-time (decode-offset-time s)
+      :time/duration (parse-duration s)
+      :time/period (parse-period s)
+      :time/zone-id (when (zone-id? s) s)
+      :time/zone-offset (parse-zone-offset s))))
 
 (defn encode
   [type v]
-  (if (= :time/duration type)
-    (format-duration v)
+  (case type
+    :time/duration (format-duration v)
+    :time/period (format-period v)
+    :time/zone-id v
+    :time/zone-offset (format-zone-offset v)
+    :time/zoned-date-time (str (.isoformat v) "[" (.-key (.-tzinfo v)) "]")
     (.isoformat v)))
 
 (def types
   {:time/instant {:check aware-datetime?
                   :decode #(decode :time/instant %)
                   :encode #(encode :time/instant %)
+                  :json-format "date-time"
+                  :bounded? true
                   :gen-default [(datetime/datetime 2000 1 1 0 0 0 0 ** :tzinfo datetime.timezone/utc)
                                 (datetime/datetime 2030 1 1 0 0 0 0 ** :tzinfo datetime.timezone/utc)]}
+   :time/offset-date-time {:check aware-datetime?
+                           :decode #(decode :time/offset-date-time %)
+                           :encode #(encode :time/offset-date-time %)
+                           :json-format "date-time"
+                           :bounded? true
+                           :gen-default [(datetime/datetime 2000 1 1 0 0 0 0 ** :tzinfo datetime.timezone/utc)
+                                         (datetime/datetime 2030 1 1 0 0 0 0 ** :tzinfo datetime.timezone/utc)]}
+   :time/zoned-date-time {:check zoned-datetime?
+                          :decode #(decode :time/zoned-date-time %)
+                          :encode #(encode :time/zoned-date-time %)
+                          :json-format "date-time"
+                          :bounded? true
+                          :gen-default [(datetime/datetime 2000 1 1 0 0 0 0 ** :tzinfo (zoneinfo/ZoneInfo "UTC"))
+                                        (datetime/datetime 2030 1 1 0 0 0 0 ** :tzinfo (zoneinfo/ZoneInfo "UTC"))]}
    :time/local-date-time {:check local-date-time?
                           :decode #(decode :time/local-date-time %)
                           :encode #(encode :time/local-date-time %)
+                          :json-format "date-time"
+                          :bounded? true
                           :gen-default [(datetime/datetime 2000 1 1)
                                         (datetime/datetime 2030 1 1)]}
    :time/local-date {:check local-date?
                      :decode #(decode :time/local-date %)
                      :encode #(encode :time/local-date %)
+                     :json-format "date"
+                     :bounded? true
                      :gen-default [(datetime/date 2000 1 1)
                                    (datetime/date 2030 1 1)]}
    :time/local-time {:check local-time?
                      :decode #(decode :time/local-time %)
                      :encode #(encode :time/local-time %)
+                     :json-format "time"
+                     :bounded? true
                      :gen-default [(datetime/time 0 0 0)
                                    (datetime/time 23 59 59)]}
+   :time/offset-time {:check offset-time?
+                      :decode #(decode :time/offset-time %)
+                      :encode #(encode :time/offset-time %)
+                      :json-format "time"
+                      :bounded? true
+                      :gen-default [(datetime/time 0 0 0 0 ** :tzinfo datetime.timezone/utc)
+                                    (datetime/time 23 59 59 0 ** :tzinfo datetime.timezone/utc)]}
    :time/duration {:check duration?
                    :decode #(decode :time/duration %)
                    :encode #(encode :time/duration %)
+                   :json-format "duration"
+                   :bounded? true
                    :gen-default [(datetime/timedelta)
-                                 (datetime/timedelta ** :seconds 1000000)]}})
+                                 (datetime/timedelta ** :seconds 1000000)]}
+   :time/period {:check period?
+                 :decode #(decode :time/period %)
+                 :encode #(encode :time/period %)
+                 :json-format "period"
+                 :gen-default [{:years 0 :months 0 :days 0}
+                               {:years 5 :months 11 :days 31}]}
+   :time/zone-id {:check zone-id?
+                  :decode #(decode :time/zone-id %)
+                  :encode #(encode :time/zone-id %)
+                  :json-format "time-zone"}
+   :time/zone-offset {:check zone-offset?
+                      :decode #(decode :time/zone-offset %)
+                      :encode #(encode :time/zone-offset %)
+                      :json-format "time-zone-offset"}})
 
 (defn time-type?
   [t]
