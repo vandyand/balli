@@ -13,13 +13,13 @@ Seven phases: spike → predicates/comparators → mutable registry → local re
 
 ## Phase 0: Spike
 
-- [ ] `datetime.fromisoformat` on py3.12 via Basilisp: `"2024-01-01T00:00:00Z"`, `"+02:00"` offsets, naive strings; `.tzinfo` aware/naive detection; `date.fromisoformat`, `time.fromisoformat`; fractional seconds
-- [ ] `(isinstance <datetime> date)` → confirm True (subclass) — exclusion strategy for `:time/local-date`
-- [ ] `timedelta`: comparison ops, negative values, `.total_seconds()`; sketch + probe the ISO-duration regex round-trip on `"PT15M" "P1DT2H3M4.5S" "P2W" "-PT5S"`
-- [ ] Basilisp availability of each §4 predicate name; note aliases/missing
-- [ ] Fn-identity map lookup: `(get {int? :a} int?)`; stability of core-fn identity across ns requires
-- [ ] `inst?` on Python datetime instances
-- [ ] Record findings in "Phase 0 findings" section here
+- [x] `datetime.fromisoformat` on py3.12 via Basilisp: `"2024-01-01T00:00:00Z"`, `"+02:00"` offsets, naive strings; `.tzinfo` aware/naive detection; `date.fromisoformat`, `time.fromisoformat`; fractional seconds
+- [x] `(isinstance <datetime> date)` → confirm True (subclass) — exclusion strategy for `:time/local-date`
+- [x] `timedelta`: comparison ops, negative values, `.total_seconds()`; sketch + probe the ISO-duration regex round-trip on `"PT15M" "P1DT2H3M4.5S" "P2W" "-PT5S"`
+- [x] Basilisp availability of each §4 predicate name; note aliases/missing
+- [x] Fn-identity map lookup: `(get {int? :a} int?)`; stability of core-fn identity across ns requires
+- [x] `inst?` on Python datetime instances
+- [x] Record findings in "Phase 0 findings" section here
 
 **Checkpoints:** each bullet a probe with exact outputs. No test file.
 
@@ -120,3 +120,75 @@ Completion gate: the Phase 6 sweep. All exit 0 before PR.
 ## Rollback
 
 Branch `balli-tier3`; main holds 0.2.0.
+
+## Phase 0 findings
+
+Spike run 2026-07-04, Basilisp 0.5.0 on Python 3.12.3. All probes via `basilisp run /tmp/probe*.lpy`.
+
+### 1. datetime interop (py3.12 `fromisoformat`)
+
+All four datetime strings parse without preprocessing (py3.11+ accepts `Z`):
+
+| input | result | `.tzinfo` |
+|---|---|---|
+| `"2024-01-01T00:00:00Z"` | aware, `+00:00` | `datetime.timezone.utc` |
+| `"2024-01-01T00:00:00+02:00"` | aware | `timezone(timedelta(seconds=7200))` |
+| `"2024-01-01T00:00:00"` | naive | `nil` |
+| `"2024-01-01T00:00:00.123456Z"` | aware, fractional preserved | `datetime.timezone.utc` |
+
+- **Aware/naive detection:** `(some? (.-tzinfo d))` works — tzinfo is `nil` (Python `None`) for naive values.
+- `datetime.date/fromisoformat "2024-01-01"` → `date(2024,1,1)`. It REJECTS a full datetime string (`"2024-01-01T00:00:00"` → `ValueError`) — good, no truncation surprise.
+- `datetime.time/fromisoformat`: naive `"10:00:00"` → tzinfo nil; **it DOES accept offsets** — `"10:00:00+02:00"` → `time(10,0, tzinfo=timezone(timedelta(seconds=7200)))` (aware time); fractional `"10:00:00.123456"` fine. So `:time/time` must decide aware-time policy explicitly (validate via `.tzinfo` just like datetime).
+- Garbage → `ValueError` (e.g. `Invalid isoformat string: 'garbage'`); decode must catch `ValueError` and return input unchanged.
+- Encode: `.isoformat` round-trips; aware utc renders `+00:00` (NOT `Z`) — tests must expect `"...+00:00"`.
+- **Basilisp syntax gotcha:** bare symbols may not contain `.`, so the CLASS is `datetime/datetime` (call/isinstance position) while STATIC methods use the dotted-namespace form `datetime.datetime/fromisoformat`. Aware construction: `(datetime/datetime 2024 1 1 12 0 0 0 ** :tzinfo datetime.timezone/utc)` → works; custom offset: `(datetime/timezone (datetime/timedelta ** :hours 2))`.
+
+### 2. date/datetime subclassing
+
+- `(isinstance <datetime> datetime/date)` → `true` (subclass, as expected); `(isinstance <date> datetime/datetime)` → `false`.
+- Exclusion pattern CONFIRMED for `:time/local-date`: `(and (isinstance x datetime/date) (not (isinstance x datetime/datetime)))` → `false` for datetimes, `true` for pure dates.
+
+### 3. timedelta + ISO-8601 durations
+
+- **Basilisp `<`/`<=` work directly on timedeltas** (delegate to Python rich comparison): `(< (td :minutes 5) (td :minutes 10))` → `true`; `(<= a a)` → `true`. No `operator` module fallback needed (though `operator/le` also works, and dunder calls are `(. a __le__ b)` — `.--le--` sugar does NOT parse).
+- Negative timedeltas fine: `(td ** :seconds -5)` → `timedelta(days=-1, seconds=86395)`, `.total-seconds` → `-5.0`; unary `(- v)` negates; comparisons hold.
+- **Duration regex decided** (match with `re/fullmatch`, then require ≥1 component group to reject bare `P`/`PT`/`-P`):
+  ```
+  ^(-)?P(?:(\d+(?:\.\d+)?)W)?(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$
+  ```
+  Groups: sign, weeks, days, hours, minutes, seconds (fractional allowed on any component). No Y/M components — timedelta cannot represent them; `"P1Y"` → nil (input kept), same as `"XYZ"`, `"P"`, `"PT"`, `""`.
+- Parse matrix: `PT15M`→900s; `P1DT2H3M4.5S`→93784.5s; `P2W`→1209600s; `-PT5S`→−5s; `P3D`→259200s; `PT0S`→`timedelta(0)`.
+- Formatter: decompose `|total_seconds|` into D/H/M/S, integerize whole seconds, emit `PT0S` for zero, leading `-` for negative. **Round-trip value→str→value equality holds for all five spec cases** (both Basilisp `=` and Python `==`). Note string round-trip is NOT identity: `"P2W"` re-formats as `"P14D"` (equal value) — tests must compare values, not strings, except where the canonical form is asserted.
+
+### 4. Predicate availability
+
+**ALL 41 probed names EXIST in basilisp.core 0.5.0** — no aliases or shims needed: `any? some? number? integer? int? pos-int? neg-int? nat-int? pos? neg? float? double? boolean? string? ident? keyword? simple-keyword? qualified-keyword? symbol? simple-symbol? qualified-symbol? uuid? inst? seqable? indexed? map? vector? list? seq? set? nil? false? true? zero? coll? associative? sequential? fn? ifn? empty? char?`.
+
+This is the final Phase 1 registration list (41 predicates). Semantics notes: `double?` ≡ `float?` (both true on `1.5`, false on `1`); `char?` is true for 1-char strings (`\a` IS a Python `str`) — document as "single-character string".
+
+### 5. Fn-identity map lookup
+
+- `(get {int? :a} int?)` → `:a`; `(= int? int?)` → `true`; fns work as literal-map keys and set members; hashing stable.
+- Identity stable across ns accesses: `(identical? c1/int? c2/int?)` → `true` for two separate `(require '[basilisp.core :as cN])` aliases, and `(identical? (deref (resolve 'int?)) int?)` → `true`. Core fns are singleton vars → **fn-identity dispatch table is safe**; register both fn-identity → type kw and quoted-symbol → type kw as planned.
+
+### 6. `inst?`
+
+`(inst? <python datetime>)` → `true`; `(inst? <date>)` → `false`; `(inst? <time>)` → `false`. So `inst?` ≙ datetime-only — its Phase 5 upgrade maps cleanly to `:time/instant`/`:time/local-date-time` territory (datetime instances, aware or naive — `inst?` does NOT distinguish awareness).
+
+### 7. Rich comparison via Basilisp `<`/`<=`
+
+Basilisp `<`/`<=` delegate to Python rich comparison for ALL time types (and strings):
+
+- datetime/date/time/timedelta: `<`, `<=`, and chained `(<= lo x hi)` all work → **`:min`/`:max` bounds can use plain `(<= min-v x)` / `(<= x max-v)`; no operator-module indirection needed.**
+- `(< "a" "b")` → `true` (strings compare too — comparator schemas get lexicographic behavior for free where both sides are strings).
+- **TypeError cases (must be caught, exception-safe → `false`/invalid):** naive vs aware datetime (`can't compare offset-naive and offset-aware datetimes`), naive vs aware time (same for times), date vs datetime mixed (`can't compare datetime.datetime to datetime.date`), and `(< 5 "x")` (`'<' not supported between instances of 'int' and 'str'`). Phase 1 comparator validate and Phase 5 bounds checks BOTH need try/except-wrapped comparisons.
+
+### Plan edits needed
+
+None structural. Refinements carried into later phases:
+
+1. **Phase 5:** aware-vs-aware/naive bounds comparison can raise TypeError even when the value is the right Python type (naive datetime vs aware `:min`) — the min/max check must be exception-safe (TypeError → `:balli.core/limits` error or a dedicated awareness mismatch message), and schema-boundary validation should require the `:min`/`:max` instance's awareness to match the type's policy.
+2. **Phase 5:** `:time/time` — Python accepts offset-aware times; define `:time/time`'s awareness policy explicitly in tests (fromisoformat can yield aware time objects).
+3. **Phase 5:** encode emits `+00:00` not `Z`; duration formatter canonicalizes (`P2W`→`P14D`) — tests compare parsed values (or canonical strings) accordingly. Duration years/months (`P1Y`) unsupported → decode leaves input unchanged.
+4. **Phase 1:** `char?` documented as 1-char string; `double?`/`float?` identical semantics (map both to the same type kw).
+5. Source-code note: use `datetime/datetime` (class) vs `datetime.datetime/fromisoformat` (static method) forms; kwargs via `**` confirmed.
