@@ -107,8 +107,15 @@
 
 (deftest generic-invalid
   (is (= ["invalid value"] (be/humanize (b/explain [:fn even?] 3))))
-  (is (= ["invalid value"] (be/humanize (b/explain [:not :int] 1))))
-  (is (= ["invalid value"] (be/humanize (b/explain [:or :string :keyword] 1)))))
+  (is (= ["invalid value"] (be/humanize (b/explain [:not :int] 1)))))
+
+;; :or humanizes per-branch (Phase 2): every failing branch contributes its
+;; own message at the same :in.
+(deftest or-per-branch-messages
+  (is (= ["should be a string" "should be a keyword"]
+         (be/humanize (b/explain [:or :string :keyword] 1))))
+  (is (= {:x ["should be a string" "should be an integer"]}
+         (be/humanize (b/explain [:map [:x [:or :string :int]]] {:x :kw})))))
 
 ;; ---------------------------------------------------------------------------
 ;; Multiple errors at the same :in accumulate into one vector

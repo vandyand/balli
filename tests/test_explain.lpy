@@ -1,7 +1,7 @@
 (ns tests.test-explain
   "Phase 3: exact explain shapes — :path/:in semantics per type, error types,
   missing/extra keys, multi dispatch, limits, tuple positions, map-of key vs
-  value errors, :or single-error simplification, :fn errors, and assert-valid."
+  value errors, :or per-branch errors, :fn errors, and assert-valid."
   (:require [basilisp.test :refer [deftest is testing]]
             [balli.core :as b]))
 
@@ -223,15 +223,33 @@
                :type :balli.core/invalid}]
              (:errors (b/explain form "x")))))))
 
-(deftest or-single-error-at-node
-  ;; Documented MVP simplification: all branches failing emits ONE
-  ;; :balli.core/invalid error at the :or node, not per-branch errors.
+(deftest or-per-branch-errors
+  ;; Malli semantics (Phase 2): all branches failing emits EVERY branch's
+  ;; errors concatenated in branch order, branch index appended to :path
+  ;; only (:in unchanged).
   (let [form [:or :string :int]]
     (is (= {:schema form
             :value :kw
-            :errors [{:path [] :in [] :schema form :value :kw
-                      :type :balli.core/invalid}]}
-           (b/explain form :kw)))))
+            :errors [{:path [0] :in [] :schema :string :value :kw
+                      :type :balli.core/invalid-type}
+                     {:path [1] :in [] :schema :int :value :kw
+                      :type :balli.core/invalid-type}]}
+           (b/explain form :kw))))
+  (testing "any valid branch -> nil"
+    (is (nil? (b/explain [:or :string :int] 5)))
+    (is (nil? (b/explain [:or :string :int] "s"))))
+  (testing "branch errors keep their own inner shape (limits, nested paths)"
+    (is (= [{:path [0] :in [] :schema [:int {:min 10}] :value 3
+             :type :balli.core/limits}
+            {:path [1] :in [] :schema :string :value 3
+             :type :balli.core/invalid-type}]
+           (:errors (b/explain [:or [:int {:min 10}] :string] 3)))))
+  (testing ":or inside a map — branch index extends :path, :in stays the value path"
+    (is (= [{:path [:x 0] :in [:x] :schema :string :value :kw
+             :type :balli.core/invalid-type}
+            {:path [:x 1] :in [:x] :schema :int :value :kw
+             :type :balli.core/invalid-type}]
+           (:errors (b/explain [:map [:x [:or :string :int]]] {:x :kw}))))))
 
 (deftest fn-error
   (let [form [:fn even?]]

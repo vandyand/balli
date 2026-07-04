@@ -1,0 +1,315 @@
+(ns tests.test-json-schema
+  "Phase 3: balli.json-schema/transform -- full §B type mapping, min/max
+  per-family translations, optional/required/closed maps, oneOf cases,
+  :json-schema/* unlift + whole-node override, $ref emission with JSON
+  Pointer escaping, recursive-registry termination, u/merge composition,
+  and python json.dumps interop round-trip."
+  (:import json)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [basilisp.json :as bj]
+            [balli.core :as b]
+            [balli.json-schema :as bjs]
+            [balli.registry :as reg]
+            [balli.util :as u]))
+
+;; ---------------------------------------------------------------------------
+;; Scalar type mappings
+
+(deftest scalar-types
+  (is (= {} (bjs/transform :any)))
+  (is (= {} (bjs/transform [:fn int?])))
+  (is (= {"type" "null"} (bjs/transform :nil)))
+  (is (= {"type" "string"} (bjs/transform :string)))
+  (is (= {"type" "integer"} (bjs/transform :int)))
+  (is (= {"type" "number"} (bjs/transform :float)))
+  (is (= {"type" "number"} (bjs/transform :double)))
+  (is (= {"type" "number"} (bjs/transform :number)))
+  (is (= {"type" "boolean"} (bjs/transform :boolean)))
+  (is (= {"type" "string"} (bjs/transform :keyword)))
+  (is (= {"type" "string"} (bjs/transform :symbol)))
+  (is (= {"type" "string" "format" "uuid"} (bjs/transform :uuid))))
+
+;; ---------------------------------------------------------------------------
+;; Literal-value schemas
+
+(deftest const-schema
+  (testing "keyword const renders as name string"
+    (is (= {"const" "red"} (bjs/transform [:= :red]))))
+  (testing "qualified keyword const renders as ns/name"
+    (is (= {"const" "color/red"} (bjs/transform [:= :color/red]))))
+  (testing "non-keyword const passes as-is"
+    (is (= {"const" 42} (bjs/transform [:= 42])))))
+
+(deftest enum-schema
+  (testing "all keywords -> string type + name-string values"
+    (is (= {"type" "string" "enum" ["a" "b/c"]}
+           (bjs/transform [:enum :a :b/c]))))
+  (testing "all strings -> string type"
+    (is (= {"type" "string" "enum" ["x" "y"]}
+           (bjs/transform [:enum "x" "y"]))))
+  (testing "all ints -> integer type"
+    (is (= {"type" "integer" "enum" [1 2 3]}
+           (bjs/transform [:enum 1 2 3]))))
+  (testing "all doubles -> number type"
+    (is (= {"type" "number" "enum" [1.5 2.5]}
+           (bjs/transform [:enum 1.5 2.5]))))
+  (testing "mixed values -> no inferred type"
+    (is (= {"enum" [1 "a"]}
+           (bjs/transform [:enum 1 "a"])))))
+
+;; ---------------------------------------------------------------------------
+;; Combinators
+
+(deftest combinator-schemas
+  (testing ":not"
+    (is (= {"not" {"type" "string"}} (bjs/transform [:not :string]))))
+  (testing ":and -> allOf"
+    (is (= {"allOf" [{"type" "integer"} {"type" "number"}]}
+           (bjs/transform [:and :int :number]))))
+  (testing ":or -> anyOf"
+    (is (= {"anyOf" [{"type" "integer"} {"type" "string"}]}
+           (bjs/transform [:or :int :string]))))
+  (testing ":maybe -> oneOf child + null"
+    (is (= {"oneOf" [{"type" "integer"} {"type" "null"}]}
+           (bjs/transform [:maybe :int]))))
+  (testing ":multi -> oneOf branch schemas (dispatch ignored)"
+    (is (= {"oneOf" [{"type" "integer"} {"type" "string"}]}
+           (bjs/transform [:multi {:dispatch :kind}
+                           [:a :int]
+                           [:b :string]])))))
+
+;; ---------------------------------------------------------------------------
+;; Collections + min/max per-family translations
+
+(deftest string-min-max
+  (is (= {"type" "string" "minLength" 1 "maxLength" 5}
+         (bjs/transform [:string {:min 1 :max 5}]))))
+
+(deftest numeric-min-max
+  (is (= {"type" "integer" "minimum" 0 "maximum" 10}
+         (bjs/transform [:int {:min 0 :max 10}])))
+  (is (= {"type" "number" "minimum" 0.5 "maximum" 1.5}
+         (bjs/transform [:double {:min 0.5 :max 1.5}]))))
+
+(deftest collection-schemas
+  (testing ":vector with min/max -> minItems/maxItems"
+    (is (= {"type" "array" "items" {"type" "integer"} "minItems" 1 "maxItems" 3}
+           (bjs/transform [:vector {:min 1 :max 3} :int]))))
+  (testing ":sequential"
+    (is (= {"type" "array" "items" {"type" "string"}}
+           (bjs/transform [:sequential :string]))))
+  (testing ":set adds uniqueItems"
+    (is (= {"type" "array" "items" {"type" "string"} "uniqueItems" true "minItems" 2}
+           (bjs/transform [:set {:min 2} :string]))))
+  (testing ":tuple -> prefixItems + items false"
+    (is (= {"type" "array"
+            "prefixItems" [{"type" "string"} {"type" "integer"}]
+            "items" false}
+           (bjs/transform [:tuple :string :int]))))
+  (testing "empty :tuple"
+    (is (= {"type" "array" "prefixItems" [] "items" false}
+           (bjs/transform [:tuple])))))
+
+(deftest map-of-schema
+  (is (= {"type" "object" "additionalProperties" {"type" "integer"}}
+         (bjs/transform [:map-of :keyword :int])))
+  (testing "min/max -> minProperties/maxProperties"
+    (is (= {"type" "object" "additionalProperties" {"type" "string"}
+            "minProperties" 1 "maxProperties" 4}
+           (bjs/transform [:map-of {:min 1 :max 4} :keyword :string])))))
+
+;; ---------------------------------------------------------------------------
+;; :re
+
+(deftest re-schema
+  (testing "string pattern child"
+    (is (= {"type" "string" "pattern" "^a+$"}
+           (bjs/transform [:re "^a+$"]))))
+  (testing "compiled pattern child -> its source"
+    (is (= {"type" "string" "pattern" "\\d+"}
+           (bjs/transform [:re #"\d+"])))))
+
+;; ---------------------------------------------------------------------------
+;; :map -- properties, required, closed
+
+(deftest map-schema
+  (testing "checkpoint shape: optional key excluded from required"
+    (is (= {"type" "object"
+            "properties" {"id" {"type" "string"}
+                          "age" {"type" "integer" "minimum" 0}}
+            "required" ["id"]}
+           (bjs/transform [:map [:id :string] [:age {:optional true} [:int {:min 0}]]]))))
+  (testing "all keys optional -> required omitted"
+    (is (= {"type" "object" "properties" {"x" {"type" "integer"}}}
+           (bjs/transform [:map [:x {:optional true} :int]]))))
+  (testing "closed -> additionalProperties false"
+    (is (= {"type" "object"
+            "properties" {"x" {"type" "integer"}}
+            "required" ["x"]
+            "additionalProperties" false}
+           (bjs/transform [:map {:closed true} [:x :int]]))))
+  (testing "empty bare :map"
+    (is (= {"type" "object" "properties" {}} (bjs/transform :map))))
+  (testing "qualified keyword keys render as ns/name"
+    (is (= {"type" "object"
+            "properties" {"user/id" {"type" "integer"}}
+            "required" ["user/id"]}
+           (bjs/transform [:map [:user/id :int]])))))
+
+;; ---------------------------------------------------------------------------
+;; title/description/default passthrough
+
+(deftest doc-properties-passthrough
+  (is (= {"type" "integer" "title" "Age" "description" "years" "default" 7}
+         (bjs/transform [:int {:title "Age" :description "years" :default 7}])))
+  (testing "keyword default renders as name string"
+    (is (= {"type" "string" "default" "north"}
+           (bjs/transform [:keyword {:default :north}]))))
+  (testing "collection default renders keywords recursively"
+    (is (= {"type" "array" "items" {"type" "string"} "default" ["a" "b"]}
+           (bjs/transform [:vector {:default [:a :b]} :keyword])))))
+
+;; ---------------------------------------------------------------------------
+;; :json-schema/* unlift + whole-node override
+
+(deftest unlift-override
+  (testing "unlifted prop adds a key"
+    (is (= {"type" "string" "format" "email"}
+           (bjs/transform [:string {:json-schema/format "email"}]))))
+  (testing "unlifted prop WINS over the generated key"
+    (is (= {"type" "custom-int"}
+           (bjs/transform [:int {:json-schema/type "custom-int"}]))))
+  (testing "unlift wins over passthrough default too"
+    (is (= {"type" "integer" "default" 99}
+           (bjs/transform [:int {:default 1 :json-schema/default 99}])))))
+
+(deftest whole-node-override
+  (testing ":json-schema prop returned verbatim, everything else ignored"
+    (is (= {"type" "totally-custom"}
+           (bjs/transform [:string {:min 1
+                                    :title "ignored"
+                                    :json-schema/format "ignored"
+                                    :json-schema {"type" "totally-custom"}}]))))
+  (testing "override applies per-node inside a map"
+    (is (= {"type" "object"
+            "properties" {"x" {"enum" [1 2]}}
+            "required" ["x"]}
+           (bjs/transform [:map [:x [:int {:json-schema {"enum" [1 2]}}]]])))))
+
+;; ---------------------------------------------------------------------------
+;; Refs + definitions
+
+(def tree-registry
+  (reg/registry {:tree/node [:map
+                             [:value :int]
+                             [:children [:vector [:ref :tree/node]]]]}))
+
+(deftest ref-emission
+  (let [out (bjs/transform [:ref :tree/node] {:registry tree-registry})]
+    (testing "exact namespaced $ref string with / escaped as ~1"
+      (is (= "#/definitions/tree~1node" (get out "$ref"))))
+    (testing "definitions key is the UNESCAPED name"
+      (is (contains? (get out "definitions") "tree/node")))
+    (testing "recursive tree ref terminates; inner ref points at the same definition"
+      (is (= {"type" "object"
+              "properties" {"value" {"type" "integer"}
+                            "children" {"type" "array"
+                                        "items" {"$ref" "#/definitions/tree~1node"}}}
+              "required" ["value" "children"]}
+             (get-in out ["definitions" "tree/node"]))))))
+
+(deftest ref-tilde-escaping
+  (let [k (keyword "a~b" "c")
+        r (reg/registry {k :int})
+        out (bjs/transform [:ref k] {:registry r})]
+    (testing "~ escapes to ~0 BEFORE / escapes to ~1"
+      (is (= "#/definitions/a~0b~1c" (get out "$ref"))))
+    (testing "definitions key stays unescaped"
+      (is (= {"type" "integer"} (get-in out ["definitions" "a~b/c"]))))))
+
+(deftest ref-inside-map
+  (testing "definitions attach at the top level, not at the ref site"
+    (let [out (bjs/transform [:map [:root [:ref :tree/node]]]
+                             {:registry tree-registry})]
+      (is (= {"$ref" "#/definitions/tree~1node"}
+             (get-in out ["properties" "root"])))
+      (is (contains? (get out "definitions") "tree/node"))
+      (is (nil? (get-in out ["properties" "root" "definitions"]))))))
+
+(deftest no-definitions-when-no-refs
+  (is (nil? (get (bjs/transform [:map [:x :int]]) "definitions"))))
+
+(deftest bare-registered-keyword-is-a-ref
+  (let [r (reg/registry {::user [:map [:name :string]]})
+        out (bjs/transform [:vector ::user] {:registry r})]
+    (is (= {"$ref" (str "#/definitions/" "tests.test-json-schema~1user")}
+           (get out "items")))
+    (is (contains? (get out "definitions") "tests.test-json-schema/user"))))
+
+(deftest unresolved-ref-throws
+  (is (= :balli.core/unresolved-ref
+         (try
+           (bjs/transform [:ref :no/such])
+           (catch python/Exception e (:type (ex-data e)))))))
+
+(deftest schema-object-input
+  (testing "schema object uses its baked-in registry"
+    (let [so (b/schema [:ref :tree/node] {:registry tree-registry})
+          out (bjs/transform so)]
+      (is (= "#/definitions/tree~1node" (get out "$ref")))
+      (is (contains? (get out "definitions") "tree/node")))))
+
+;; ---------------------------------------------------------------------------
+;; Composition: u/merge output exports correctly
+
+(deftest merge-composition
+  (let [merged (u/merge [:map [:x :int]]
+                        [:map {:closed true}
+                         [:x :string]
+                         [:y {:optional true} :int]])]
+    (is (= {"type" "object"
+            "properties" {"x" {"type" "string"}
+                          "y" {"type" "integer"}}
+            "required" ["x"]
+            "additionalProperties" false}
+           (bjs/transform merged)))))
+
+;; ---------------------------------------------------------------------------
+;; python json.dumps interop round-trip
+;;
+;; Empirical finding (probed on Basilisp 0.5.0): python json.dumps does NOT
+;; accept Basilisp PersistentMap/PersistentVector directly (TypeError: not
+;; JSON serializable). Two working paths:
+;;   1. basilisp.json/write-str takes the transform output as-is.
+;;   2. Raw json.dumps needs a clj->py conversion (below) -- python/dict DOES
+;;      accept a Basilisp map (Mapping protocol), so the converter only has
+;;      to recurse and switch vectors to python lists.
+
+(defn- clj->py
+  [x]
+  (cond
+    (map? x) (python/dict (into {} (map (fn [[k v]] [(clj->py k) (clj->py v)]) x)))
+    (vector? x) (python/list (map clj->py x))
+    :else x))
+
+(deftest json-dumps-roundtrip
+  (let [out (bjs/transform [:tuple :string :int])
+        s (json/dumps (clj->py out))]
+    (testing "checkpoint: json.dumps via interop produces a JSON string"
+      (is (string? s)))
+    (testing "loads(dumps(x)) round-trips back to the transform output"
+      (is (= out (bj/read-str s))))))
+
+(deftest json-dumps-nested-with-refs
+  (let [out (bjs/transform [:map
+                            [:root [:ref :tree/node]]
+                            [:tags {:optional true} [:set :keyword]]]
+                           {:registry tree-registry})
+        s (json/dumps (clj->py out))]
+    (is (string? s))
+    (is (= out (bj/read-str s)))))
+
+(deftest basilisp-json-write-str-direct
+  (testing "basilisp.json/write-str accepts the output without conversion"
+    (let [out (bjs/transform [:map [:x [:maybe :int]]])]
+      (is (= out (bj/read-str (bj/write-str out)))))))

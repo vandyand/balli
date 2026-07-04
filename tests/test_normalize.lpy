@@ -232,7 +232,13 @@
 (deftest registry-basics
   (is (contains? reg/builtin-types :map))
   (is (contains? reg/builtin-types :=))
-  (is (= 27 (count reg/builtin-types)))
+  ;; 28 MVP types + Phase 6: :cat :catn :alt :altn :? :* :+ :repeat :schema
+  ;; + Phase 8: :=> :function
+  (is (= 39 (count reg/builtin-types)))
+  (is (contains? reg/builtin-types :cat))
+  (is (contains? reg/builtin-types :schema))
+  (is (contains? reg/builtin-types :=>))
+  (is (contains? reg/builtin-types :function))
   (is (= {} (:schemas (reg/default-registry))))
   (is (= reg/builtin-types (:types (reg/default-registry))))
   (let [r (reg/registry {:user/id :string} {:user/age :int})]
@@ -278,3 +284,17 @@
     (testing "numeric bounds still accepted"
       (is (= {:min 1 :max 5} (:properties (normalize [:int {:min 1 :max 5}] {}))))
       (is (= {:min 0.5} (:properties (normalize [:float {:min 0.5}] {})))))))
+
+(deftest dispatch-and-fn-pred-boundary-tightened
+  (testing "collection dispatch values are rejected"
+    (doseq [d [[] {} #{} (quote sym)]]
+      (is (= :balli.core/invalid-schema
+             (try (normalize [:multi {:dispatch d} [:x :int]] {})
+                  (catch python/Exception e (:type (ex-data e))))))))
+  (testing ":fn accepts idiomatic predicates, rejects vectors/symbols"
+    (is (map? (normalize [:fn #{:a}] {})))
+    (is (map? (normalize [:fn :kw] {})))
+    (is (map? (normalize [:fn {:a 1}] {})))
+    (is (= :balli.core/invalid-schema
+           (try (normalize [:fn [1 2]] {})
+                (catch python/Exception e (:type (ex-data e))))))))

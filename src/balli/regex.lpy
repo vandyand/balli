@@ -1,0 +1,559 @@
+(ns balli.regex
+  "Backtracking regex-of-sequences engine (Malli's malli.impl.regex, ported
+  to an iterative thunk-stack driver -- Python has no TCO and a low recursion
+  limit, so parked continuations trampoline through an explicit stack instead
+  of recursing per input element).
+
+  A combinator is a fn [driver regs pos k]:
+    driver -- per-run mutable state (see make-driver below)
+    regs   -- persistent vector of :repeat iteration counters (only :repeat
+              pushes/reads; snapshotted into the memo key)
+    pos    -- integer position into the input vector
+    k      -- success continuation. Validator/explainer k receives pos;
+              parser k receives (v pos) where v is the parsed value.
+  Returning without calling k means the thread died; parked alternatives on
+  the driver stack keep the search alive.
+
+  Driver state is Python-native mutables per the Phase 0 hot-loop rule:
+    :stack   python list of 0-arg thunks (parked threads, LIFO)
+    :cache   python set of (matcher-id, pos, regs) tuples -- every combinator
+             instance that can be parked gets an integer id at CONSTRUCTION
+             time; park! drops a thunk whose (id, pos, regs) was already
+             tried (same instance = same continuation, so a repeat visit can
+             only rediscover a failure). This is what keeps pathological
+             nullable nestings like [:* [:* :int]] polynomial.
+    :success python list cell [flag result]
+    :coll    the input, converted to a Basilisp vector ONCE (O(1) nth)
+    :n       (count coll)
+  Explainer drivers additionally carry :path/:in (the runtime base paths) and
+  :fail, a python list cell [max-pos errors]: fail! REPLACES the errors when
+  pos > max-pos, APPENDS when pos = max-pos, ignores earlier failures --
+  explain reports the furthest position reached.
+
+  Sequencing combinators (cat*/alt*/opt*/star*/plus*/repeat*) are shared
+  between validator and explainer modes (identical k shape); parsers have
+  their own variants threading an accumulator. Unparsers are plain fns (no
+  engine): parse-shape -> flat element vector | :balli.core/invalid; every
+  unparser returns a SEQUENCE so parents can concat-splice.
+
+  This namespace is substrate-only: it knows nothing about schemas or ASTs.
+  balli.compile builds combinator trees out of compiled child fns and passes
+  Tag/Tags constructors/predicates in as arguments (catn-parser/altn-parser/
+  catn-unparser/altn-unparser), mirroring malli's cyclic-require avoidance."
+  (:refer-basilisp :exclude [run!]))
+
+(def ^:private -invalid :balli.core/invalid)
+
+(defn- -invalid?
+  ;; = not identical?: keyword identity is unreliable across cached-bytecode
+  ;; module loads (same rationale as balli.compile).
+  [x]
+  (= -invalid x))
+
+;; ---------------------------------------------------------------------------
+;; Matcher ids
+;;
+;; The memo cache dedupes (matcher-id, pos, regs) triples, so every
+;; combinator instance that gets parked needs a stable integer identity.
+;; Uniqueness is only required WITHIN one compiled combinator tree (the cache
+;; is per driver run), but a global monotonic counter is the simplest thing
+;; that guarantees it.
+
+(def ^:private id-counter (atom 0))
+
+(defn- next-id
+  []
+  (swap! id-counter inc))
+
+;; ---------------------------------------------------------------------------
+;; Driver
+
+(defn- make-driver
+  "Fresh driver for input vector `coll` (already converted via vec)."
+  [coll]
+  {:stack (python/list)
+   :cache (python/set)
+   :success (python/list [false nil])
+   :coll coll
+   :n (count coll)})
+
+(defn- succeed!
+  [driver]
+  (aset (:success driver) 0 true))
+
+(defn- succeed-with!
+  [driver v]
+  (let [cell (:success driver)]
+    (aset cell 0 true)
+    (aset cell 1 v)))
+
+(defn- park!
+  "Park `thunk` (a 0-arg fn resuming a matcher) unless matcher `id` was
+  already tried at (pos, regs) in this run."
+  [driver id regs pos thunk]
+  (let [cache (:cache driver)
+        key (python/tuple [id pos regs])]
+    (when-not (contains? cache key)
+      (.add cache key)
+      (.append (:stack driver) thunk))))
+
+(defn- park-noncaching!
+  "Park `thunk` unconditionally. Used for :repeat's compulsory-iteration
+  steps, which are trampolining (TCO substitute), not backtracking
+  alternatives -- they must always run."
+  [driver thunk]
+  (.append (:stack driver) thunk))
+
+(defn- run!
+  "Main loop: the initial thread has already run; pop+run parked thunks until
+  success or exhaustion. Iterative -- recursion depth stays proportional to
+  schema nesting, never input length."
+  [driver]
+  (let [stack (:stack driver)
+        success (:success driver)]
+    (loop []
+      (cond
+        (aget success 0) true
+        (zero? (python/len stack)) false
+        :else (do ((.pop stack)) (recur))))))
+
+(defn- fail!
+  "Record explainer `errors` at `pos` into the driver's furthest-position
+  cell: later positions replace, equal positions append, earlier are
+  ignored."
+  [driver pos errors]
+  (let [cell (:fail driver)
+        max-pos (aget cell 0)]
+    (cond
+      (> pos max-pos) (do (aset cell 0 pos)
+                          (aset cell 1 (vec errors)))
+      (= pos max-pos) (aset cell 1 (into (aget cell 1) errors)))))
+
+(defn- rx-error
+  [path in form value type]
+  {:path path :in in :schema form :value value :type type})
+
+;; ---------------------------------------------------------------------------
+;; Items (the only mode-specific leaves)
+
+(defn item-validator
+  "Consume one element iff `valid?` accepts it."
+  [valid?]
+  (fn [driver _regs pos k]
+    (when (and (< pos (:n driver))
+               (valid? (nth (:coll driver) pos)))
+      (k (inc pos)))))
+
+(defn item-explainer
+  "Consume one element via compiled child explainer `ef` (fn [x path in] ->
+  error vector). `rel-path` is this child's schema path relative to the
+  seqex root (absolute paths only exist at runtime); `form` is the child's
+  original form for :balli.core/end-of-input errors."
+  [ef rel-path form]
+  (fn [driver _regs pos k]
+    (let [path (into (:path driver) rel-path)
+          in (conj (:in driver) pos)]
+      (if (< pos (:n driver))
+        (let [errors (ef (nth (:coll driver) pos) path in)]
+          (if (seq errors)
+            (fail! driver pos errors)
+            (k (inc pos))))
+        (fail! driver pos [(rx-error path in form nil :balli.core/end-of-input)])))))
+
+(defn item-parser
+  "Consume one element via child parser `pf` (value -> parsed |
+  :balli.core/invalid); k receives the parsed value."
+  [pf]
+  (fn [driver _regs pos k]
+    (when (< pos (:n driver))
+      (let [v (pf (nth (:coll driver) pos))]
+        (when-not (-invalid? v)
+          (k v (inc pos)))))))
+
+;; ---------------------------------------------------------------------------
+;; Validator/explainer combinators (shared: k receives pos)
+
+(defn- epsilon
+  [_driver _regs pos k]
+  (k pos))
+
+(defn cat*
+  "Catenation: children run left to right, each feeding the next its
+  position. Empty -> epsilon."
+  [rs]
+  (if (empty? rs)
+    epsilon
+    (reduce (fn [acc r]
+              (fn [driver regs pos k]
+                (acc driver regs pos (fn [pos*] (r driver regs pos* k)))))
+            rs)))
+
+(defn alt*
+  "Ordered choice with backtracking: both alternatives are parked, the
+  preferred one LAST so it pops (LIFO) first."
+  [rs]
+  (reduce (fn [r r*]
+            (let [id-r (next-id)
+                  id-r* (next-id)]
+              (fn [driver regs pos k]
+                (park! driver id-r* regs pos (fn [] (r* driver regs pos k)))
+                (park! driver id-r regs pos (fn [] (r driver regs pos k))))))
+          rs))
+
+(defn opt*
+  "? -- greedy option: child preferred over epsilon."
+  [r]
+  (alt* [r epsilon]))
+
+(defn star*
+  "* -- greedy Kleene star: epsilon fallback parked first, then the child
+  runs; each successful child iteration parks the loop continuation (memoized
+  on (id, pos, regs), which is what terminates nullable children)."
+  [r]
+  (let [self-id (next-id)
+        eps-id (next-id)]
+    (fn *p [driver regs pos k]
+      (park! driver eps-id regs pos (fn [] (k pos)))
+      (r driver regs pos
+         (fn [pos*]
+           (park! driver self-id regs pos*
+                  (fn [] (*p driver regs pos* k))))))))
+
+(defn plus*
+  "+ = cat(child, *(child))."
+  [r]
+  (cat* [r (star* r)]))
+
+(defn repeat*
+  "{min,max} counted repetition. Pushes a fresh counter onto regs on entry
+  (regs snapshots into the memo key, so different iteration counts never
+  alias). Compulsory iterations (< count min) park noncaching trampolining
+  steps; optional iterations park an epsilon fallback plus the increment
+  step. The (<= count pos) guard bails out of optional looping when the
+  child consumes nothing (nullable-child infinite-loop prevention, per
+  semantics section F). `mx` may be infinite (python float inf)."
+  [mn mx r]
+  (let [opt-id (next-id)
+        eps-id (next-id)]
+    (letfn [(compulsories [driver regs pos k]
+              (if (< (peek regs) mn)
+                (r driver regs pos
+                   (fn [pos*]
+                     (park-noncaching!
+                      driver
+                      (fn []
+                        (compulsories driver (conj (pop regs) (inc (peek regs)))
+                                      pos* k)))))
+                (optionals driver regs pos k)))
+            (optionals [driver regs pos k]
+              (if (and (< (peek regs) mx)
+                       (<= (peek regs) pos)
+                       (< pos (:n driver)))
+                (do
+                  (park! driver eps-id regs pos (fn [] (k pos)))
+                  (r driver regs pos
+                     (fn [pos*]
+                       (park! driver opt-id regs pos*
+                              (fn []
+                                (optionals driver (conj (pop regs) (inc (peek regs)))
+                                           pos* k))))))
+                (k pos)))]
+      (fn [driver regs pos k]
+        (compulsories driver (conj regs 0) pos k)))))
+
+;; ---------------------------------------------------------------------------
+;; Parser combinators (k receives (v pos))
+
+(defn pure-parser
+  "Match nothing, produce `v`."
+  [v]
+  (fn [_driver _regs pos k]
+    (k v pos)))
+
+(defn fmap-parser
+  "Map `f` over `p`'s parse result."
+  [f p]
+  (fn [driver regs pos k]
+    (p driver regs pos (fn [v pos*] (k (f v) pos*)))))
+
+(defn cat-parser
+  "Catenation producing a vector of child parse results."
+  [ps]
+  (let [sp (reduce (fn [acc p]
+                     (fn [driver regs acc* pos k]
+                       (p driver regs pos
+                          (fn [v pos*] (acc driver regs (conj acc* v) pos* k)))))
+                   (fn [_driver _regs acc* pos k] (k acc* pos))
+                   (reverse ps))]
+    (fn [driver regs pos k]
+      (sp driver regs [] pos k))))
+
+(defn catn-parser
+  "Catenation producing (->tags {tag parsed}). `entries` is [[tag parser]
+  ...]; `->tags` is balli's Tags constructor, passed in to avoid a cyclic
+  require."
+  [->tags entries]
+  (let [sp (reduce (fn [acc [tag p]]
+                     (fn [driver regs m pos k]
+                       (p driver regs pos
+                          (fn [v pos*] (acc driver regs (assoc m tag v) pos* k)))))
+                   (fn [_driver _regs m pos k] (k (->tags m) pos))
+                   (reverse entries))]
+    (fn [driver regs pos k]
+      (sp driver regs {} pos k))))
+
+(defn alt-parser
+  "Ordered choice; the matched branch's parse result passes through
+  untagged."
+  [ps]
+  (reduce (fn [p p*]
+            (let [id-p (next-id)
+                  id-p* (next-id)]
+              (fn [driver regs pos k]
+                (park! driver id-p* regs pos (fn [] (p* driver regs pos k)))
+                (park! driver id-p regs pos (fn [] (p driver regs pos k))))))
+          ps))
+
+(defn altn-parser
+  "Ordered choice producing (->tag branch-tag parsed). `entries` is
+  [[tag parser] ...]."
+  [->tag entries]
+  (alt-parser (mapv (fn [[tag p]]
+                      (fmap-parser (fn [v] (->tag tag v)) p))
+                    entries)))
+
+(defn opt-parser
+  "? -- child's parse result, or nil when the child does not match."
+  [p]
+  (alt-parser [p (pure-parser nil)]))
+
+(defn star-parser
+  "* -- vector of child parse results (greedy)."
+  [p]
+  (let [self-id (next-id)
+        eps-id (next-id)]
+    (letfn [(*p [driver regs acc pos k]
+              (park! driver eps-id regs pos (fn [] (k acc pos)))
+              (p driver regs pos
+                 (fn [v pos*]
+                   (park! driver self-id regs pos*
+                          (fn [] (*p driver regs (conj acc v) pos* k))))))]
+      (fn [driver regs pos k]
+        (*p driver regs [] pos k)))))
+
+(defn plus-parser
+  "+ -- non-empty vector of child parse results."
+  [p]
+  (fmap-parser (fn [[v vs]] (into [v] vs))
+               (cat-parser [p (star-parser p)])))
+
+(defn repeat-parser
+  "{min,max} repetition producing a vector of child parse results. Same
+  structure (and nullable-child guard) as repeat*."
+  [mn mx p]
+  (let [opt-id (next-id)
+        eps-id (next-id)]
+    (letfn [(compulsories [driver regs acc pos k]
+              (if (< (peek regs) mn)
+                (p driver regs pos
+                   (fn [v pos*]
+                     (park-noncaching!
+                      driver
+                      (fn []
+                        (compulsories driver (conj (pop regs) (inc (peek regs)))
+                                      (conj acc v) pos* k)))))
+                (optionals driver regs acc pos k)))
+            (optionals [driver regs acc pos k]
+              (if (and (< (peek regs) mx)
+                       (<= (peek regs) pos)
+                       (< pos (:n driver)))
+                (do
+                  (park! driver eps-id regs pos (fn [] (k acc pos)))
+                  (p driver regs pos
+                     (fn [v pos*]
+                       (park! driver opt-id regs pos*
+                              (fn []
+                                (optionals driver (conj (pop regs) (inc (peek regs)))
+                                           (conj acc v) pos* k))))))
+                (k acc pos)))]
+      (fn [driver regs pos k]
+        (compulsories driver (conj regs 0) [] pos k)))))
+
+;; ---------------------------------------------------------------------------
+;; Top-level wrappers
+
+(defn validator
+  "Wrap combinator `p` into a 1-arg boolean validator over whole sequential
+  inputs (non-sequential -> false; trailing elements -> false)."
+  [p]
+  (let [end (fn [driver _regs pos k]
+              (when (= pos (:n driver))
+                (k pos)))
+        p (cat* [p end])]
+    (fn [x]
+      (boolean
+       (and (sequential? x)
+            (let [driver (make-driver (vec x))]
+              (p driver [] 0 (fn [_pos] (succeed! driver)))
+              (run! driver)))))))
+
+(defn explainer
+  "Wrap explainer combinator `p` into a compile-layer explainer fn
+  [x path in] -> error vector (empty when valid). `form` is the seqex root's
+  original form. Non-sequential input -> a single :balli.core/invalid-type
+  error; failed runs report the errors recorded at the furthest position
+  reached (trailing input fails as :balli.core/input-remaining via the end
+  matcher)."
+  [p form]
+  (let [end (fn [driver _regs pos k]
+              (if (= pos (:n driver))
+                (k pos)
+                (fail! driver pos
+                       [(rx-error (:path driver) (conj (:in driver) pos) form
+                                  (nth (:coll driver) pos)
+                                  :balli.core/input-remaining)])))
+        p (cat* [p end])]
+    (fn [x path in]
+      (if (sequential? x)
+        (let [driver (assoc (make-driver (vec x))
+                            :path path :in in
+                            :fail (python/list [-1 []]))]
+          (p driver [] 0 (fn [_pos] (succeed! driver)))
+          (if (run! driver)
+            []
+            (vec (aget (:fail driver) 1))))
+        [(rx-error path in form x :balli.core/invalid-type)]))))
+
+(defn parser
+  "Wrap parser combinator `p` into a 1-arg parser: sequential input ->
+  parse shape | :balli.core/invalid (also on non-sequential input or
+  unconsumed trailing elements)."
+  [p]
+  (let [end (fn [driver _regs pos k]
+              (when (= pos (:n driver))
+                (k nil pos)))
+        sp (cat-parser [p end])]
+    (fn [x]
+      (if (sequential? x)
+        (let [driver (make-driver (vec x))]
+          (sp driver [] 0 (fn [v _pos] (succeed-with! driver (nth v 0))))
+          (if (run! driver)
+            (aget (:success driver) 1)
+            -invalid))
+        -invalid))))
+
+;; ---------------------------------------------------------------------------
+;; Unparsers (plain fns, no engine)
+;;
+;; parse shape -> vector of original elements | :balli.core/invalid. Every
+;; unparser returns a SEQUENCE, so seqex parents concat-splice child results
+;; and the root unparser's value IS the unparsed sequence.
+
+(defn item-unparser
+  "Unparse one element via child unparser `uf`; wraps the result in a
+  1-element vector for splicing."
+  [uf]
+  (fn [v]
+    (let [r (uf v)]
+      (if (-invalid? r) -invalid [r]))))
+
+(defn- unparse-all
+  "Unparse every element of vector `v` via `up`, concatenating the spliced
+  results; invalid as soon as any element is."
+  [up v]
+  (reduce (fn [acc x]
+            (let [r (up x)]
+              (if (-invalid? r)
+                (reduced -invalid)
+                (into acc r))))
+          [] v))
+
+(defn cat-unparser
+  "Parse shape: vector of exactly (count ups) child results."
+  [ups]
+  (let [n (count ups)]
+    (fn [x]
+      (if (and (vector? x) (= n (count x)))
+        (reduce (fn [acc i]
+                  (let [r ((nth ups i) (nth x i))]
+                    (if (-invalid? r)
+                      (reduced -invalid)
+                      (into acc r))))
+                [] (range n))
+        -invalid))))
+
+(defn catn-unparser
+  "Parse shape: Tags whose :values has exactly the declared tags. `entries`
+  is [[tag unparser] ...] in declared order (Tags value maps are unordered);
+  `tags?` is balli's Tags predicate, passed in to avoid a cyclic require."
+  [tags? entries]
+  (let [n (count entries)]
+    (fn [x]
+      (let [values (when (tags? x) (:values x))]
+        (if (and (map? values) (= n (count values)))
+          (reduce (fn [acc [tag up]]
+                    (if (contains? values tag)
+                      (let [r (up (get values tag))]
+                        (if (-invalid? r)
+                          (reduced -invalid)
+                          (into acc r)))
+                      (reduced -invalid)))
+                  [] entries)
+          -invalid)))))
+
+(defn alt-unparser
+  "First branch whose unparse is valid."
+  [ups]
+  (fn [x]
+    (reduce (fn [acc up]
+              (let [r (up x)]
+                (if (-invalid? r) acc (reduced r))))
+            -invalid ups)))
+
+(defn altn-unparser
+  "Parse shape: Tag with a declared :key; unparses :value via that branch.
+  `tag?` is balli's Tag predicate."
+  [tag? entries]
+  (let [table (into {} entries)]
+    (fn [x]
+      (if (tag? x)
+        (if-some [up (get table (:key x))]
+          (up (:value x))
+          -invalid)
+        -invalid))))
+
+(defn opt-unparser
+  "Parse shape: child value or nil. Child-first (so a child that itself
+  accepts nil round-trips); a nil the child rejects unparses to []."
+  [up]
+  (fn [x]
+    (let [r (up x)]
+      (cond
+        (not (-invalid? r)) r
+        (nil? x) []
+        :else -invalid))))
+
+(defn star-unparser
+  "Parse shape: vector (any repetition count)."
+  [up]
+  (fn [x]
+    (if (vector? x)
+      (unparse-all up x)
+      -invalid)))
+
+(defn plus-unparser
+  "Parse shape: vector of >= 1 repetitions."
+  [up]
+  (fn [x]
+    (if (and (vector? x) (<= 1 (count x)))
+      (unparse-all up x)
+      -invalid)))
+
+(defn repeat-unparser
+  "Parse shape: vector of min..max repetitions (repetition count, not
+  element count -- child splices may be multi-element)."
+  [mn mx up]
+  (fn [x]
+    (if (and (vector? x) (<= mn (count x) mx))
+      (unparse-all up x)
+      -invalid)))

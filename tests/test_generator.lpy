@@ -1,0 +1,280 @@
+(ns tests.test-generator
+  "Phase 7: generators per malli-semantics section H. Generated values
+  validate across seeds for a broad schema list, seeded determinism
+  (generate + sample), bound respect (:min/:max and :gen/min/:gen/max),
+  recursive ref termination + the exact cap-5 escape contract, :gen/* hooks
+  and their priority, no-generator/unsatisfiable throws, flat seqex
+  generation (splicing, [:schema ...] item semantics, seqex-in-map
+  composition), and sample count/threading semantics."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.generator :as bg]
+            [balli.registry :as reg]))
+
+(defn- ex-type
+  [thunk]
+  (try
+    (thunk)
+    nil
+    (catch python/Exception e
+      (:type (ex-data e)))))
+
+(def tree-registry
+  (reg/registry {:tree/node [:maybe [:map [:children [:vector [:ref :tree/node]]]]]}))
+
+;; ---------------------------------------------------------------------------
+;; Broad generate->validate sweep
+
+(def broad-schemas
+  [:int :string :boolean :keyword :symbol :uuid :nil :any :float :double :number
+   [:int {:min 1 :max 5}]
+   [:string {:min 2 :max 4}]
+   [:float {:min 0.0 :max 1.0}]
+   [:enum :a :b :c]
+   [:= 42]
+   [:maybe :int]
+   [:or :int :string]
+   [:orn [:i :int] [:s :string]]
+   [:and :int]
+   [:and :int [:fn even?]]
+   [:not :int]
+   [:map [:x :int] [:y {:optional true} :string]]
+   [:map {:closed true} [:a :boolean]]
+   [:map-of :keyword :int]
+   [:vector :int]
+   [:vector {:min 2 :max 5} :string]
+   [:sequential :keyword]
+   [:set :int]
+   [:tuple :int :string :keyword]
+   [:multi {:dispatch :type}
+    [:a [:map [:type [:= :a]] [:n :int]]]
+    [:b [:map [:type [:= :b]] [:s :string]]]]
+   [:cat :int [:* :string]]
+   [:catn [:n :int] [:s :string]]
+   [:alt :int :string]
+   [:altn [:i :int] [:s :string]]
+   [:? :int]
+   [:* :int]
+   [:+ :int]
+   [:repeat {:min 2 :max 4} :int]
+   [:schema :int]
+   [:map [:cmd [:cat :keyword [:* :int]]]]])
+
+(deftest generated-values-validate
+  (doseq [s broad-schemas
+          seed (range 5)]
+    (is (true? (b/validate s (bg/generate s {:seed seed})))
+        (str "schema " s " seed " seed))))
+
+;; ---------------------------------------------------------------------------
+;; Determinism
+
+(def composite-schema
+  [:map
+   [:id :uuid]
+   [:tags [:set :keyword]]
+   [:counts [:map-of :string :int]]
+   [:kind [:orn [:i :int] [:s :string]]]
+   [:coords [:tuple :double :double]]
+   [:cmd [:cat :keyword [:* :int]]]
+   [:opt {:optional true} [:maybe :boolean]]])
+
+(deftest deterministic-under-seed
+  (testing "two same-seed generates are equal (:map/:uuid/:map-of composite)"
+    (doseq [seed [0 1 42]]
+      (is (= (bg/generate composite-schema {:seed seed})
+             (bg/generate composite-schema {:seed seed})))))
+  (testing "the composite validates across seeds"
+    (doseq [seed (range 5)]
+      (is (true? (b/validate composite-schema
+                             (bg/generate composite-schema {:seed seed}))))))
+  (testing ":size participates but stays deterministic"
+    (is (= (bg/generate [:vector :int] {:seed 3 :size 5})
+           (bg/generate [:vector :int] {:seed 3 :size 5})))))
+
+;; ---------------------------------------------------------------------------
+;; Bounds
+
+(deftest bounds-respected
+  (testing ":int :min/:max"
+    (doseq [seed (range 20)]
+      (let [v (bg/generate [:int {:min 1 :max 5}] {:seed seed})]
+        (is (and (int? v) (<= 1 v 5))))))
+  (testing ":float :min/:max"
+    (doseq [seed (range 10)]
+      (let [v (bg/generate [:double {:min 0.0 :max 1.0}] {:seed seed})]
+        (is (and (float? v) (<= 0.0 v 1.0))))))
+  (testing ":string length bounds"
+    (doseq [seed (range 10)]
+      (is (<= 2 (count (bg/generate [:string {:min 2 :max 4}] {:seed seed})) 4))))
+  (testing "collection count bounds"
+    (doseq [seed (range 10)]
+      (is (<= 2 (count (bg/generate [:vector {:min 2 :max 3} :int] {:seed seed})) 3))))
+  (testing "one-sided :min above the default max still generates"
+    (doseq [seed (range 5)]
+      (is (<= 5000 (bg/generate [:int {:min 5000}] {:seed seed})))))
+  (testing ":gen/min/:gen/max override :min/:max"
+    (doseq [seed (range 20)]
+      (is (<= 10 (bg/generate [:int {:min 0 :max 100 :gen/min 10 :gen/max 12}]
+                              {:seed seed})
+              12)))
+    (doseq [seed (range 10)]
+      (is (<= 1 (count (bg/generate [:vector {:gen/min 1 :gen/max 2} :int]
+                                    {:seed seed}))
+              2)))))
+
+;; ---------------------------------------------------------------------------
+;; Recursive refs + cap behavior
+
+(deftest recursive-ref-generation
+  (testing "recursive tree registry terminates and validates"
+    (doseq [seed (range 10)]
+      (let [v (bg/generate [:ref :tree/node] {:seed seed :registry tree-registry})]
+        (is (true? (b/validate [:ref :tree/node] v {:registry tree-registry}))))))
+  (testing "recursion through an optional map key terminates by omission"
+    (let [r (reg/registry {:lnk/node [:map
+                                      [:v :int]
+                                      [:next {:optional true} [:ref :lnk/node]]]})]
+      (doseq [seed (range 5)]
+        (let [v (bg/generate [:ref :lnk/node] {:seed seed :registry r})]
+          (is (true? (b/validate [:ref :lnk/node] v {:registry r})))))))
+  (testing "required-key ref recursion with no escape throws unsatisfiable"
+    (let [r (reg/registry {:loop/node [:map [:next [:ref :loop/node]]]})]
+      (is (= :balli.core/unsatisfiable-schema
+             (ex-type #(bg/generate [:ref :loop/node] {:seed 0 :registry r}))))))
+  (testing "unresolved ref throws"
+    (is (= :balli.core/unresolved-ref
+           (ex-type #(bg/generate [:ref :no/such] {:seed 0}))))))
+
+;; ---------------------------------------------------------------------------
+;; :gen/* property hooks
+
+(deftest gen-hooks
+  (testing ":gen/return constant wins over everything below it"
+    (is (= 7 (bg/generate [:int {:gen/return 7}] {:seed 0})))
+    (is (= :ret (bg/generate [:int {:gen/return :ret
+                                    :gen/elements [1 2]
+                                    :gen/schema :string}]
+                             {:seed 0}))))
+  (testing ":gen/return nil is honored (presence-checked, not truthiness)"
+    (doseq [seed (range 5)]
+      (is (nil? (bg/generate [:int {:gen/return nil}] {:seed seed})))))
+  (testing ":gen/elements uniform pick"
+    (doseq [seed (range 10)]
+      (is (contains? #{1 2 3}
+                     (bg/generate [:int {:gen/elements [1 2 3]}] {:seed seed})))))
+  (testing ":gen/schema generates the alternate schema"
+    (doseq [seed (range 5)]
+      (is (string? (bg/generate [:int {:gen/schema :string}] {:seed seed})))))
+  (testing ":gen/fmap post-maps the result (real fn)"
+    (doseq [seed (range 5)]
+      (is (string? (bg/generate [:int {:gen/fmap str}] {:seed seed}))))
+    (is (= "7" (bg/generate [:int {:gen/return 7 :gen/fmap str}] {:seed 0}))))
+  (testing "hooks make :re and :fn generable"
+    (is (= "abc" (bg/generate [:re {:gen/return "abc"} "a.c"] {:seed 0})))
+    (doseq [seed (range 5)]
+      (let [v (bg/generate [:fn {:gen/elements [2 4 6]} even?] {:seed seed})]
+        (is (even? v))
+        (is (true? (b/validate [:fn even?] v)))))))
+
+;; ---------------------------------------------------------------------------
+;; Throws
+
+(deftest no-generator-throws
+  (is (= :balli.core/no-generator
+         (ex-type #(bg/generate [:re "a+"] {:seed 0}))))
+  (is (= :balli.core/no-generator
+         (ex-type #(bg/generate [:fn int?] {:seed 0})))))
+
+(deftest unsatisfiable-throws
+  (testing ":and whose extra child never validates exhausts 100 retries"
+    (is (= :balli.core/unsatisfiable-schema
+           (ex-type #(bg/generate [:and :int [:fn (fn [_] false)]] {:seed 0})))))
+  (testing "[:not :any] can never generate"
+    (is (= :balli.core/unsatisfiable-schema
+           (ex-type #(bg/generate [:not :any] {:seed 0})))))
+  (testing "distinct-key exhaustion: 3+ distinct boolean keys are impossible"
+    (is (= :balli.core/unsatisfiable-schema
+           (ex-type #(bg/generate [:map-of {:min 3} :boolean :int] {:seed 0}))))
+    (is (= :balli.core/unsatisfiable-schema
+           (ex-type #(bg/generate [:set {:min 3} :boolean] {:seed 0}))))))
+
+;; ---------------------------------------------------------------------------
+;; Sequence schemas
+
+(deftest seqex-generation
+  (testing "flat vectors satisfying the seqex"
+    (doseq [seed (range 5)]
+      (let [v (bg/generate [:cat :int [:* :string]] {:seed seed})]
+        (is (vector? v))
+        (is (true? (b/validate [:cat :int [:* :string]] v))))))
+  (testing "nested seqex chunks splice flat into the parent"
+    (doseq [seed (range 5)]
+      (let [s [:cat :keyword [:* [:cat :int :string]]]
+            v (bg/generate s {:seed seed})]
+        (is (not-any? vector? v))
+        (is (true? (b/validate s v))))))
+  (testing "composition: seqex inside a map entry generates and validates"
+    (doseq [seed (range 5)]
+      (let [s [:map [:cmd [:cat :keyword [:* :int]]]]
+            v (bg/generate s {:seed seed})]
+        (is (vector? (:cmd v)))
+        (is (keyword? (first (:cmd v))))
+        (is (true? (b/validate s v))))))
+  (testing "[:schema <seqex>] is one element whose value is the inner match"
+    (doseq [seed (range 5)]
+      (let [s [:cat [:schema [:cat :int :int]]]
+            v (bg/generate s {:seed seed})]
+        (is (= 1 (count v)))
+        (is (true? (b/validate s v))))))
+  (testing ":repeat rep bounds respected"
+    (doseq [seed (range 10)]
+      (is (<= 2 (count (bg/generate [:repeat {:min 2 :max 4} :int] {:seed seed})) 4))))
+  (testing ":+ generates at least one element"
+    (doseq [seed (range 10)]
+      (is (<= 1 (count (bg/generate [:+ :int] {:seed seed}))))))
+  (testing "ref directly in seqex child position throws (mirrors the compilers)"
+    (let [r (reg/registry {:x/int :int})]
+      (is (= :balli.core/potentially-recursive-seqex
+             (ex-type #(bg/generate [:cat [:ref :x/int]] {:seed 0 :registry r})))))))
+
+;; ---------------------------------------------------------------------------
+;; sample
+
+(deftest sample-behavior
+  (testing "default count is 10"
+    (is (= 10 (count (bg/sample :int)))))
+  (testing ":size sets the count"
+    (is (= 3 (count (bg/sample :int {:size 3})))))
+  (testing "every sample validates"
+    (doseq [v (bg/sample [:map [:x :int]] {:seed 1 :size 5})]
+      (is (true? (b/validate [:map [:x :int]] v)))))
+  (testing "deterministic as a whole under seed"
+    (is (= (bg/sample composite-schema {:seed 9 :size 5})
+           (bg/sample composite-schema {:seed 9 :size 5}))))
+  (testing "one Random threads through: first sample = single generate"
+    (is (= (first (bg/sample :int {:seed 4}))
+           (bg/generate :int {:seed 4}))))
+  (testing "the rng advances between samples"
+    (let [vs (bg/sample [:vector {:min 5} :int] {:seed 9 :size 5})]
+      (is (< 1 (count (set vs)))))))
+
+;; ---------------------------------------------------------------------------
+;; Distributions / documented pools
+
+(deftest maybe-distribution
+  (let [vs (bg/sample [:maybe :int] {:seed 0 :size 40})]
+    (is (some nil? vs))
+    (is (some int? vs))))
+
+(deftest any-generates-documented-pool
+  (doseq [v (bg/sample :any {:seed 2 :size 30})]
+    (is (or (nil? v) (int? v) (string? v) (boolean? v)))))
+
+(deftest float-bounds-coerced-for-integer-generation
+  (testing "float :min/:max on int/count-generating schemas don't crash"
+    (let [v (bg/generate [:int {:min 0.5 :max 5.5}] {:seed 1})]
+      (is (and (int? v) (<= 1 v 5))))
+    (is (b/validate [:repeat {:min 1.5 :max 2.5} :int]
+                    (bg/generate [:repeat {:min 1.5 :max 2.5} :int] {:seed 1})))
+    (is (string? (bg/generate [:string {:min 1.2 :max 3.9}] {:seed 1})))))

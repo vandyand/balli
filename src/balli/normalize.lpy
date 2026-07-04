@@ -4,7 +4,7 @@
   Every AST node is a plain map:
     {:type <kw> :properties <map> :children <vector> :form <original form fragment>}
 
-  :children is always a vector. :map and :multi children are entry maps
+  :children is always a vector. :map, :multi, and :orn children are entry maps
   {:key k :properties p :schema <ast>}. :ref nodes additionally carry :ref <kw>.
 
   Entry point: (normalize form opts) where opts may carry {:registry r}.
@@ -15,6 +15,27 @@
 (defn- invalid!
   [msg form]
   (throw (ex-info msg {:type :balli.core/invalid-schema :form form})))
+
+(defn fn-like?
+  "True when `x` is function-like: a Basilisp fn, or a Python callable that
+  is not a Basilisp collection, keyword, or symbol. Bare `python/callable`
+  is too broad — keywords, maps, sets, vectors, and symbols all implement
+  __call__ in Basilisp. Canonical home of this predicate (balli.compile
+  aliases it)."
+  [x]
+  (or (fn? x)
+      (and (python/callable x)
+           (not (coll? x))
+           (not (keyword? x))
+           (not (symbol? x)))))
+
+(defn ifn-like?
+  "Clojure-idiom predicate position: real fns plus keywords, maps, and sets
+  (all callable lookups routinely used as predicates). Vectors and symbols
+  are callable in Basilisp too but are rejected — they are far more likely
+  to be schema-authoring mistakes than intentional predicates."
+  [x]
+  (or (fn-like? x) (keyword? x) (map? x) (set? x)))
 
 (def ^:private bounded-types
   "Types whose :min/:max properties participate in numeric comparisons at
@@ -47,8 +68,9 @@
     [{} (vec args)]))
 
 (defn- split-props-leading
-  "Like split-props, but a leading map is always properties. Used for :map and
-  :multi, whose children are entry vectors and can never be bare maps."
+  "Like split-props, but a leading map is always properties. Used for :map,
+  :multi, and :orn, whose children are entry vectors and can never be bare
+  maps."
   [args]
   (if (map? (first args))
     [(first args) (vec (rest args))]
@@ -148,7 +170,7 @@
 (defmethod normalize :tuple [form opts] (normalize-n-children 0 form opts))
 
 ;; ---------------------------------------------------------------------------
-;; :map / :multi entries
+;; :map / :multi / :orn entries
 
 (defn- normalize-entry
   "Normalize an entry [k schema] or [k props schema] into
@@ -175,9 +197,18 @@
   (let [[props elems] (split-props-leading (rest form))]
     (when-not (contains? props :dispatch)
       (invalid! ":multi requires a :dispatch property" form))
-    (when-not (python/callable (:dispatch props))
-      (invalid! ":multi :dispatch must be a keyword or fn" form))
+    (let [d (:dispatch props)]
+      (when-not (or (keyword? d) (fn-like? d))
+        (invalid! ":multi :dispatch must be a keyword or fn" form)))
     (node :multi props (mapv #(normalize-entry % opts) elems) form)))
+
+(defmethod normalize :orn [form opts]
+  (when (keyword? form)
+    (invalid! ":orn requires at least one entry" form))
+  (let [[props elems] (split-props-leading (rest form))]
+    (when (empty? elems)
+      (invalid! ":orn requires at least one entry" form))
+    (node :orn props (mapv #(normalize-entry % opts) elems) form)))
 
 ;; ---------------------------------------------------------------------------
 ;; :map-of
@@ -200,8 +231,8 @@
     (when-not (= 1 (count elems))
       (invalid! ":fn expects exactly 1 predicate child" form))
     (let [pred (first elems)]
-      (when-not (python/callable pred)
-        (invalid! ":fn child must be callable" form))
+      (when-not (ifn-like? pred)
+        (invalid! ":fn child must be a fn, keyword, map, or set" form))
       (node :fn props [pred] form))))
 
 ;; ---------------------------------------------------------------------------
@@ -222,6 +253,162 @@
                     (instance? re/Pattern p) p
                     :else (invalid! ":re child must be a regex pattern or string" form))]
       (node :re props [pattern] form))))
+
+;; ---------------------------------------------------------------------------
+;; Sequence (regex) schemas: :cat :catn :alt :altn :? :* :+ :repeat -- plus
+;; :schema, the transparent single-child wrapper (in a seqex it forces
+;; single-element item semantics; everywhere else it is invisible).
+;;
+;; :cat/:alt children are plain schemas (never bare maps), so a leading map
+;; is always properties (split-props-leading). :catn/:altn children are entry
+;; vectors like :map/:orn.
+
+(defmethod normalize :cat [form opts]
+  (if (keyword? form)
+    (node :cat {} [] form)
+    (let [[props elems] (split-props-leading (rest form))]
+      (node :cat props (mapv #(normalize % opts) elems) form))))
+
+(defmethod normalize :alt [form opts]
+  (when (keyword? form)
+    (invalid! ":alt requires at least one child schema" form))
+  (let [[props elems] (split-props-leading (rest form))]
+    (when (empty? elems)
+      (invalid! ":alt requires at least one child schema" form))
+    (node :alt props (mapv #(normalize % opts) elems) form)))
+
+(defn- normalize-seqex-entries
+  [t form opts]
+  (when (keyword? form)
+    (invalid! (str t " requires at least one entry") form))
+  (let [[props elems] (split-props-leading (rest form))]
+    (when (empty? elems)
+      (invalid! (str t " requires at least one entry") form))
+    (node t props (mapv #(normalize-entry % opts) elems) form)))
+
+(defmethod normalize :catn [form opts] (normalize-seqex-entries :catn form opts))
+(defmethod normalize :altn [form opts] (normalize-seqex-entries :altn form opts))
+
+(defmethod normalize :? [form opts] (normalize-single-child form opts))
+(defmethod normalize :* [form opts] (normalize-single-child form opts))
+(defmethod normalize :+ [form opts] (normalize-single-child form opts))
+(defmethod normalize :schema [form opts] (normalize-single-child form opts))
+
+(defmethod normalize :repeat [form opts]
+  (when (keyword? form)
+    (invalid! ":repeat requires a child schema" form))
+  (let [[props elems] (split-props-leading (rest form))]
+    (when-not (= 1 (count elems))
+      (invalid! ":repeat expects exactly 1 child schema" form))
+    (doseq [k [:min :max]]
+      (let [v (get props k)]
+        (when (and (some? v) (not (or (int? v) (float? v))))
+          (invalid! (str ":repeat " k " must be a number") form))))
+    (let [mn (:min props)
+          mx (:max props)]
+      (when (and mn (neg? mn))
+        (invalid! ":repeat :min must be non-negative" form))
+      (when (and mx (neg? mx))
+        (invalid! ":repeat :max must be non-negative" form))
+      (when (and mn mx (> mn mx))
+        (invalid! ":repeat :min must be <= :max" form)))
+    (node :repeat props [(normalize (first elems) opts)] form)))
+
+;; ---------------------------------------------------------------------------
+;; Seqex arity bounds (used by :function normalization below and by Phase 8's
+;; instrument/function-info in balli.core; balli.compile re-exports it under
+;; its original Phase 6 home).
+
+(defn regex-min-max
+  "Matched-element count bounds for seqex AST node `ast`: {:min n :max m},
+  :max absent when unbounded (:*/:+/unbounded :repeat). Any non-seqex node
+  counts as one element {:min 1 :max 1} -- including [:schema ...] wrappers,
+  which is exactly their point. Phase 8 uses this for :=>/:function arities."
+  [ast]
+  (letfn [(entry-nodes [node]
+            (if (contains? #{:catn :altn} (:type node))
+              (mapv :schema (:children node))
+              (:children node)))
+          (mm [node]
+            (case (:type node)
+              (:cat :catn)
+              (reduce (fn [[amin amax] c]
+                        (let [[cmin cmax] (mm c)]
+                          [(+ amin cmin) (when (and amax cmax) (+ amax cmax))]))
+                      [0 0]
+                      (entry-nodes node))
+
+              (:alt :altn)
+              (reduce (fn [[amin amax] [cmin cmax]]
+                        [(min amin cmin) (when (and amax cmax) (max amax cmax))])
+                      (mapv mm (entry-nodes node)))
+
+              :? (let [[_ cmax] (mm (first (:children node)))]
+                   [0 cmax])
+              :* [0 nil]
+              :+ (let [[cmin _] (mm (first (:children node)))]
+                   [cmin nil])
+              :repeat (let [[cmin cmax] (mm (first (:children node)))
+                            props (:properties node)
+                            mn (or (:min props) 0)
+                            mx (:max props)]
+                        [(* mn cmin) (when (and mx cmax) (* mx cmax))])
+
+              [1 1]))]
+    (let [[mn mx] (mm ast)]
+      (if mx {:min mn :max mx} {:min mn}))))
+
+;; ---------------------------------------------------------------------------
+;; Function schemas: :=> / :function (Phase 8)
+;;
+;; [:=> <input> <output>] or [:=> <input> <output> <guard>]. The input child
+;; must be a LITERAL :cat/:catn vector form (checked post-normalization on
+;; the child's AST :type): a bare registry keyword that happens to resolve to
+;; a :cat, or a [:schema [:cat ...]] wrapper, is rejected with
+;; :balli.core/invalid-input-schema -- MVP simplification, refs are not
+;; dereferenced at normalize time (that needs the compile-time registry).
+;; The guard, when present, is an ordinary schema validated against
+;; [args ret] by instrument.
+
+(defmethod normalize :=> [form opts]
+  (when (keyword? form)
+    (invalid! ":=> requires input and output schemas" form))
+  (let [[props elems] (split-props-leading (rest form))]
+    (when-not (<= 2 (count elems) 3)
+      (invalid! ":=> expects 2 or 3 children (input, output, optional guard)" form))
+    (let [children (mapv #(normalize % opts) elems)]
+      (when-not (contains? #{:cat :catn} (:type (first children)))
+        (throw (ex-info ":=> input must be a literal :cat or :catn schema"
+                        {:type :balli.core/invalid-input-schema :form form})))
+      (node :=> props children form))))
+
+(defmethod normalize :function [form opts]
+  (when (keyword? form)
+    (invalid! ":function requires at least one :=> child" form))
+  (let [[props elems] (split-props-leading (rest form))]
+    (when (empty? elems)
+      (invalid! ":function requires at least one :=> child" form))
+    (let [children (mapv #(normalize % opts) elems)]
+      (doseq [c children]
+        (when-not (= :=> (:type c))
+          (invalid! ":function children must be :=> schemas" form)))
+      ;; Arity grouping (malli -group-by-arity! semantics): each :=> child's
+      ;; arity key is its input min when min == max (fixed), else :varargs.
+      ;; Duplicate fixed arities, more than one varargs, and any fixed arity
+      ;; >= the varargs min are all ambiguous for instrument dispatch.
+      (let [mms (mapv #(regex-min-max (first (:children %))) children)
+            arity-key (fn [{:keys [min max]}] (if (= min max) min :varargs))
+            keys* (mapv arity-key mms)
+            fixed (filterv number? keys*)
+            varargs-mms (filterv #(= :varargs (arity-key %)) mms)]
+        (when (not= (count fixed) (count (set fixed)))
+          (invalid! ":function :=> children must have distinct arities" form))
+        (when (< 1 (count varargs-mms))
+          (invalid! ":function allows at most one varargs :=> child" form))
+        (when-let [v (first varargs-mms)]
+          (when (some #(>= % (:min v)) fixed)
+            (invalid! ":function fixed arities must be below the varargs :=> child's minimum" form))))
+      (node :function props children form))))
 
 ;; ---------------------------------------------------------------------------
 ;; :ref

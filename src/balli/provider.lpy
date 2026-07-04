@@ -1,0 +1,226 @@
+(ns balli.provider
+  "Schema inference (Malli's malli.provider): `provide` takes a collection of
+  sample values and returns a schema FORM that validates all of them.
+
+  Two passes:
+  1. Stats fold -- classify every sample as nil / map / set / vector /
+     sequential / scalar; maps recurse per key (tracking per-key presence
+     counts + total map count), collections recurse over their elements
+     (union element stats), scalars record which of the preference-ordered
+     scalar types accept them (via balli.core validators).
+  2. Synthesis -- turn the stats into a form: a single scalar type-set picks
+     the most specific type accepting ALL samples (preference order
+     [:int :double :keyword :symbol :string :boolean :uuid]); collections
+     become [type elem-schema] ([type :any] when no elements were seen);
+     maps become [:map [k v] ...] with {:optional true} on keys present in
+     fewer samples than the map total (entries in first-seen order), or
+     [:map-of k v] per the heuristic below; mixed classifications join under
+     [:or ...] (first-seen classification order), and nil samples wrap the
+     rest in [:maybe ...]. No samples at all -> :any.
+
+  :map-of heuristic (opts key :map-of-threshold, default 3): at least
+  threshold map samples AND every per-key value schema equal AND every key
+  schema equal (keys inferred as scalar samples) AND distinct keys across
+  samples > (total keys)^0.7 -> [:map-of k v].
+
+  Deviations from malli documented here on purpose:
+  - Mixed int + float samples synthesize [:or :int :double], NOT :double or
+    number?: Balli's float? rejects ints ((float? 1) -> false), unlike JVM
+    malli where double accepts any number, so no single scalar type accepts
+    a mixed int/float sample set.
+  - Vectors whose samples all share the same arity are NOT tuple-ized --
+    malli's :tuple hint is skipped; homogeneous [:vector x] is always
+    produced.
+  - No :enum inference.
+  - Scalars none of the preference types accept (e.g. arbitrary Python
+    objects) infer :any; :any among mixed branches collapses the whole
+    union to :any."
+  (:require [balli.core :as b]))
+
+;; ---------------------------------------------------------------------------
+;; Scalar classification
+
+(def ^:private scalar-preference
+  "Most-specific-first scalar type order (Balli order; no predicates registry)."
+  [:int :double :keyword :symbol :string :boolean :uuid])
+
+(def ^:private scalar-validators
+  "[[type validator] ...] in preference order, compiled once."
+  (mapv (fn [t] [t (b/validator t)]) scalar-preference))
+
+(defn- accepting-types
+  "Set of preference-ordered scalar types whose validator accepts `x`."
+  [x]
+  (into #{} (comp (filter (fn [[_ f]] (f x))) (map first)) scalar-validators))
+
+(defn- preferred-type
+  "Most specific type in `type-set` per scalar-preference; :any when none."
+  [type-set]
+  (or (first (filter type-set scalar-preference)) :any))
+
+;; ---------------------------------------------------------------------------
+;; Pass 1: stats fold
+
+(defn- classify
+  [x]
+  (cond
+    (nil? x) :nil
+    (map? x) :map
+    (set? x) :set
+    (vector? x) :vector
+    (or (list? x) (seq? x) (sequential? x)) :sequential
+    :else :scalar))
+
+(defn- empty-stats
+  []
+  {:total 0 :nil 0 :order [] :branches {}})
+
+(declare fold)
+
+(defn- fold-scalar
+  "Track the intersection of accepting type-sets across all scalar samples
+  plus the first-seen order of each sample's most specific type."
+  [branch x]
+  (let [branch (or branch {:intersect nil :seen []})
+        acc (accepting-types x)
+        best (preferred-type acc)]
+    (-> branch
+        (update :intersect (fn [i] (if (nil? i) acc (set (filter acc i)))))
+        (update :seen (fn [seen] (if (some #{best} seen) seen (conj seen best)))))))
+
+(defn- fold-map
+  "Per-key stats recursion + per-key presence counts + total map count, plus
+  distinct-key set and total key occurrences for the :map-of heuristic."
+  [branch m]
+  (let [branch (-> (or branch {:count 0 :key-order [] :key-counts {}
+                               :key-stats {} :total-keys 0 :distinct-keys #{}})
+                   (update :count inc))]
+    ;; Iterate each sample's keys sorted by str: Basilisp map iteration order
+    ;; is hash-dependent, so unsorted folding makes the output entry order
+    ;; nondeterministic across processes. Cross-sample order stays first-seen.
+    (reduce
+     (fn [acc k]
+       (let [v (get m k)
+             new-key? (not (contains? (:key-counts acc) k))]
+         (-> acc
+             (update :key-order (if new-key? (fn [ks] (conj ks k)) identity))
+             (update-in [:key-counts k] (fnil inc 0))
+             (update-in [:key-stats k] (fn [s] (fold (or s (empty-stats)) v)))
+             (update :total-keys inc)
+             (update :distinct-keys conj k))))
+     branch
+     (sort-by str (keys m)))))
+
+(defn- fold-coll
+  "Union element stats across every sample of this collection kind."
+  [branch xs]
+  (let [branch (-> (or branch {:count 0 :elem (empty-stats)})
+                   (update :count inc))]
+    (update branch :elem (fn [s] (reduce fold s xs)))))
+
+(defn- note-order
+  [stats k]
+  (if (some #{k} (:order stats))
+    stats
+    (update stats :order conj k)))
+
+(defn- fold
+  "Fold one sample into `stats`."
+  [stats x]
+  (let [stats (update stats :total inc)
+        c (classify x)]
+    (case c
+      :nil (update stats :nil inc)
+      :scalar (-> (note-order stats :scalar)
+                  (update-in [:branches :scalar] fold-scalar x))
+      :map (-> (note-order stats :map)
+               (update-in [:branches :map] fold-map x))
+      (:set :vector :sequential)
+      (-> (note-order stats c)
+          (update-in [:branches c] fold-coll x)))))
+
+;; ---------------------------------------------------------------------------
+;; Pass 2: synthesis
+
+(declare synthesize)
+
+(defn- scalar-schemas
+  "Schemas for the scalar branch. Non-empty accept-all intersection -> single
+  most specific type; otherwise one schema per first-seen best type."
+  [branch]
+  (let [i (:intersect branch)]
+    (if (seq i)
+      [(preferred-type i)]
+      (:seen branch))))
+
+(defn- synthesize-map
+  "[:map-of k v] when the heuristic holds, else [:map [k (props?) v] ...] with
+  {:optional true} iff the key was present in fewer samples than the total.
+  Entries in first-seen key order."
+  [branch opts]
+  (let [n (:count branch)
+        threshold (get opts :map-of-threshold 3)
+        val-schemas (into {}
+                          (map (fn [k] [k (synthesize (get-in branch [:key-stats k]) opts)]))
+                          (:key-order branch))
+        distinct-keys (:distinct-keys branch)
+        map-of? (and (>= n threshold)
+                     (seq distinct-keys)
+                     (= 1 (count (distinct (vals val-schemas))))
+                     (= 1 (count (distinct (map (fn [k] (synthesize (fold (empty-stats) k) opts))
+                                                distinct-keys))))
+                     (> (count distinct-keys)
+                        (python/pow (:total-keys branch) 0.7)))]
+    (if map-of?
+      [:map-of
+       (synthesize (fold (empty-stats) (first distinct-keys)) opts)
+       (val (first val-schemas))]
+      (into [:map]
+            (map (fn [k]
+                   (let [v (get val-schemas k)]
+                     (if (< (get-in branch [:key-counts k]) n)
+                       [k {:optional true} v]
+                       [k v]))))
+            (:key-order branch)))))
+
+(defn- synthesize-coll
+  [type-kw branch opts]
+  (let [elem (:elem branch)]
+    [type-kw (if (zero? (:total elem)) :any (synthesize elem opts))]))
+
+(defn- branch-schemas
+  [k branch opts]
+  (case k
+    :scalar (scalar-schemas branch)
+    :map [(synthesize-map branch opts)]
+    :set [(synthesize-coll :set branch opts)]
+    :vector [(synthesize-coll :vector branch opts)]
+    :sequential [(synthesize-coll :sequential branch opts)]))
+
+(defn- synthesize
+  [stats opts]
+  (let [schemas (into []
+                      (mapcat (fn [k] (branch-schemas k (get (:branches stats) k) opts)))
+                      (:order stats))
+        nils? (pos? (:nil stats))]
+    (cond
+      (zero? (:total stats)) :any
+      (some #{:any} schemas) :any
+      (empty? schemas) (if nils? :nil :any)
+      nils? (if (= 1 (count schemas))
+              [:maybe (first schemas)]
+              [:maybe (into [:or] schemas)])
+      (= 1 (count schemas)) (first schemas)
+      :else (into [:or] schemas))))
+
+;; ---------------------------------------------------------------------------
+;; Public API
+
+(defn provide
+  "Infer a schema FORM from `samples` (any seqable of values). `opts`
+  supports {:map-of-threshold n} (default 3) for the [:map-of ...]
+  heuristic. Every sample validates against the returned form. No samples
+  -> :any."
+  ([samples] (provide samples {}))
+  ([samples opts]
+   (synthesize (reduce fold (empty-stats) samples) opts)))

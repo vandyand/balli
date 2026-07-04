@@ -1,0 +1,196 @@
+(ns tests.test-spell
+  "Phase 4: key spell-checking — levenshtein distance, threshold table,
+  with-spell-checking rewrites (misspelled-key / misspelled-value), dropping
+  of explained missing-key errors, humanize rendering, and composition
+  (multi branch inside a closed map)."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.error :as be]))
+
+;; ---------------------------------------------------------------------------
+;; levenshtein
+
+(deftest levenshtein-distance
+  (is (= 0 (be/levenshtein "abc" "abc")))
+  (is (= 0 (be/levenshtein "" "")))
+  (is (= 4 (be/levenshtein "" "abcd")))
+  (is (= 4 (be/levenshtein "abcd" "")))
+  (is (= 1 (be/levenshtein "abc" "abcd")))     ; insertion
+  (is (= 1 (be/levenshtein "abcd" "abc")))     ; deletion
+  (is (= 1 (be/levenshtein "abc" "axc")))      ; substitution
+  (is (= 2 (be/levenshtein "naem" "name")))    ; transposition costs 2
+  (is (= 3 (be/levenshtein "kitten" "sitting")))
+  (testing "non-string args go through str (keywords keep the colon)"
+    (is (= 1 (be/levenshtein :streetz :street)))
+    (is (= 2 (be/levenshtein :naem :name)))))
+
+;; ---------------------------------------------------------------------------
+;; nil / no-op passthrough
+
+(deftest nil-passthrough
+  (is (nil? (be/with-spell-checking nil)))
+  (is (nil? (be/with-spell-checking (b/explain [:map [:x :int]] {:x 1})))))
+
+(deftest irrelevant-errors-unchanged
+  (testing "explain maps without extra-key/dispatch errors come back equal"
+    (let [ex (b/explain :int "x")]
+      (is (= ex (be/with-spell-checking ex))))
+    (let [ex (b/explain [:map [:x :int]] {:x "s"})]
+      (is (= ex (be/with-spell-checking ex))))
+    (testing "missing-key with no misspelling evidence is NOT dropped"
+      (let [ex (b/explain [:map [:x :int]] {})]
+        (is (= ex (be/with-spell-checking ex)))))))
+
+;; ---------------------------------------------------------------------------
+;; misspelled-key rewrite + missing-key dropping
+
+(deftest misspelled-key-rewrite
+  (let [schema [:map {:closed true} [:street :string]]
+        ex (b/explain schema {:streetz "x"})
+        checked (be/with-spell-checking ex)]
+    (testing "without spell-checking: extra-key AND missing-key both present"
+      (is (= #{:balli.core/extra-key :balli.core/missing-key}
+             (set (map :type (:errors ex))))))
+    (testing "with spell-checking: single misspelled-key, missing-key dropped"
+      (is (= 1 (count (:errors checked))))
+      (let [err (first (:errors checked))]
+        (is (= :balli.error/misspelled-key (:type err)))
+        (is (= [[:street]] (:balli.error/likely-misspelling-of err)))
+        (is (= [:streetz] (:in err)))
+        (is (= "x" (:value err)))))))
+
+(deftest misspelled-key-nested-in
+  (testing "likely-misspelling-of paths are value paths (parent :in + key)"
+    (let [schema [:map [:address [:map {:closed true} [:street :string]]]]
+          checked (-> (b/explain schema {:address {:streetz "x"}})
+                      be/with-spell-checking)]
+      (is (= [:balli.error/misspelled-key] (mapv :type (:errors checked))))
+      (is (= [[:address :street]]
+             (:balli.error/likely-misspelling-of (first (:errors checked))))))))
+
+(deftest misspelled-key-entry-with-props
+  (testing "entries with a props map ([k props schema]) still contribute keys"
+    (let [schema [:map {:closed true} [:street {:optional true} :string]]
+          checked (-> (b/explain schema {:streetz "x"}) be/with-spell-checking)]
+      (is (= [:balli.error/misspelled-key] (mapv :type (:errors checked)))))))
+
+(deftest below-threshold-stays-extra-key
+  (testing ":naem vs :name is distance 2 > threshold 1 (len 4) — no rewrite
+            (matches malli: transpositions are 2 edits under levenshtein)"
+    (let [ex (b/explain [:map {:closed true} [:name :string]] {:naem "x"})
+          checked (be/with-spell-checking ex)]
+      (is (= ex checked))
+      (is (= #{:balli.core/extra-key :balli.core/missing-key}
+             (set (map :type (:errors checked)))))))
+  (testing "short keys (len <= 2) need an exact match, so never rewrite"
+    (let [ex (b/explain [:map {:closed true} [:xy :int]] {:xz 1})]
+      (is (= ex (be/with-spell-checking ex))))))
+
+(deftest candidates-exclude-present-keys
+  (testing "a declared key already present in the value is not a candidate"
+    (let [schema [:map {:closed true} [:name :string]]
+          ex (b/explain schema {:name "a" :namee "b"})
+          checked (be/with-spell-checking ex)]
+      (is (= ex checked))
+      (is (= [:balli.core/extra-key] (mapv :type (:errors checked)))))))
+
+(deftest multiple-candidates-sorted-by-distance
+  (let [schema [:map {:closed true} [:aaaabbbc :int] [:aaaabbcc :int]]
+        checked (-> (b/explain schema {:aaaabbbb 1}) be/with-spell-checking)
+        errs (:errors checked)]
+    ;; :aaaabbbb -> :aaaabbbc distance 1, -> :aaaabbcc distance 2; both
+    ;; within threshold 3 (len 8); both missing-keys dropped.
+    (is (= [:balli.error/misspelled-key] (mapv :type errs)))
+    (is (= [[:aaaabbbc] [:aaaabbcc]]
+           (:balli.error/likely-misspelling-of (first errs))))))
+
+;; ---------------------------------------------------------------------------
+;; misspelled-value rewrite (:multi keyword dispatch)
+
+(def multi-schema
+  [:multi {:dispatch :type}
+   [:dog [:map [:type :keyword] [:breed :string]]]
+   [:fish [:map [:type :keyword]]]])
+
+(deftest misspelled-dispatch-value
+  (let [ex (b/explain multi-schema {:type :dob :breed "lab"})
+        checked (be/with-spell-checking ex)]
+    (testing "without spell-checking: invalid-dispatch-value"
+      (is (= [:balli.core/invalid-dispatch-value] (mapv :type (:errors ex)))))
+    (testing "with: misspelled-value + likely-misspelling-of (:in + candidate)"
+      (let [err (first (:errors checked))]
+        (is (= :balli.error/misspelled-value (:type err)))
+        (is (= [[:dog]] (:balli.error/likely-misspelling-of err)))))))
+
+(deftest dispatch-typo-below-threshold
+  (testing ":dgo vs :dog is distance 2 > threshold 1 — stays as-is"
+    (let [ex (b/explain multi-schema {:type :dgo})]
+      (is (= ex (be/with-spell-checking ex))))))
+
+(deftest fn-dispatch-multi-untouched
+  (let [schema [:multi {:dispatch (fn [x] (:type x))}
+                [:dog [:map [:type :keyword]]]]
+        ex (b/explain schema {:type :dob})]
+    (is (= ex (be/with-spell-checking ex)))))
+
+;; ---------------------------------------------------------------------------
+;; humanize rendering
+
+(deftest humanize-misspelled-key
+  (is (= {:streetz ["should be spelled :street"]}
+         (-> (b/explain [:map {:closed true} [:street :string]] {:streetz "x"})
+             be/with-spell-checking
+             be/humanize))))
+
+(deftest humanize-misspelled-key-two-candidates
+  (is (= {:aaaabbbb ["should be spelled :aaaabbbc or :aaaabbcc"]}
+         (-> (b/explain [:map {:closed true} [:aaaabbbc :int] [:aaaabbcc :int]]
+                        {:aaaabbbb 1})
+             be/with-spell-checking
+             be/humanize))))
+
+(deftest humanize-misspelled-value
+  (is (= ["should be spelled :dog"]
+         (-> (b/explain multi-schema {:type :dob :breed "lab"})
+             be/with-spell-checking
+             be/humanize))))
+
+(deftest humanize-without-spell-checking-unchanged
+  (is (= {:street ["missing required key"]
+          :streetz ["disallowed key"]}
+         (-> (b/explain [:map {:closed true} [:street :string]] {:streetz "x"})
+             be/humanize))))
+
+;; ---------------------------------------------------------------------------
+;; Composition: multi branch inside a closed map — one explain carries an
+;; outer extra-key typo AND an inner dispatch typo; both rewritten, the
+;; explained missing-key dropped, and humanize renders both.
+
+(deftest composition-multi-inside-closed-map
+  (let [schema [:map {:closed true}
+                [:street :string]
+                [:pet [:multi {:dispatch :kind}
+                       [:dog [:map [:kind :keyword]]]
+                       [:fish [:map [:kind :keyword]]]]]]
+        value {:streetz "main st" :pet {:kind :dob}}
+        ex (b/explain schema value)
+        checked (be/with-spell-checking ex)]
+    (testing "raw explain: missing-key + extra-key + invalid-dispatch-value"
+      (is (= #{:balli.core/missing-key :balli.core/extra-key
+               :balli.core/invalid-dispatch-value}
+             (set (map :type (:errors ex))))))
+    (testing "both typos rewritten, missing-key for :street dropped"
+      (is (= #{:balli.error/misspelled-key :balli.error/misspelled-value}
+             (set (map :type (:errors checked)))))
+      (is (= 2 (count (:errors checked))))
+      (let [by-type (into {} (map (juxt :type identity)) (:errors checked))]
+        (is (= [[:street]]
+               (:balli.error/likely-misspelling-of
+                (get by-type :balli.error/misspelled-key))))
+        (is (= [[:pet :dog]]
+               (:balli.error/likely-misspelling-of
+                (get by-type :balli.error/misspelled-value))))))
+    (testing "humanize renders both corrections"
+      (is (= {:streetz ["should be spelled :street"]
+              :pet ["should be spelled :dog"]}
+             (be/humanize checked))))))

@@ -1,0 +1,415 @@
+(ns tests.test-transform
+  "Phase 1: transformers -- decode/encode/coerce per malli-semantics section A.
+  String/json built-ins, lenient scalar coercions, strip-extra-keys, default
+  values, key transforms, chain composition order, property overrides,
+  :or/:multi/:ref descent, :map-of key decoding, and coercer throw shape."
+  (:import uuid)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.registry :as reg]
+            [balli.transform :as bt]))
+
+(def st (bt/string-transformer))
+(def jt (bt/json-transformer))
+
+;; ---------------------------------------------------------------------------
+;; string-transformer decode: scalars
+
+(deftest string-decode-int
+  (is (= 42 (b/decode :int "42" st)))
+  (is (= -7 (b/decode :int "-7" st)))
+  (testing "lenient: non-numeric strings and non-strings unchanged"
+    (is (= "abc" (b/decode :int "abc" st)))
+    (is (= "4.5" (b/decode :int "4.5" st)))
+    (is (= 42 (b/decode :int 42 st)))
+    (is (nil? (b/decode :int nil st)))))
+
+(deftest string-decode-double-and-number
+  (is (= 1.5 (b/decode :double "1.5" st)))
+  (is (= 1.5 (b/decode :float "1.5" st)))
+  (is (= 1.5 (b/decode :number "1.5" st)))
+  (is (= "x" (b/decode :double "x" st))))
+
+(deftest string-decode-boolean
+  (is (true? (b/decode :boolean "true" st)))
+  (is (false? (b/decode :boolean "false" st)))
+  (testing "only exact true/false strings coerce"
+    (is (= "TRUE" (b/decode :boolean "TRUE" st)))
+    (is (= "1" (b/decode :boolean "1" st)))
+    (is (true? (b/decode :boolean true st)))))
+
+(deftest string-decode-keyword-and-symbol
+  (is (= :kw (b/decode :keyword "kw" st)))
+  (is (= :ns/kw (b/decode :keyword "ns/kw" st)))
+  (is (= :already (b/decode :keyword :already st)))
+  (is (= 'sym (b/decode :symbol "sym" st))))
+
+(deftest string-decode-uuid
+  (let [s "550e8400-e29b-41d4-a716-446655440000"
+        u (b/decode :uuid s st)]
+    (is (uuid? u))
+    (is (= s (str u)))
+    (is (true? (b/validate :uuid u))))
+  (testing "non-canonical strings unchanged"
+    (is (= "not-a-uuid" (b/decode :uuid "not-a-uuid" st)))
+    (is (= "550e8400" (b/decode :uuid "550e8400" st)))))
+
+(deftest string-decode-enum-and-eq-infer-child-type
+  (is (= 2 (b/decode [:enum 1 2 3] "2" st)))
+  (is (= :a (b/decode [:enum :a :b] "a" st)))
+  (is (= "small" (b/decode [:enum "small" "big"] "small" st)))
+  (is (= 1.5 (b/decode [:= 1.5] "1.5" st)))
+  (is (= :on (b/decode [:= :on] "on" st)))
+  (testing "lenient on mismatch"
+    (is (= "x9x" (b/decode [:enum 1 2] "x9x" st)))))
+
+;; ---------------------------------------------------------------------------
+;; json-transformer decode
+
+(deftest json-decode-excludes-string-to-number
+  (is (= "42" (b/decode :int "42" jt)))
+  (is (= "1.5" (b/decode :double "1.5" jt)))
+  (is (= "true" (b/decode :boolean "true" jt)))
+  (testing "enum inference under json also refuses number strings"
+    (is (= "2" (b/decode [:enum 1 2] "2" jt)))))
+
+(deftest json-decode-numbers
+  (is (= 42 (b/decode :int 42.0 jt)))
+  (is (= 4.5 (b/decode :int 4.5 jt)))
+  (is (= 1.0 (b/decode :double 1 jt)))
+  (is (float? (b/decode :double 1 jt))))
+
+(deftest json-decode-strings
+  (is (= :a (b/decode :keyword "a" jt)))
+  (is (= :ns/kw (b/decode :keyword "ns/kw" jt)))
+  (is (= 'sym (b/decode :symbol "sym" jt)))
+  (is (uuid? (b/decode :uuid "550e8400-e29b-41d4-a716-446655440000" jt))))
+
+(deftest json-decode-set
+  (is (= #{1 2} (b/decode [:set :int] [1 2] jt)))
+  (is (= #{:a :b} (b/decode [:set :keyword] ["a" "b"] jt))))
+
+;; ---------------------------------------------------------------------------
+;; encode
+
+(deftest string-encode-scalars
+  (is (= "42" (b/encode :int 42 st)))
+  (is (= "1.5" (b/encode :double 1.5 st)))
+  (is (= "a" (b/encode :keyword :a st)))
+  (is (= "ns/kw" (b/encode :keyword :ns/kw st)))
+  (is (= "sym" (b/encode :symbol 'sym st)))
+  (testing "booleans NOT stringified"
+    (is (true? (b/encode :boolean true st))))
+  (testing "enum/eq encode via inferred child type"
+    (is (= "a" (b/encode [:enum :a :b] :a st)))
+    (is (= "2" (b/encode [:= 2] 2 st)))))
+
+(deftest string-encode-uuid
+  (let [u (uuid/UUID "550e8400-e29b-41d4-a716-446655440000")]
+    (is (= "550e8400-e29b-41d4-a716-446655440000" (b/encode :uuid u st)))))
+
+(deftest json-encode
+  (is (= 42 (b/encode :int 42 jt)))
+  (is (= "a" (b/encode :keyword :a jt)))
+  (is (= "sym" (b/encode :symbol 'sym jt))))
+
+(deftest encode-decode-reversal
+  (testing "decode then encode round-trips"
+    (is (= "42" (b/encode :int (b/decode :int "42" st) st)))
+    (is (= "ns/kw" (b/encode :keyword (b/decode :keyword "ns/kw" st) st)))))
+
+;; ---------------------------------------------------------------------------
+;; collections / map / tuple descent
+
+(deftest collection-descent
+  (is (= [1 2] (b/decode [:vector :int] ["1" "2"] st)))
+  (is (= #{:a :b} (b/decode [:set :keyword] ["a" "b"] st)))
+  (is (= [1 :a] (b/decode [:tuple :int :keyword] ["1" "a"] st)))
+  (testing "tuple is lenient on too-short vectors (no throw)"
+    (is (= [1] (b/decode [:tuple :int :keyword] ["1"] st))))
+  (testing "non-collections pass through"
+    (is (= "nope" (b/decode [:vector :int] "nope" st)))))
+
+(deftest map-descent-present-keys-only
+  (is (= {:age 42 :extra "x"}
+         (b/decode [:map [:age :int]] {:age "42" :extra "x"} st)))
+  (testing "missing keys untouched"
+    (is (= {} (b/decode [:map [:age :int]] {} st))))
+  (testing "non-maps pass through"
+    (is (= "nope" (b/decode [:map [:age :int]] "nope" st)))))
+
+(deftest checkpoint-nested-map
+  (is (= {:age 42 :tags #{:a :b}}
+         (b/decode [:map [:age :int] [:tags [:set :keyword]]]
+                   {:age "42" :tags ["a" "b"]}
+                   st))))
+
+(deftest and-maybe-not-descent
+  (is (= 42 (b/decode [:and :int [:fn pos?]] "42" st)))
+  (is (= 42 (b/decode [:maybe :int] "42" st)))
+  (is (nil? (b/decode [:maybe :int] nil st)))
+  (is (= 42 (b/decode [:not [:int {:min 100}]] "42"
+                      (bt/transformer {:decoders {:int bt/-string->long}})))))
+
+;; ---------------------------------------------------------------------------
+;; :map-of key decoding (string decoders for keys, keep-valid)
+
+(deftest map-of-key-decode-under-json
+  (is (= {:a 1} (b/decode [:map-of :keyword :int] {"a" 1} jt)))
+  (is (= {1 "x"} (b/decode [:map-of :int :string] {"1" "x"} jt)))
+  (testing "decoded key kept only when valid per key schema, else original"
+    (is (= {"9" "x"} (b/decode [:map-of [:int {:max 5}] :string] {"9" "x"} jt)))
+    (is (= {3 "x"} (b/decode [:map-of [:int {:max 5}] :string] {"3" "x"} jt)))))
+
+(deftest map-of-key-decode-under-string
+  (is (= {:a 1} (b/decode [:map-of :keyword :int] {"a" 1} st)))
+  (is (= {1 2} (b/decode [:map-of :int :int] {"1" "2"} st)))
+  (testing "encode side: keyword keys to strings"
+    (is (= {"a" 1} (b/encode [:map-of :keyword :int] {:a 1} jt)))))
+
+;; ---------------------------------------------------------------------------
+;; strip-extra-keys
+
+(deftest strip-extra-keys
+  (let [t (bt/strip-extra-keys-transformer)]
+    (testing "open map strips undeclared keys"
+      (is (= {:x 1} (b/decode [:map [:x :int]] {:x 1 :junk 2} t))))
+    (testing "closed map strips too"
+      (is (= {:x 1} (b/decode [:map {:closed true} [:x :int]] {:x 1 :junk 2} t))))
+    (testing "explicit {:closed false} does NOT strip"
+      (is (= {:x 1 :junk 2}
+             (b/decode [:map {:closed false} [:x :int]] {:x 1 :junk 2} t))))
+    (testing "encode strips as well"
+      (is (= {:x 1} (b/encode [:map [:x :int]] {:x 1 :junk 2} t))))))
+
+(deftest strip-extra-keys-map-of
+  (let [t (bt/strip-extra-keys-transformer)]
+    (testing "keeps only entries valid per key AND value schemas"
+      (is (= {:a 1} (b/decode [:map-of :keyword :int] {:a 1 :b "x"} t)))
+      (is (= {:a 1} (b/decode [:map-of :keyword :int] {:a 1 "c" 2} t)))
+      (is (= {:a 1} (b/encode [:map-of :keyword :int] {:a 1 :b "x"} t))))))
+
+;; ---------------------------------------------------------------------------
+;; default-value-transformer
+
+(deftest default-value-missing-vs-nil
+  (let [t (bt/default-value-transformer)]
+    (testing "missing non-optional key filled from entry props"
+      (is (= {:x 7} (b/decode [:map [:x {:default 7} :int]] {} t))))
+    (testing "missing key filled from value-schema props"
+      (is (= {:x 7} (b/decode [:map [:x [:int {:default 7}]]] {} t))))
+    (testing "present nil replaced only when the VALUE SCHEMA carries the default"
+      (is (= {:x 7} (b/decode [:map [:x [:int {:default 7}]]] {:x nil} t)))
+      (is (= {:x nil} (b/decode [:map [:x {:default 7} :int]] {:x nil} t))))
+    (testing "root nil replaced"
+      (is (= 7 (b/decode [:int {:default 7}] nil t)))
+      (is (= 5 (b/decode [:int {:default 7}] 5 t))))
+    (testing "optional keys not filled by default"
+      (is (= {} (b/decode [:map [:x {:optional true :default 7} :int]] {} t))))
+    (testing "encode fills too"
+      (is (= {:x 7} (b/encode [:map [:x {:default 7} :int]] {} t))))))
+
+(deftest default-value-options
+  (testing ":add-optional-keys fills optional entries"
+    (let [t (bt/default-value-transformer {:add-optional-keys true})]
+      (is (= {:x 7} (b/decode [:map [:x {:optional true :default 7} :int]] {} t)))))
+  (testing ":defaults per-type fns receive the ast node"
+    (let [t (bt/default-value-transformer {:defaults {:int (fn [_ast] 0)
+                                                      :string (fn [_ast] "")}})]
+      (is (= 0 (b/decode :int nil t)))
+      (is (= {:x 0 :s ""} (b/decode [:map [:x :int] [:s :string]] {} t)))))
+  (testing "custom :key"
+    (let [t (bt/default-value-transformer {:key :dflt})]
+      (is (= {:x 3} (b/decode [:map [:x {:dflt 3} :int]] {} t)))))
+  (testing "explicit nil default counts (contains?-based lookup)"
+    (let [t (bt/default-value-transformer)]
+      (is (= {:x nil} (b/decode [:map [:x {:default nil} :int]] {} t))))))
+
+;; ---------------------------------------------------------------------------
+;; key-transformer
+
+(deftest key-transformer-basics
+  (is (= {:x 1} (b/decode [:map [:x :int]] {"x" 1}
+                          (bt/key-transformer {:decode keyword}))))
+  (is (= {"x" 1} (b/encode [:map [:x :int]] {:x 1}
+                           (bt/key-transformer {:encode name})))))
+
+(deftest key-transformer-composes-with-string
+  (let [t (bt/transformer (bt/key-transformer {:decode keyword}) st)]
+    (is (= {:age 42} (b/decode [:map [:age :int]] {"age" "42"} t)))))
+
+;; ---------------------------------------------------------------------------
+;; collection-transformer
+
+(deftest collection-transformer-coercions
+  (let [t (bt/collection-transformer)]
+    (is (= [1 2] (b/decode [:vector :int] (list 1 2) t)))
+    (is (vector? (b/decode [:vector :int] #{1} t)))
+    (is (= #{1 2} (b/decode [:set :int] [1 2 2] t)))
+    (is (= [1 2] (b/decode [:tuple :int :int] (list 1 2) t)))
+    (let [r (b/decode [:sequential :int] [1 2] t)]
+      (is (sequential? r))
+      (is (= (list 1 2) r)))
+    (testing "empty stays valid sequential (documented deviation from malli's seq->nil)"
+      (is (sequential? (b/decode [:sequential :int] [] t))))))
+
+;; ---------------------------------------------------------------------------
+;; composition: chain order (decode) vs reversal (leave-phase encode)
+
+(deftest composition-order
+  (let [t1 {:name :t1
+            :decoders {:int (fn [x] (conj x :d1))}
+            :encoders {:int {:leave (fn [x] (conj x :e1))}}}
+        t2 {:name :t2
+            :decoders {:int (fn [x] (conj x :d2))}
+            :encoders {:int {:leave (fn [x] (conj x :e2))}}}
+        t (bt/transformer t1 t2)]
+    (testing "decode: enter interceptors run in chain order"
+      (is (= [:d1 :d2] (b/decode :int [] t))))
+    (testing "encode: leave interceptors run in reverse chain order"
+      (is (= [:e2 :e1] (b/encode :int [] t))))))
+
+(deftest transformer-composition-flattening
+  (is (nil? (bt/transformer)))
+  (is (nil? (bt/transformer nil nil)))
+  (is (= 2 (count (:chain (bt/transformer st {:name :extra})))))
+  (is (= 2 (count (:chain (bt/transformer nil st nil {:name :extra})))))
+  (testing "a 0-arg fn returning a transformer is accepted"
+    (is (= 42 (b/decode :int "42" bt/string-transformer)))
+    (is (= 1 (count (:chain (bt/transformer bt/string-transformer)))))))
+
+;; ---------------------------------------------------------------------------
+;; property overrides (real fns / interceptor maps / :compile)
+
+(deftest property-override-qualified
+  (is (= "ABC" (b/decode [:string {:decode/string (fn [s] (.upper s))}] "abc" st)))
+  (testing "override beats the type table"
+    (is (= 99 (b/decode [:int {:decode/string (fn [_] 99)}] "42" st))))
+  (testing "encode side"
+    (is (= "!x" (b/encode [:string {:encode/string (fn [s] (str "!" s))}] "x" st)))))
+
+(deftest property-override-method-map-wins-over-qualified
+  (is (= "map-form" (b/decode [:string {:decode {:string (fn [_] "map-form")}
+                                        :decode/string (fn [_] "qualified")}]
+                              "x" st))))
+
+(deftest property-override-interceptor-shapes
+  (testing "{:enter f :leave g}"
+    (is (= "<hi>" (b/decode [:string {:decode/string {:enter (fn [s] (str "<" s))
+                                                      :leave (fn [s] (str s ">"))}}]
+                            "hi" st))))
+  (testing "{:compile (fn [ast opts] ...)} receives the AST node"
+    (is (= [:string "hi"]
+           (b/decode [:string {:decode/string
+                               {:compile (fn [ast _opts]
+                                           (fn [x] [(:type ast) x]))}}]
+                     "hi" st)))))
+
+;; ---------------------------------------------------------------------------
+;; :or descent
+
+(deftest or-decode-first-validating-branch
+  (is (= 42 (b/decode [:or :int :keyword] "42" st)))
+  (testing "branch order matters (keyword branch would also accept)"
+    (is (= :42 (b/decode [:or :keyword :int] "42" st))))
+  (testing "no branch validates -> FIRST branch's transformed result"
+    (is (= 42 (b/decode [:or [:int {:min 100}] :boolean] "42" st)))))
+
+(deftest or-encode-first-valid-branch
+  (is (= "a" (b/encode [:or :int :keyword] :a st)))
+  (is (= "7" (b/encode [:or :int :keyword] 7 st)))
+  (testing "no branch accepts the raw value -> unchanged"
+    (is (= 1.5 (b/encode [:or :int :keyword] 1.5 st)))))
+
+;; ---------------------------------------------------------------------------
+;; :multi descent (dispatch on the post-enter value)
+
+(deftest multi-descent
+  (let [s [:multi {:dispatch :kind}
+           [:circle [:map [:kind :keyword] [:r :double]]]
+           [:rect [:map [:kind :keyword] [:w :int] [:h :int]]]]]
+    (is (= {:kind :circle :r 1.5}
+           (b/decode s {:kind :circle :r "1.5"} st)))
+    (is (= {:kind :rect :w 2 :h 3}
+           (b/decode s {:kind :rect :w "2" :h "3"} st)))
+    (testing "no matching branch -> pass-through"
+      (is (= {:kind :nope :r "1.5"} (b/decode s {:kind :nope :r "1.5"} st))))))
+
+(deftest multi-fn-dispatch
+  (let [s [:multi {:dispatch (fn [x] (:k x))}
+           [:a [:map [:k :keyword] [:v :int]]]]]
+    (is (= {:k :a :v 5} (b/decode s {:k :a :v "5"} st)))))
+
+;; ---------------------------------------------------------------------------
+;; :ref descent (lazy, memoized, recursion-safe)
+
+(deftest ref-descent-composition
+  (let [r (reg/registry {:user [:map [:id :int] [:tags [:set :keyword]]]})]
+    (testing "composition case: [:ref :user] decoding nested map keys' values"
+      (is (= {:alice {:id 1 :tags #{:a :b}}
+              :bob {:id 2 :tags #{:c}}}
+             (b/decode [:map-of :keyword [:ref :user]]
+                       {"alice" {:id "1" :tags ["a" "b"]}
+                        "bob" {:id "2" :tags ["c"]}}
+                       st
+                       {:registry r}))))))
+
+(deftest ref-recursive-decode
+  (let [r (reg/registry {:tree [:map [:v :int]
+                                [:kids {:optional true} [:vector [:ref :tree]]]]})]
+    (is (= {:v 1 :kids [{:v 2 :kids [{:v 3}]}]}
+           (b/decode [:ref :tree]
+                     {:v "1" :kids [{:v "2" :kids [{:v "3"}]}]}
+                     st
+                     {:registry r})))))
+
+;; ---------------------------------------------------------------------------
+;; coerce / coercer
+
+(deftest coerce-success-and-throw
+  (is (= 42 (b/coerce :int "42" st)))
+  (is (= {:age 42} (b/coerce [:map [:age :int]] {:age "42"} st)))
+  (testing "invalid after decode throws typed ex-info"
+    (let [data (try
+                 (b/coerce :int "x" jt)
+                 (catch python/Exception e (ex-data e)))]
+      (is (= :balli.core/coercion (:type data)))
+      (is (= "x" (:value data)))
+      (is (= :int (:schema data)))
+      (is (seq (:errors (:explain data)))))))
+
+(deftest coercer-fn
+  (let [cf (b/coercer [:vector :int] st)]
+    (is (= [1 2] (cf ["1" "2"])))
+    (is (= :balli.core/coercion
+           (try (cf ["1" "nope"])
+                (catch python/Exception e (:type (ex-data e))))))))
+
+(deftest coerce-with-registry-opts
+  (let [r (reg/registry {:age [:int {:min 0}]})]
+    (is (= {:a 30} (b/coerce [:map [:a [:ref :age]]] {:a "30"} st {:registry r})))))
+
+;; ---------------------------------------------------------------------------
+;; API plumbing: nil transformer, caching, validators unaffected
+
+(deftest nil-transformer-is-identity
+  (is (= "42" (b/decode :int "42" nil)))
+  (is (= "42" (b/encode :int "42" nil))))
+
+(deftest schema-object-coder-caching
+  (let [s (b/schema [:map [:x :int]])]
+    (testing "same transformer object -> identical cached coder"
+      (is (identical? (b/decoder s st) (b/decoder s st)))
+      (is (identical? (b/encoder s st) (b/encoder s st))))
+    (testing "decode and encode cache independently"
+      (is (not (identical? (b/decoder s st) (b/encoder s st)))))
+    (testing "validator/explainer still work on the same schema object"
+      (is (true? (b/validate s {:x 1})))
+      (is (= {:x 42} (b/decode s {:x "42"} st)))
+      (is (false? (b/validate s {:x "42"}))))))
+
+(deftest transformer-object-shape
+  (is (bt/transformer? st))
+  (is (not (bt/transformer? {:name :string})))
+  (is (int? (:id st)))
+  (is (vector? (:chain st))))

@@ -1,0 +1,293 @@
+(ns balli.util
+  "Schema utilities (Malli's malli.util, form->form).
+
+  Every fn accepts a raw schema form or a balli schema object and returns a
+  plain schema FORM (never a schema object). Entry introspection goes through
+  balli.normalize; `opts` (where accepted) supports {:registry r} for raw
+  forms — schema objects use their baked-in registry.
+
+  Refs are never dereferenced: a ref-valued entry participates as its form
+  (the bare keyword or [:ref k]), matching balli.core/walk's refs-not-entered
+  rule."
+  (:refer-basilisp :exclude [merge dissoc select-keys get get-in])
+  (:require [balli.core :as b]
+            [balli.normalize :as norm]
+            [balli.registry :as reg]))
+
+(def ^:private core-merge basilisp.core/merge)
+(def ^:private core-get basilisp.core/get)
+(def ^:private core-dissoc basilisp.core/dissoc)
+
+;; ---------------------------------------------------------------------------
+;; Introspection helpers
+
+(defn- ->ast
+  "Normalize `s` (raw form or schema object) to an AST node."
+  [s opts]
+  (if (b/schema? s)
+    (:ast s)
+    (norm/normalize s {:registry (or (:registry opts) (reg/default-registry))})))
+
+(defn- ->form
+  "The raw form of `s` (identity for raw forms)."
+  [s]
+  (if (b/schema? s) (b/form s) s))
+
+(defn- map-ast
+  "Normalize `s` and assert it is a :map schema."
+  [s opts fname]
+  (let [ast (->ast s opts)]
+    (when-not (= :map (:type ast))
+      (throw (ex-info (str fname " expects a :map schema")
+                      {:type :balli.core/invalid-schema :form (:form ast)})))
+    ast))
+
+(defn- entry-triple
+  "AST entry -> [key entry-props value-form]."
+  [{:keys [key properties schema]}]
+  [key properties (:form schema)])
+
+(defn- entry->form
+  [[k props vform]]
+  (if (seq props) [k props vform] [k vform]))
+
+(defn- map->form
+  "Rebuild a :map form from root `props` and a seq of entry triples."
+  [props entries]
+  (into (if (seq props) [:map props] [:map])
+        (map entry->form)
+        entries))
+
+;; ---------------------------------------------------------------------------
+;; merge / union
+;;
+;; Shared engine parameterized by a strategy:
+;;   :default  (fn [form1 form2]) — result when the two schemas are not both
+;;             :map (merge: s2 wins; union: s1 when equal, else [:or s1 s2])
+;;   :required (fn [required1? required2?]) — duplicate-entry requiredness
+;;             (merge: later entry wins; union: required only when required
+;;             in both — i.e. optional in either => optional)
+;; Both maps: root props shallow-merged (s2 over s1); entries iterate s1's
+;; then s2-only ones, preserving first-seen order; duplicate keys merge entry
+;; props (s2 over s1), apply the requiredness rule, and recurse on the value
+;; schemas (both nested :map => deep merge/union, else the :default rule).
+
+(defn- absorb-registry
+  "Thread a schema object's baked registry into opts so recursive merge-forms
+  calls (which pass raw child FORMS) resolve refs against the same registry.
+  Explicit opts registry wins; then s1's, then s2's."
+  [opts s]
+  (if (and (b/schema? s) (nil? (:registry opts)))
+    (assoc opts :registry (:registry s))
+    opts))
+
+(defn- merge-forms
+  [s1 s2 opts strategy]
+  (cond
+    (nil? s1) (->form s2)
+    (nil? s2) (->form s1)
+    :else
+    (let [opts (-> opts (absorb-registry s1) (absorb-registry s2))
+          a1 (->ast s1 opts)
+          a2 (->ast s2 opts)]
+      (if (and (= :map (:type a1)) (= :map (:type a2)))
+        (let [props (core-merge (:properties a1) (:properties a2))
+              e2-by-key (into {} (map (fn [e] [(:key e) e])) (:children a2))
+              e1-keys (set (map :key (:children a1)))
+              merged (mapv
+                      (fn [{:keys [key properties schema]}]
+                        (if-let [e2 (core-get e2-by-key key)]
+                          (let [p2 (:properties e2)
+                                required ((:required strategy)
+                                          (not (:optional properties))
+                                          (not (:optional p2)))
+                                eprops (core-merge properties p2)
+                                eprops (if required
+                                         (core-dissoc eprops :optional)
+                                         (assoc eprops :optional true))
+                                vform (merge-forms (:form schema)
+                                                   (:form (:schema e2))
+                                                   opts strategy)]
+                            [key eprops vform])
+                          (entry-triple {:key key :properties properties
+                                         :schema schema})))
+                      (:children a1))
+              extra (into []
+                          (comp (remove #(contains? e1-keys (:key %)))
+                                (map entry-triple))
+                          (:children a2))]
+          (map->form props (concat merged extra)))
+        ((:default strategy) (:form a1) (:form a2))))))
+
+(def ^:private merge-strategy
+  {:default (fn [_f1 f2] f2)
+   :required (fn [_r1 r2] r2)})
+
+(def ^:private union-strategy
+  {:default (fn [f1 f2] (if (= f1 f2) f1 [:or f1 f2]))
+   :required (fn [r1 r2] (and r1 r2))})
+
+(defn merge
+  "Merge two :map schema forms (nil either side => the other). Root props
+  shallow-merge (s2 wins); s1's entries keep their order, s2-only entries
+  append in s2 order; duplicate keys merge entry props, requiredness follows
+  the LATER entry, and value schemas deep-merge when both are :map (else
+  s2's wins). Not both :map => s2's form."
+  ([s1 s2] (merge s1 s2 {}))
+  ([s1 s2 opts] (merge-forms s1 s2 opts merge-strategy)))
+
+(defn union
+  "Union of two schema forms. Like `merge`, but duplicate-key (and
+  not-both-:map) value schemas combine as: equal forms => s1's, differing =>
+  [:or s1 s2]; an entry is optional when optional in EITHER side (required
+  only when required in both)."
+  ([s1 s2] (union s1 s2 {}))
+  ([s1 s2 opts] (merge-forms s1 s2 opts union-strategy)))
+
+;; ---------------------------------------------------------------------------
+;; Entry editing
+
+(defn select-keys
+  "Keep only the :map entries of `s` whose key is in `ks` (root props
+  preserved, entry order preserved)."
+  ([s ks] (select-keys s ks {}))
+  ([s ks opts]
+   (let [ast (map-ast s opts "select-keys")
+         ks (set ks)]
+     (map->form (:properties ast)
+                (into []
+                      (comp (filter #(contains? ks (:key %)))
+                            (map entry-triple))
+                      (:children ast))))))
+
+(defn dissoc
+  "Remove the :map entry of `s` keyed `k`."
+  ([s k] (dissoc s k {}))
+  ([s k opts]
+   (let [ast (map-ast s opts "dissoc")]
+     (map->form (:properties ast)
+                (into []
+                      (comp (remove #(= k (:key %)))
+                            (map entry-triple))
+                      (:children ast))))))
+
+(defn- set-requiredness
+  [s ks opts fname optional?]
+  (let [ast (map-ast s opts fname)
+        ks (when ks (set ks))]
+    (map->form (:properties ast)
+               (mapv (fn [{:keys [key properties] :as e}]
+                       (if (or (nil? ks) (contains? ks key))
+                         [key
+                          (if optional?
+                            (assoc properties :optional true)
+                            (core-dissoc properties :optional))
+                          (:form (:schema e))]
+                         (entry-triple e)))
+                     (:children ast)))))
+
+(defn optional-keys
+  "Set {:optional true} on the given :map entries (all entries when `ks` is
+  omitted or nil)."
+  ([s] (optional-keys s nil {}))
+  ([s ks] (optional-keys s ks {}))
+  ([s ks opts] (set-requiredness s ks opts "optional-keys" true)))
+
+(defn required-keys
+  "Remove :optional from the given :map entries (all entries when `ks` is
+  omitted or nil)."
+  ([s] (required-keys s nil {}))
+  ([s ks] (required-keys s ks {}))
+  ([s ks opts] (set-requiredness s ks opts "required-keys" false)))
+
+;; ---------------------------------------------------------------------------
+;; closed-schema / open-schema (recursive via balli.core/walk)
+
+(defn- map-form?
+  [form]
+  (or (= :map form)
+      (and (vector? form) (= :map (first form)))))
+
+(defn- split-map-form
+  "Rebuilt :map form -> [props entry-forms]. A leading map is always props
+  for :map forms."
+  [form]
+  (cond
+    (keyword? form) [{} []]
+    (map? (second form)) [(second form) (vec (drop 2 form))]
+    :else [{} (vec (rest form))]))
+
+(defn- rebuild-map-form
+  [props entry-forms]
+  (into (if (seq props) [:map props] [:map]) entry-forms))
+
+(defn closed-schema
+  "Recursively add {:closed true} to every :map schema in `s` that does not
+  explicitly carry {:closed false}. Returns a form."
+  ([s] (closed-schema s {}))
+  ([s opts]
+   (b/walk s
+           (fn [form _path]
+             (if (map-form? form)
+               (let [[props entries] (split-map-form form)]
+                 (if (false? (:closed props))
+                   form
+                   (rebuild-map-form (assoc props :closed true) entries)))
+               form))
+           opts)))
+
+(defn open-schema
+  "Recursively remove :closed from every :map schema in `s`, except maps
+  explicitly marked {:closed false} (kept as-is). Returns a form."
+  ([s] (open-schema s {}))
+  ([s opts]
+   (b/walk s
+           (fn [form _path]
+             (if (map-form? form)
+               (let [[props entries] (split-map-form form)]
+                 (if (or (false? (:closed props))
+                         (not (contains? props :closed)))
+                   form
+                   (rebuild-map-form (core-dissoc props :closed) entries)))
+               form))
+           opts)))
+
+;; ---------------------------------------------------------------------------
+;; get / get-in
+
+(def ^:private indexed-child-types
+  #{:maybe :not :vector :sequential :set :and :or :tuple :map-of
+    :cat :alt :? :* :+ :repeat :schema :=> :function})
+
+(defn get
+  "Sub-schema form of `s` at key/index `k`: :map/:multi/:orn/:catn/:altn
+  entries by entry key (tag), indexed children (:and/:or/:tuple/:maybe/:not/
+  colls/:map-of/:cat/:alt/:?/:*/:+/:repeat/:schema) by integer index. nil
+  when absent. Refs are not dereferenced."
+  ([s k] (get s k {}))
+  ([s k opts]
+   (let [ast (->ast s opts)
+         t (:type ast)]
+     (cond
+       (contains? #{:map :multi :orn :catn :altn} t)
+       (some (fn [{:keys [key schema]}]
+               (when (= key k) (:form schema)))
+             (:children ast))
+
+       (contains? indexed-child-types t)
+       (when (and (int? k) (<= 0 k) (< k (count (:children ast))))
+         (:form (nth (:children ast) k)))
+
+       :else nil))))
+
+(defn get-in
+  "`get` repeatedly along `ks`; nil as soon as any step is absent. Empty `ks`
+  returns the form of `s` itself."
+  ([s ks] (get-in s ks {}))
+  ([s ks opts]
+   (loop [cur s
+          ks (seq ks)]
+     (cond
+       (nil? cur) nil
+       (nil? ks) (->form cur)
+       :else (recur (get cur (first ks) opts) (next ks))))))

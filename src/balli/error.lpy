@@ -12,7 +12,13 @@
 
   Messages come from a default table keyed by error :type, with :min/:max
   interpolation for :balli.core/limits. An :error/message property on the
-  failing schema fragment (the error's :schema) overrides everything."
+  failing schema fragment (the error's :schema) overrides everything.
+
+  (with-spell-checking explain-map) is an opt-in pre-humanize rewrite that
+  turns extra-key / invalid-dispatch-value errors caused by likely typos
+  into :balli.error/misspelled-key / :balli.error/misspelled-value errors
+  (levenshtein distance vs the declared keys) and drops the missing-key
+  errors those typos explain."
   (:require [basilisp.string :as str]))
 
 ;; ---------------------------------------------------------------------------
@@ -58,7 +64,9 @@
    :sequential "should be sequential"
    :tuple "should be a tuple"
    :re "should be a string"
-   :nil "should be nil"})
+   :nil "should be nil"
+   :=> "should be a function"
+   :function "should be a function"})
 
 (def ^:private numeric-types #{:int :float :double :number})
 (def ^:private counted-types #{:vector :sequential :set :map-of})
@@ -101,7 +109,7 @@
 (defn- error-message
   "Message for a single error map. :error/message on the failing schema
   fragment's properties overrides the default table."
-  [{:keys [type schema]}]
+  [{:keys [type schema] :as error}]
   (let [[t props children] (split-form schema)]
     (or (:error/message props)
         (case type
@@ -112,7 +120,149 @@
           :balli.core/enum-mismatch (str "should be one of: " (str/join ", " children))
           :balli.core/not-eq (str "should be equal to " (first children))
           :balli.core/invalid-dispatch-value "invalid dispatch value"
+          :balli.core/end-of-input "end of input"
+          :balli.core/input-remaining "unexpected input"
+          (:balli.error/misspelled-key :balli.error/misspelled-value)
+          (str "should be spelled "
+               (str/join " or " (map (comp str last)
+                                     (:balli.error/likely-misspelling-of error))))
           "invalid value"))))
+
+;; ---------------------------------------------------------------------------
+;; Spell-checking (semantics §D)
+;;
+;; Opt-in rewrite of explain data BEFORE humanize:
+;;   (-> (b/explain schema value) with-spell-checking humanize)
+
+(defn levenshtein
+  "Levenshtein edit distance between (str a) and (str b). Iterative
+  full-matrix dynamic programming (row by row) — no recursion."
+  [a b]
+  (let [a (str a)
+        b (str b)
+        m (count a)
+        n (count b)]
+    (loop [i 1
+           prev (vec (range (inc n)))]
+      (if (> i m)
+        (nth prev n)
+        (recur (inc i)
+               (loop [j 1
+                      row [i]]
+                 (if (> j n)
+                   row
+                   (recur (inc j)
+                          (conj row
+                                (if (= (nth a (dec i)) (nth b (dec j)))
+                                  (nth prev (dec j))
+                                  (inc (min (nth prev (dec j))   ; substitute
+                                            (nth prev j)         ; delete
+                                            (nth row (dec j)))))))))))))) ; insert
+
+(defn- stripped-length
+  "Length of (str k) with a leading \":\" stripped (keyword colons do not
+  count toward the threshold length)."
+  [k]
+  (let [s (str k)]
+    (count (if (str/starts-with? s ":") (subs s 1) s))))
+
+(defn- threshold
+  "Maximum edit distance at which two keys count as similar, from the
+  SHORTER key's stripped length: <=2 -> 0, <=5 -> 1, <=6 -> 2, <=11 -> 3,
+  <=20 -> 4, else floor(0.2 * len)."
+  [a b]
+  (let [len (min (stripped-length a) (stripped-length b))]
+    (cond
+      (<= len 2) 0
+      (<= len 5) 1
+      (<= len 6) 2
+      (<= len 11) 3
+      (<= len 20) 4
+      :else (int (* 0.2 len)))))
+
+(defn- similar-keys
+  "Candidates within levenshtein threshold of k, sorted by ascending
+  distance (stable for ties)."
+  [k candidates]
+  (->> candidates
+       (keep (fn [c]
+               (let [d (levenshtein k c)]
+                 (when (<= d (threshold k c))
+                   [d c]))))
+       (sort-by first)
+       (mapv second)))
+
+(defn- entry-keys
+  "Keys of the entry children ([k schema] or [k props schema]) of a map or
+  multi schema form fragment."
+  [form]
+  (let [[_t _props children] (split-form form)]
+    (mapv first children)))
+
+(defn- check-extra-key
+  "Rewrite an :balli.core/extra-key error into :balli.error/misspelled-key
+  when the extra key is within edit-distance threshold of a declared key
+  that is ABSENT from the value at the parent path. nil when no candidate
+  is similar."
+  [value error]
+  (let [in (vec (:in error))
+        parent-in (vec (butlast in))
+        k (peek in)
+        at (get-in value parent-in)
+        present (if (map? at) (set (keys at)) #{})
+        candidates (remove present (entry-keys (:schema error)))
+        similar (similar-keys k candidates)]
+    (when (seq similar)
+      (assoc error
+             :type :balli.error/misspelled-key
+             :balli.error/likely-misspelling-of
+             (mapv #(conj parent-in %) similar)))))
+
+(defn- check-dispatch-value
+  "Rewrite an :balli.core/invalid-dispatch-value error on a keyword-dispatch
+  :multi into :balli.error/misspelled-value when the actual dispatch value
+  is within threshold of a dispatch key. nil for fn dispatch or when no
+  candidate is similar."
+  [error]
+  (let [[_t props _children] (split-form (:schema error))
+        d (:dispatch props)]
+    (when (keyword? d)
+      (let [v (:value error)
+            dv (when (map? v) (get v d))
+            similar (similar-keys dv (entry-keys (:schema error)))]
+        (when (seq similar)
+          (assoc error
+                 :type :balli.error/misspelled-value
+                 :balli.error/likely-misspelling-of
+                 (mapv #(conj (vec (:in error)) %) similar)))))))
+
+(defn with-spell-checking
+  "Rewrite an explain map's :errors with key/value spell-checking:
+    - :balli.core/extra-key within threshold of an absent declared key ->
+      :balli.error/misspelled-key + :balli.error/likely-misspelling-of
+      (vector of value paths to the likely intended keys, best match first)
+    - :balli.core/invalid-dispatch-value on a keyword-dispatch :multi ->
+      :balli.error/misspelled-value + :balli.error/likely-misspelling-of
+    - :balli.core/missing-key errors whose :in is a likely-misspelling
+      target are dropped (the key isn't missing — it's misspelled).
+  nil (valid input) passes through; explain maps with no matching errors
+  are returned unchanged."
+  [explain-map]
+  (when explain-map
+    (let [value (:value explain-map)
+          errors (mapv (fn [e]
+                         (or (case (:type e)
+                               :balli.core/extra-key (check-extra-key value e)
+                               :balli.core/invalid-dispatch-value (check-dispatch-value e)
+                               nil)
+                             e))
+                       (:errors explain-map))
+          targets (into #{} (mapcat :balli.error/likely-misspelling-of) errors)
+          errors (vec (remove (fn [e]
+                                (and (= :balli.core/missing-key (:type e))
+                                     (contains? targets (vec (:in e)))))
+                              errors))]
+      (assoc explain-map :errors errors))))
 
 ;; ---------------------------------------------------------------------------
 ;; Assembly by :in

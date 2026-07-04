@@ -5,6 +5,10 @@
     (compile-validator ast registry) -> 1-arg fn returning boolean
     (compile-explainer ast registry) -> fn [value path in] returning a vector
       of error maps {:path :in :schema <original-form-fragment> :value :type}
+    (compile-parser ast registry)    -> 1-arg fn returning the parsed value
+      or the sentinel :balli.core/invalid
+    (compile-unparser ast registry)  -> exact inverse of the parser, same
+      sentinel on mismatch
 
   Compilation walks the AST once, producing a closure tree — no per-call
   interpretation. Refs resolve eagerly at compile time (unresolved refs throw
@@ -12,9 +16,25 @@
   through a per-compilation cache atom (fn indirection), so recursive schemas
   (Phase 5) terminate on finite data."
   (:require [balli.normalize :as norm]
+            [balli.regex :as rx]
             [balli.registry :as reg]))
 
 (declare compile-node explain-node)
+
+;; ---------------------------------------------------------------------------
+;; Tag containers (parse/unparse)
+;;
+;; Tag wraps an :orn/:multi (and, once Phase 6 lands, :altn) branch parse as
+;; {:key <branch tag> :value <parsed>}; Tags will wrap :catn parses as
+;; {:values {tag parsed}}. They live HERE rather than in balli.core (the
+;; public surface, which re-exports tag/tag?/tags/tags? around them) because
+;; balli.core requires this namespace and the parser compilers below must
+;; construct and instance-check them -- defining them in balli.core would be
+;; a circular require. NOTE: records satisfy map? in Basilisp, so the :map
+;; parser guard below excludes them explicitly.
+
+(defrecord Tag [key value])
+(defrecord Tags [values])
 
 ;; ---------------------------------------------------------------------------
 ;; Helpers
@@ -138,6 +158,85 @@
                            registry cache)))
     (fn [x] ((get @cache k) x))))
 
+;; ---------------------------------------------------------------------------
+;; Sequence (regex) schemas
+;;
+;; Seqex nodes compile into balli.regex combinator trees. A child that is
+;; itself a seqex SPLICES (its combinator consumes from the parent's element
+;; stream); any other child gets single-element item semantics via its
+;; ordinary compiled validator/explainer/parser. [:schema <seqex>] therefore
+;; forces item semantics (compile-node on :schema derefs to the child's
+;; whole-input wrapper). A :ref directly in seqex child position throws
+;; :balli.core/potentially-recursive-seqex at compile time -- the engine's
+;; memo cache assumes a finite combinator tree, which recursion through the
+;; registry would break.
+
+(def ^:private regex-types
+  #{:cat :catn :alt :altn :? :* :+ :repeat})
+
+(defn regex-op?
+  "True when AST node `node` is a sequence (regex) operator whose combinator
+  splices into a parent seqex's element stream."
+  [node]
+  (contains? regex-types (:type node)))
+
+(defn- throw-recursive-seqex!
+  [node]
+  (throw (ex-info "Refs inside sequence schemas are potentially recursive; wrap the ref in [:schema ...] for single-element semantics"
+                  {:type :balli.core/potentially-recursive-seqex
+                   :ref (:ref node)
+                   :form (:form node)})))
+
+(defn- repeat-bounds
+  "[min max] for a :repeat node; missing :min -> 0, missing :max -> python
+  float inf (comparable with < in the engine)."
+  [node]
+  (let [props (:properties node)]
+    [(or (:min props) 0)
+     (or (:max props) (python/float "inf"))]))
+
+(defn- regex-validator
+  "Validator combinator for seqex AST `node` (raw -- not yet wrapped in the
+  engine's whole-input driver)."
+  [node registry cache]
+  (letfn [(child* [c]
+            (cond
+              (regex-op? c) (regex-validator c registry cache)
+              (= :ref (:type c)) (throw-recursive-seqex! c)
+              :else (rx/item-validator (compile-node c registry cache))))]
+    (case (:type node)
+      :cat (rx/cat* (mapv child* (:children node)))
+      :catn (rx/cat* (mapv #(child* (:schema %)) (:children node)))
+      :alt (rx/alt* (mapv child* (:children node)))
+      :altn (rx/alt* (mapv #(child* (:schema %)) (:children node)))
+      :? (rx/opt* (child* (first (:children node))))
+      :* (rx/star* (child* (first (:children node))))
+      :+ (rx/plus* (child* (first (:children node))))
+      :repeat (let [[mn mx] (repeat-bounds node)]
+                (rx/repeat* mn mx (child* (first (:children node))))))))
+
+(def regex-min-max
+  "Matched-element count bounds for seqex AST node `ast`: {:min n :max m},
+  :max absent when unbounded. Moved to balli.normalize in Phase 8 (so
+  :function normalization can check arity distinctness); re-exported here at
+  its original Phase 6 home."
+  norm/regex-min-max)
+
+;; ---------------------------------------------------------------------------
+;; Function schemas: :=> / :function (Phase 8)
+;;
+;; Validation is a callable check (fn-like?, below) UNLESS a function checker
+;; is in effect for this compilation -- then it is generative: the checker
+;; (see balli.generator/function-checker) generates input seqs from the input
+;; seqex, applies the value, and validates outputs; nil means all iterations
+;; passed. The checker threads into compile-node through the per-compilation
+;; cache atom under ::function-checker (the atom's other keys are ref
+;; keywords, which cannot collide with this namespaced key).
+
+;; Canonical fn-like? lives in balli.normalize (compile requires normalize;
+;; the reverse import would be circular). Re-exported here for the public API.
+(def fn-like? norm/fn-like?)
+
 (defn- compile-node
   [node registry cache]
   (case (:type node)
@@ -168,6 +267,12 @@
     (let [fns (mapv #(compile-node % registry cache) (:children node))]
       (fn [x] (boolean (some #(% x) fns))))
 
+    :orn
+    ;; validates exactly like :or; the entry tags only matter for explain
+    ;; :path and parse.
+    (let [fns (mapv #(compile-node (:schema %) registry cache) (:children node))]
+      (fn [x] (boolean (some #(% x) fns))))
+
     :vector (compile-coll vector? node registry cache)
     :sequential (compile-coll sequential? node registry cache)
     :set (compile-coll set? node registry cache)
@@ -188,14 +293,37 @@
       (fn [x] (boolean (and (string? x) (re-matches pattern x)))))
 
     :multi (compile-multi node registry cache)
-    :ref (compile-ref node registry cache)))
+    :ref (compile-ref node registry cache)
+
+    ;; transparent wrapper: validates exactly as its child
+    :schema (compile-node (first (:children node)) registry cache)
+
+    (:=> :function)
+    (if-some [checker (get @cache ::function-checker)]
+      (fn [x] (and (fn-like? x) (nil? (checker node x registry))))
+      (fn [x] (fn-like? x)))
+
+    (:cat :catn :alt :altn :? :* :+ :repeat)
+    (rx/validator (regex-validator node registry cache))))
+
+(defn- fresh-cache
+  "Per-compilation cache atom, seeded with the function checker from `opts`
+  (:balli.core/function-checker) when present so the :=>/:function compilers
+  can bake it into their closures."
+  [opts]
+  (atom (if-some [checker (:balli.core/function-checker opts)]
+          {::function-checker checker}
+          {})))
 
 (defn compile-validator
   "Compile AST node `ast` against `registry` into a 1-arg validator fn
   returning a boolean. Refs are resolved via the registry; unresolved refs
-  throw ex-info {:type :balli.core/unresolved-ref}."
-  [ast registry]
-  (compile-node ast registry (atom {})))
+  throw ex-info {:type :balli.core/unresolved-ref}. `opts` supports
+  {:balli.core/function-checker chk} -- when present, :=>/:function validate
+  generatively through the checker instead of by callable check."
+  ([ast registry] (compile-validator ast registry {}))
+  ([ast registry opts]
+   (compile-node ast registry (fresh-cache opts))))
 
 ;; ===========================================================================
 ;; Explainers
@@ -214,9 +342,12 @@
 ;;   - :and/:or branch       -> branch index to :path only
 ;;   - :maybe child          -> 0 to :path only (transparent in :in)
 ;;   - :multi child          -> dispatch key to :path only (transparent in :in)
-;;   - :or all-branches-fail -> single :balli.core/invalid error at the :or
-;;                              node (documented simplification vs Malli's
-;;                              per-branch errors)
+;;   - :or all-branches-fail -> every branch's errors concatenated in branch
+;;                              order, branch index appended to :path only
+;;                              (:in unchanged) — Malli semantics
+;;   - :orn                  -> like :or, but the entry TAG is appended to
+;;                              :path instead of the branch index
+;;   - :balli.core/invalid   -> reserved for :fn / :not / :re-mismatch only
 ;;   - :re non-match on a string -> :balli.core/invalid (non-strings get
 ;;                              :balli.core/invalid-type)
 
@@ -395,6 +526,34 @@
                            registry cache)))
     (fn [x path in] ((get @cache k) x path in))))
 
+(defn- regex-explainer
+  "Explainer combinator for seqex AST `node`. `rel-path` is the node's
+  schema path relative to the seqex ROOT -- item errors report at
+  (into base-path rel-path) where base-path is only known at runtime (the
+  engine's driver carries it). :cat/:alt children get their index appended,
+  :catn/:altn children their entry TAG, single-child ops 0."
+  [node registry cache rel-path]
+  (letfn [(child* [c p]
+            (cond
+              (regex-op? c) (regex-explainer c registry cache p)
+              (= :ref (:type c)) (throw-recursive-seqex! c)
+              :else (rx/item-explainer (explain-node c registry cache) p (:form c))))
+          (indexed [children]
+            (vec (map-indexed (fn [i c] (child* c (conj rel-path i))) children)))
+          (tagged [entries]
+            (mapv (fn [{:keys [key schema]}] (child* schema (conj rel-path key)))
+                  entries))]
+    (case (:type node)
+      :cat (rx/cat* (indexed (:children node)))
+      :catn (rx/cat* (tagged (:children node)))
+      :alt (rx/alt* (indexed (:children node)))
+      :altn (rx/alt* (tagged (:children node)))
+      :? (rx/opt* (child* (first (:children node)) (conj rel-path 0)))
+      :* (rx/star* (child* (first (:children node)) (conj rel-path 0)))
+      :+ (rx/plus* (child* (first (:children node)) (conj rel-path 0)))
+      :repeat (let [[mn mx] (repeat-bounds node)]
+                (rx/repeat* mn mx (child* (first (:children node)) (conj rel-path 0)))))))
+
 (defn- explain-node
   [node registry cache]
   (case (:type node)
@@ -442,12 +601,38 @@
                  (map-indexed vector fns)))))
 
     :or
+    ;; Per-branch errors (Malli semantics): a branch that validates makes the
+    ;; whole :or valid ([]); when ALL branches fail, every branch's errors are
+    ;; concatenated in branch order with the branch index appended to :path
+    ;; only (:in unchanged).
     (let [fns (mapv #(explain-node % registry cache) (:children node))
-          form (:form node)]
+          n (count fns)]
       (fn [x path in]
-        (if (some (fn [f] (empty? (f x path in))) fns)
-          []
-          [(err path in form x :balli.core/invalid)])))
+        (loop [i 0
+               acc (transient [])]
+          (if (>= i n)
+            (persistent! acc)
+            (let [errors ((nth fns i) x (conj path i) in)]
+              (if (empty? errors)
+                []
+                (recur (inc i) (into! acc errors))))))))
+
+    :orn
+    ;; like :or, except the entry TAG (not the branch index) is appended to
+    ;; :path (:in unchanged).
+    (let [fns (mapv (fn [c] [(:key c) (explain-node (:schema c) registry cache)])
+                    (:children node))
+          n (count fns)]
+      (fn [x path in]
+        (loop [i 0
+               acc (transient [])]
+          (if (>= i n)
+            (persistent! acc)
+            (let [[k f] (nth fns i)
+                  errors (f x (conj path k) in)]
+              (if (empty? errors)
+                []
+                (recur (inc i) (into! acc errors))))))))
 
     :vector (explain-coll vector? node registry cache)
     :sequential (explain-coll sequential? node registry cache)
@@ -477,12 +662,418 @@
           :else [(err path in form x :balli.core/invalid)])))
 
     :multi (explain-multi node registry cache)
-    :ref (explain-ref node registry cache)))
+    :ref (explain-ref node registry cache)
+
+    ;; transparent wrapper: explains exactly as its child (no :path segment)
+    :schema (explain-node (first (:children node)) registry cache)
+
+    ;; :=>/:function: non-callable -> invalid-type. With a checker in effect,
+    ;; a checker failure map is MERGED into a :balli.core/invalid-output
+    ;; error (pragmatic shape: the standard error keys plus the checker's
+    ;; :balli.core/result / :input / :output-errors keys).
+    (:=> :function)
+    (let [form (:form node)
+          checker (get @cache ::function-checker)]
+      (fn [x path in]
+        (cond
+          (not (fn-like? x))
+          [(err path in form x :balli.core/invalid-type)]
+
+          (nil? checker) []
+
+          :else
+          (if-some [failure (checker node x registry)]
+            [(merge (err path in form x :balli.core/invalid-output) failure)]
+            []))))
+
+    (:cat :catn :alt :altn :? :* :+ :repeat)
+    (rx/explainer (regex-explainer node registry cache []) (:form node))))
 
 (defn compile-explainer
   "Compile AST node `ast` against `registry` into an explainer fn
   [value path in] returning a vector of error maps (empty when valid).
   Error :schema carries the original form fragment stored on the AST node
-  as :form, not the AST itself."
+  as :form, not the AST itself. `opts` supports
+  {:balli.core/function-checker chk} -- see compile-validator."
+  ([ast registry] (compile-explainer ast registry {}))
+  ([ast registry opts]
+   (explain-node ast registry (fresh-cache opts))))
+
+;; ===========================================================================
+;; Parsers / Unparsers
+;;
+;; A parser is a 1-arg fn: value -> parsed value | :balli.core/invalid.
+;; An unparser is its exact inverse: parsed value -> original value | the
+;; same sentinel. Validate semantics carry through: a parser returns the
+;; sentinel exactly when the validator would return false, and otherwise a
+;; structure-preserving parse of the value. Non-transforming types parse as
+;; validate-then-value; :orn and :multi produce Tag records (Phase 6 will add
+;; :catn/:altn/seqex producing Tags/Tag/vectors). Both directions compile
+;; through one `coder-node` tree parameterized by `mode` (:parse | :unparse)
+;; -- each compilation is single-mode, so the ref cache (same eager-resolve +
+;; lazy fn-indirection pattern as validators/explainers, keyed by ref
+;; keyword) never mixes directions.
+
+(declare coder-node)
+
+(def ^:private -invalid :balli.core/invalid)
+
+(defn- -invalid?
+  ;; = (not identical?): Basilisp keyword literals reconstructed from cached
+  ;; namespace bytecode are NOT globally interned, so identity comparison
+  ;; against the sentinel keyword is unreliable across modules. Keyword = is
+  ;; a cheap name/ns compare.
+  [x]
+  (= -invalid x))
+
+(defn- transforming-parser?
+  "True when `node`'s parser produces structure rather than the value
+  itself: :orn/:multi (Tag) and ALL seqex types (:catn -> Tags, :altn ->
+  Tag, :cat/:alt/:?/:*/:+/:repeat -> reshaped vectors/values -- matching
+  malli, which marks every seqex parser as transforming), recursing through
+  :and/:or/:maybe/:schema children and through refs via the registry.
+  `visited` is the set of ref keywords already under analysis -- a ref cycle
+  counts as NON-transforming (the analysis terminates instead of looping)."
+  [node registry visited]
+  (case (:type node)
+    (:orn :multi :cat :catn :alt :altn :? :* :+ :repeat) true
+
+    (:and :or :maybe :schema)
+    (boolean (some #(transforming-parser? % registry visited) (:children node)))
+
+    :ref
+    (let [k (:ref node)
+          target (reg/resolve-ref registry k)]
+      (cond
+        (contains? visited k) false
+        (nil? target) (throw (ex-info "Unresolved ref"
+                                      {:type :balli.core/unresolved-ref :ref k}))
+        :else (transforming-parser? (norm/normalize target {:registry registry})
+                                    registry (conj visited k))))
+
+    false))
+
+(defn- coder-and
+  "Parser/unparser for :and. Parse goes through the single TRANSFORMING child
+  (see transforming-parser?) when exactly one exists, else through the first
+  child; in both cases every remaining child validates against the ORIGINAL
+  value -- the input on parse, the unparsed result on unparse. Two or more
+  transforming children throw ex-info {:type :balli.core/invalid-schema} at
+  compile time (refs need the registry, which normalize does not have)."
+  [node registry cache mode]
+  (let [children (:children node)
+        t-idxs (vec (keep-indexed
+                     (fn [i c] (when (transforming-parser? c registry #{}) i))
+                     children))]
+    (when (> (count t-idxs) 1)
+      (throw (ex-info ":and supports at most one transforming child in parse/unparse"
+                      {:type :balli.core/invalid-schema :form (:form node)})))
+    (let [idx (or (first t-idxs) 0)
+          coder (coder-node (nth children idx) registry cache mode)
+          validators (into []
+                           (comp (map-indexed vector)
+                                 (remove (fn [[i _]] (= i idx)))
+                                 (map (fn [[_ c]] (compile-node c registry (atom {})))))
+                           children)]
+      (if (= :parse mode)
+        (fn [x]
+          (if (every? #(% x) validators)
+            (coder x)
+            -invalid))
+        (fn [x]
+          (let [v (coder x)]
+            (if (or (-invalid? v) (not (every? #(% v) validators)))
+              -invalid
+              v)))))))
+
+(defn- coder-orn
+  "Parse: Tag of the first branch whose parse is not invalid. Unparse: a Tag
+  with a known :key unparses its :value via that branch; anything else is
+  invalid."
+  [node registry cache mode]
+  (if (= :parse mode)
+    (let [entries (mapv (fn [{:keys [key schema]}]
+                          [key (coder-node schema registry cache mode)])
+                        (:children node))
+          n (count entries)]
+      (fn [x]
+        (loop [i 0]
+          (if (>= i n)
+            -invalid
+            (let [[k f] (nth entries i)
+                  r (f x)]
+              (if (-invalid? r)
+                (recur (inc i))
+                (->Tag k r)))))))
+    (let [table (into {}
+                      (map (fn [{:keys [key schema]}]
+                             [key (coder-node schema registry cache mode)]))
+                      (:children node))]
+      (fn [x]
+        (if (instance? Tag x)
+          (if-some [f (get table (:key x))]
+            (f (:value x))
+            -invalid)
+          -invalid)))))
+
+(defn- coder-multi
+  "Parse: Tag(dispatch-value, branch-parse); no matching branch or invalid
+  branch parse -> invalid. Unparse: the Tag :key IS the dispatch value --
+  unparse the :value via that branch."
+  [node registry cache mode]
+  (let [table (into {}
+                    (map (fn [c] [(:key c) (coder-node (:schema c) registry cache mode)]))
+                    (:children node))]
+    (if (= :parse mode)
+      (let [d (:dispatch (:properties node))
+            dispatch-fn (if (keyword? d) (fn [x] (get x d)) d)]
+        (fn [x]
+          (let [dv (try
+                     (dispatch-fn x)
+                     (catch python/Exception _ ::dispatch-threw))]
+            (if-some [f (get table dv)]
+              (let [r (f x)]
+                (if (-invalid? r)
+                  -invalid
+                  (->Tag dv r)))
+              -invalid))))
+      (fn [x]
+        (if (instance? Tag x)
+          (if-some [f (get table (:key x))]
+            (f (:value x))
+            -invalid)
+          -invalid)))))
+
+(defn- coder-map
+  "Parse/unparse entry values; the result stays a map (non-entry keys pass
+  through untouched). The guard excludes Tag/Tags records explicitly --
+  records satisfy map? in Basilisp, so parsed :orn/:multi output could
+  otherwise masquerade as plain map data. Validate semantics carry through:
+  missing required key or a closed map with extra keys -> invalid."
+  [node registry cache mode]
+  (let [entries (mapv (fn [{:keys [key properties schema]}]
+                        {:k key
+                         :optional (boolean (:optional properties))
+                         :f (coder-node schema registry cache mode)})
+                      (:children node))
+        n (count entries)
+        closed (boolean (:closed (:properties node)))
+        known (set (map :k entries))]
+    (fn [x]
+      (if (and (map? x)
+               (not (instance? Tag x))
+               (not (instance? Tags x))
+               (or (not closed)
+                   (every? #(contains? known %) (keys x))))
+        (loop [i 0
+               acc x]
+          (if (>= i n)
+            acc
+            (let [{:keys [k optional f]} (nth entries i)]
+              (if (contains? acc k)
+                (let [r (f (get acc k))]
+                  (if (-invalid? r)
+                    -invalid
+                    (recur (inc i) (assoc acc k r))))
+                (if optional
+                  (recur (inc i) acc)
+                  -invalid)))))
+        -invalid))))
+
+(defn- coder-map-of
+  "Parse/unparse both keys and values; any invalid entry -> invalid."
+  [node registry cache mode]
+  (let [kf (coder-node (nth (:children node) 0) registry cache mode)
+        vf (coder-node (nth (:children node) 1) registry cache mode)
+        props (:properties node)
+        mn (:min props)
+        mx (:max props)]
+    (fn [x]
+      (if (and (map? x)
+               (or (nil? mn) (<= mn (count x)))
+               (or (nil? mx) (<= (count x) mx)))
+        (loop [s (seq x)
+               acc {}]
+          (if s
+            (let [[k v] (first s)
+                  k* (kf k)]
+              (if (-invalid? k*)
+                -invalid
+                (let [v* (vf v)]
+                  (if (-invalid? v*)
+                    -invalid
+                    (recur (next s) (assoc acc k* v*))))))
+            acc))
+        -invalid))))
+
+(defn- coder-coll
+  "Per-element parse/unparse; any invalid element -> invalid. :vector and
+  :sequential rebuild as vectors (sequential equality makes round-trips on
+  lists/seqs compare equal), :set as a set."
+  [coll-pred node registry cache mode]
+  (let [f (coder-node (first (:children node)) registry cache mode)
+        props (:properties node)
+        mn (:min props)
+        mx (:max props)
+        to-set (= :set (:type node))]
+    (fn [x]
+      (if (and (coll-pred x)
+               (or (nil? mn) (<= mn (count x)))
+               (or (nil? mx) (<= (count x) mx)))
+        (loop [s (seq x)
+               acc (transient [])]
+          (if s
+            (let [r (f (first s))]
+              (if (-invalid? r)
+                -invalid
+                (recur (next s) (conj! acc r))))
+            (let [v (persistent! acc)]
+              (if to-set (set v) v))))
+        -invalid))))
+
+(defn- coder-tuple
+  [node registry cache mode]
+  (let [fns (mapv #(coder-node % registry cache mode) (:children node))
+        n (count fns)]
+    (fn [x]
+      (if (and (vector? x) (= n (count x)))
+        (loop [i 0
+               acc x]
+          (if (>= i n)
+            acc
+            (let [r ((nth fns i) (nth acc i))]
+              (if (-invalid? r)
+                -invalid
+                (recur (inc i) (assoc acc i r))))))
+        -invalid))))
+
+(defn- coder-ref
+  "Same eager-resolve + lazy fn-indirection pattern as compile-ref/explain-ref,
+  caching coders keyed by ref keyword (single-mode per compilation, so parse
+  and unparse entries never mix)."
+  [node registry cache mode]
+  (let [k (:ref node)
+        target (reg/resolve-ref registry k)]
+    (when (nil? target)
+      (throw (ex-info "Unresolved ref" {:type :balli.core/unresolved-ref :ref k})))
+    (when-not (contains? @cache k)
+      (swap! cache assoc k ::compiling)
+      (swap! cache assoc k
+             (coder-node (norm/normalize target {:registry registry})
+                         registry cache mode)))
+    (fn [x] ((get @cache k) x))))
+
+(defn- regex-parser
+  "Parser combinator for seqex AST `node`. Parse shapes: :cat -> vector,
+  :catn -> Tags, :alt -> matched value, :altn -> Tag, :? -> value-or-nil,
+  :*/:+/:repeat -> vector; nested seqex children nest (their parse shape
+  becomes one element of the parent's)."
+  [node registry cache]
+  (letfn [(child* [c]
+            (cond
+              (regex-op? c) (regex-parser c registry cache)
+              (= :ref (:type c)) (throw-recursive-seqex! c)
+              :else (rx/item-parser (coder-node c registry cache :parse))))
+          (tagged [entries]
+            (mapv (fn [{:keys [key schema]}] [key (child* schema)]) entries))]
+    (case (:type node)
+      :cat (rx/cat-parser (mapv child* (:children node)))
+      :catn (rx/catn-parser ->Tags (tagged (:children node)))
+      :alt (rx/alt-parser (mapv child* (:children node)))
+      :altn (rx/altn-parser ->Tag (tagged (:children node)))
+      :? (rx/opt-parser (child* (first (:children node))))
+      :* (rx/star-parser (child* (first (:children node))))
+      :+ (rx/plus-parser (child* (first (:children node))))
+      :repeat (let [[mn mx] (repeat-bounds node)]
+                (rx/repeat-parser mn mx (child* (first (:children node))))))))
+
+(defn- regex-unparser
+  "Unparser for seqex AST `node`: a plain fn inverting the parse (no engine
+  run) -- validates the parse shape, unparses each part, and concat-splices
+  child sequences back into a flat vector; :balli.core/invalid on any
+  mismatch. The root unparser's result IS the unparsed sequence."
+  [node registry cache]
+  (letfn [(child* [c]
+            (cond
+              (regex-op? c) (regex-unparser c registry cache)
+              (= :ref (:type c)) (throw-recursive-seqex! c)
+              :else (rx/item-unparser (coder-node c registry cache :unparse))))
+          (tagged [entries]
+            (mapv (fn [{:keys [key schema]}] [key (child* schema)]) entries))]
+    (case (:type node)
+      :cat (rx/cat-unparser (mapv child* (:children node)))
+      :catn (rx/catn-unparser (fn [x] (instance? Tags x)) (tagged (:children node)))
+      :alt (rx/alt-unparser (mapv child* (:children node)))
+      :altn (rx/altn-unparser (fn [x] (instance? Tag x)) (tagged (:children node)))
+      :? (rx/opt-unparser (child* (first (:children node))))
+      :* (rx/star-unparser (child* (first (:children node))))
+      :+ (rx/plus-unparser (child* (first (:children node))))
+      :repeat (let [[mn mx] (repeat-bounds node)]
+                (rx/repeat-unparser mn mx (child* (first (:children node))))))))
+
+(defn- coder-node
+  [node registry cache mode]
+  (case (:type node)
+    ;; non-transforming leaves: parse == unparse == validate-then-value.
+    ;; :=>/:function parse with the PLAIN callable check -- function checkers
+    ;; are a validate/explain concern only, never part of parse.
+    (:any :nil :string :int :float :double :number :boolean :keyword :symbol
+          :uuid :enum := :fn :re :not :=> :function)
+    (let [valid? (compile-node node registry (atom {}))]
+      (fn [x] (if (valid? x) x -invalid)))
+
+    :maybe
+    (let [f (coder-node (first (:children node)) registry cache mode)]
+      (fn [x] (if (nil? x) nil (f x))))
+
+    :or
+    ;; first branch whose parse/unparse is not invalid -- untagged (branch
+    ;; results pass through as-is).
+    (let [fns (mapv #(coder-node % registry cache mode) (:children node))
+          n (count fns)]
+      (fn [x]
+        (loop [i 0]
+          (if (>= i n)
+            -invalid
+            (let [r ((nth fns i) x)]
+              (if (-invalid? r)
+                (recur (inc i))
+                r))))))
+
+    :orn (coder-orn node registry cache mode)
+    :and (coder-and node registry cache mode)
+    :multi (coder-multi node registry cache mode)
+
+    :vector (coder-coll vector? node registry cache mode)
+    :sequential (coder-coll sequential? node registry cache mode)
+    :set (coder-coll set? node registry cache mode)
+
+    :tuple (coder-tuple node registry cache mode)
+    :map (coder-map node registry cache mode)
+    :map-of (coder-map-of node registry cache mode)
+    :ref (coder-ref node registry cache mode)
+
+    ;; transparent wrapper: parses/unparses exactly as its child
+    :schema (coder-node (first (:children node)) registry cache mode)
+
+    (:cat :catn :alt :altn :? :* :+ :repeat)
+    (if (= :parse mode)
+      (rx/parser (regex-parser node registry cache))
+      (regex-unparser node registry cache))))
+
+(defn compile-parser
+  "Compile AST node `ast` against `registry` into a 1-arg parser fn:
+  value -> parsed value | :balli.core/invalid. :orn/:multi parse into Tag
+  records; everything else is structure-preserving. An :and with two or more
+  transforming children throws ex-info {:type :balli.core/invalid-schema}
+  here (compile time), not at normalize -- the analysis derefs refs, which
+  needs the registry."
   [ast registry]
-  (explain-node ast registry (atom {})))
+  (coder-node ast registry (atom {}) :parse))
+
+(defn compile-unparser
+  "Compile AST node `ast` against `registry` into a 1-arg unparser fn -- the
+  exact inverse of compile-parser: parsed value -> original value |
+  :balli.core/invalid."
+  [ast registry]
+  (coder-node ast registry (atom {}) :unparse))

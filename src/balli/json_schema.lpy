@@ -1,0 +1,220 @@
+(ns balli.json-schema
+  "Schema -> JSON Schema export (Malli's malli.json-schema).
+
+  `transform` takes a raw schema form or a balli schema object (plus optional
+  opts {:registry r}, ignored when given a schema object -- its baked-in
+  registry wins) and returns a STRING-KEYED Basilisp map shaped like a JSON
+  Schema document (draft 2020-12: :tuple uses prefixItems + items false).
+
+  Per-node result (mirrors Malli's -json-schema-walker):
+
+    (or (:json-schema props)                     ; whole-node override, verbatim
+        (merge {title/description/default}       ; passthrough props
+               (generated type mapping)
+               (unlifted :json-schema/* props))) ; :json-schema/foo -> \"foo\", wins
+
+  Keywords render as name strings (\"ns/name\" when qualified) -- map keys,
+  :enum values, := consts, :default values.
+
+  Refs emit {\"$ref\" \"#/definitions/<name>\"} with the name JSON-Pointer
+  escaped per RFC 6901 (~ -> ~0 FIRST, then / -> ~1); the top-level
+  \"definitions\" map (attached only when non-empty) is keyed by the
+  UNESCAPED name. Recursion is guarded by marking a ref visited before
+  recursing into its target, so recursive registries terminate. Unresolved
+  refs throw ex-info {:type :balli.core/unresolved-ref} (same contract as
+  the validator compiler).
+
+  The output is Basilisp data, not Python data: feed it to python json.dumps
+  via a small clj->py conversion (or `basilisp.json/write-str`, which accepts
+  it directly)."
+  (:require [balli.core :as b]
+            [balli.normalize :as norm]
+            [balli.registry :as reg]))
+
+(declare ^:private -transform)
+
+;; ---------------------------------------------------------------------------
+;; Rendering helpers
+
+(defn- kw->str
+  "Render keyword `k` as its JSON name string: \"name\", or \"ns/name\" when
+  qualified. Implemented as (subs (str k) 1) so it round-trips whatever the
+  keyword actually holds (including ~ and / characters)."
+  [k]
+  (subs (str k) 1))
+
+(defn- render-value
+  "Render a literal value for JSON output: keywords become name strings,
+  recursively inside maps/vectors/sets/seqs (sets and seqs become vectors);
+  everything else passes through as-is."
+  [v]
+  (cond
+    (keyword? v) (kw->str v)
+    (map? v) (into {} (map (fn [[k x]] [(render-value k) (render-value x)]) v))
+    (or (vector? v) (set? v) (seq? v)) (mapv render-value v)
+    :else v))
+
+(defn- escape-pointer
+  "JSON Pointer escaping per RFC 6901: ~ -> ~0 FIRST, then / -> ~1 (the
+  order matters -- reversing it would corrupt names containing ~1)."
+  [s]
+  (-> s (.replace "~" "~0") (.replace "/" "~1")))
+
+(defn- with-min-max
+  "Attach :min/:max from `props` to map `m` under `min-key`/`max-key` when
+  present. The key pair encodes the per-type-family translation (minLength,
+  minimum, minItems, minProperties, ...)."
+  [m props min-key max-key]
+  (cond-> m
+    (contains? props :min) (assoc min-key (:min props))
+    (contains? props :max) (assoc max-key (:max props))))
+
+(defn- infer-enum-type
+  "Inferred JSON Schema \"type\" for :enum values, mirroring Malli's -infer
+  order: all strings -> string, all keywords -> string (they render as
+  strings), all ints -> integer, all doubles -> number; otherwise nil (no
+  type emitted)."
+  [values]
+  (cond
+    (every? string? values) "string"
+    (every? keyword? values) "string"
+    (every? int? values) "integer"
+    (every? float? values) "number"
+    :else nil))
+
+;; ---------------------------------------------------------------------------
+;; Per-type mapping
+
+(defn- transform-ref
+  "Emit {\"$ref\" \"#/definitions/<escaped-name>\"} for ref node `node`,
+  transforming the target into (:definitions ctx) under the UNESCAPED name.
+  Marks the ref visited BEFORE recursing so recursive schemas terminate."
+  [node registry ctx]
+  (let [k (:ref node)
+        ref-name (kw->str k)]
+    (when-not (contains? @(:visited ctx) k)
+      (swap! (:visited ctx) conj k)
+      (let [target (reg/resolve-ref registry k)]
+        (when (nil? target)
+          (throw (ex-info "Unresolved ref"
+                          {:type :balli.core/unresolved-ref :ref k})))
+        (let [ast (norm/normalize target {:registry registry})]
+          (swap! (:definitions ctx) assoc ref-name (-transform ast registry ctx)))))
+    {"$ref" (str "#/definitions/" (escape-pointer ref-name))}))
+
+(defn- transform-map
+  "\"properties\" from entry values, \"required\" from non-optional keys
+  (omitted when empty), \"additionalProperties\" false when {:closed true}."
+  [node registry ctx]
+  (let [entries (:children node)
+        properties (into {}
+                         (map (fn [{:keys [key schema]}]
+                                [(render-value key) (-transform schema registry ctx)])
+                              entries))
+        required (mapv #(render-value (:key %))
+                       (remove #(:optional (:properties %)) entries))]
+    (cond-> {"type" "object" "properties" properties}
+      (seq required) (assoc "required" required)
+      (:closed (:properties node)) (assoc "additionalProperties" false))))
+
+(defn- -accept
+  "The generated JSON Schema fragment for AST `node` (the §B type mapping
+  table), before title/description/default and :json-schema/* merging."
+  [node registry ctx]
+  (let [props (:properties node)
+        children (:children node)
+        child #(-transform % registry ctx)]
+    (case (:type node)
+      ;; :=>/:function: JSON Schema has no function values -- lossy {} like :fn
+      (:any :fn :=> :function) {}
+      :nil {"type" "null"}
+      :string (with-min-max {"type" "string"} props "minLength" "maxLength")
+      :int (with-min-max {"type" "integer"} props "minimum" "maximum")
+      (:float :double :number) (with-min-max {"type" "number"} props "minimum" "maximum")
+      :boolean {"type" "boolean"}
+      (:keyword :symbol) {"type" "string"}
+      :uuid {"type" "string" "format" "uuid"}
+      := {"const" (render-value (first children))}
+      :enum (let [t (infer-enum-type children)]
+              (cond-> {"enum" (mapv render-value children)}
+                t (assoc "type" t)))
+      :not {"not" (child (first children))}
+      :and {"allOf" (mapv child children)}
+      :or {"anyOf" (mapv child children)}
+      ;; entry tags are a parse-time concern -- JSON Schema sees the branches
+      :orn {"anyOf" (mapv #(child (:schema %)) children)}
+      :maybe {"oneOf" [(child (first children)) {"type" "null"}]}
+      :multi {"oneOf" (mapv #(child (:schema %)) children)}
+      :map-of (with-min-max {"type" "object"
+                             "additionalProperties" (child (second children))}
+                props "minProperties" "maxProperties")
+      (:vector :sequential) (with-min-max {"type" "array"
+                                           "items" (child (first children))}
+                              props "minItems" "maxItems")
+      :set (with-min-max {"type" "array"
+                          "items" (child (first children))
+                          "uniqueItems" true}
+             props "minItems" "maxItems")
+      :tuple {"type" "array" "prefixItems" (mapv child children) "items" false}
+      ;; :re children hold a compiled python re.Pattern; .-pattern is source
+      :re {"type" "string" "pattern" (.-pattern (first children))}
+      :map (transform-map node registry ctx)
+      :ref (transform-ref node registry ctx)
+      ;; :schema is transparent
+      :schema (child (first children))
+      ;; Sequence (regex) schemas export as a best-effort LOSSY array --
+      ;; JSON Schema has no regex-of-sequences. "items" is attached only
+      ;; when every (branch) child maps to ONE distinct schema; ordering,
+      ;; arity, and per-position typing are all lost.
+      (:? :* :+ :repeat) {"type" "array" "items" (child (first children))}
+      (:cat :alt) (let [items (vec (distinct (mapv child children)))]
+                    (if (= 1 (count items))
+                      {"type" "array" "items" (first items)}
+                      {"type" "array"}))
+      (:catn :altn) (let [items (vec (distinct (mapv #(child (:schema %)) children)))]
+                      (if (= 1 (count items))
+                        {"type" "array" "items" (first items)}
+                        {"type" "array"})))))
+
+(defn- -transform
+  "AST node -> JSON Schema map. Property layering per the ns docstring:
+  whole-node :json-schema override short-circuits (returned verbatim,
+  children not visited); otherwise title/description/default under the
+  generated mapping under unlifted :json-schema/* props (unlift wins)."
+  [node registry ctx]
+  (let [props (:properties node)]
+    (if (contains? props :json-schema)
+      (:json-schema props)
+      (let [base (cond-> {}
+                   (contains? props :title) (assoc "title" (:title props))
+                   (contains? props :description) (assoc "description" (:description props))
+                   (contains? props :default) (assoc "default" (render-value (:default props))))
+            unlifted (into {}
+                           (keep (fn [[k v]]
+                                   (when (and (keyword? k) (= "json-schema" (namespace k)))
+                                     [(name k) v]))
+                                 props))]
+        (merge base (-accept node registry ctx) unlifted)))))
+
+;; ---------------------------------------------------------------------------
+;; Public API
+
+(defn transform
+  "Export schema `s` (raw form or schema object) as a JSON Schema: a
+  string-keyed Basilisp map. `opts` supports {:registry r} for raw forms
+  (ignored when `s` is a schema object). When any refs were reached, the
+  top-level map carries \"definitions\" keyed by unescaped ref names."
+  ([s] (transform s {}))
+  ([s opts]
+   (let [registry (if (b/schema? s)
+                    (:registry s)
+                    (or (:registry opts) (reg/default-registry)))
+         ast (if (b/schema? s)
+               (:ast s)
+               (norm/normalize s {:registry registry}))
+         ctx {:definitions (atom {}) :visited (atom #{})}
+         out (-transform ast registry ctx)
+         defs @(:definitions ctx)]
+     (if (and (map? out) (seq defs))
+       (assoc out "definitions" defs)
+       out))))
