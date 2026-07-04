@@ -1,0 +1,314 @@
+(ns tests.test-function
+  "Phase 8: function schemas per malli-semantics section G. :=>/:function
+  normalization (input must be a literal :cat/:catn, distinct :function
+  arities, at most one varargs), the fn-like? callable predicate (false for
+  keywords/maps/sets/vectors/symbols despite python/callable being true for
+  all of them), generative checking via balli.generator/function-checker and
+  its exact checker/caching contract (raw-form opts bypass the global cache;
+  schema objects bake the checker; call-time opts on schema objects are
+  IGNORED), instrument (arity/input/output/guard reporting, :function
+  multi-arity dispatch, varargs composition), function-info, and :=>/
+  :function generation."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.generator :as bg]
+            [balli.json-schema :as bjs]))
+
+(defn- ex-type
+  [thunk]
+  (try
+    (thunk)
+    nil
+    (catch python/Exception e
+      (:type (ex-data e)))))
+
+(def =>int->int [:=> [:cat :int] :int])
+
+;; ---------------------------------------------------------------------------
+;; Plain validate: the fn-like? predicate
+
+(deftest validates-function-like-values
+  (testing "Basilisp fns"
+    (is (true? (b/validate =>int->int inc)))
+    (is (true? (b/validate =>int->int (fn [x] (* 2 x))))))
+  (testing "Python builtins and bound methods (callable, not fn?)"
+    (is (true? (b/validate =>int->int python/abs)))
+    (is (true? (b/validate =>int->int (.-upper "a")))))
+  (testing ":function accepts callables too"
+    (is (true? (b/validate [:function =>int->int] inc)))))
+
+(deftest rejects-false-callables
+  ;; python/callable is TRUE for all of these (they implement __call__) --
+  ;; the combined predicate must still reject them as :=> values.
+  (doseq [v [:kw {:a 1} {} [1 2] [] #{1} 'sym]]
+    (is (false? (b/validate =>int->int v)) (str "should reject " (pr-str v)))
+    (is (false? (b/validate [:function =>int->int] v))))
+  (testing "plain non-callables"
+    (is (false? (b/validate =>int->int 5)))
+    (is (false? (b/validate =>int->int "s")))
+    (is (false? (b/validate =>int->int nil)))))
+
+(deftest explain-plain-invalid-type
+  (let [ex (b/explain =>int->int :kw)]
+    (is (= :balli.core/invalid-type (:type (first (:errors ex)))))
+    (is (= =>int->int (:schema (first (:errors ex))))))
+  (is (nil? (b/explain =>int->int inc))))
+
+;; ---------------------------------------------------------------------------
+;; Normalization errors
+
+(deftest normalize-errors
+  (testing ":=> input must be a literal :cat/:catn"
+    (is (= :balli.core/invalid-input-schema
+           (ex-type #(b/schema [:=> :int :int]))))
+    (is (= :balli.core/invalid-input-schema
+           (ex-type #(b/schema [:=> [:vector :int] :int]))))
+    ;; [:schema [:cat ...]] wrappers are rejected too (MVP: literal only)
+    (is (= :balli.core/invalid-input-schema
+           (ex-type #(b/schema [:=> [:schema [:cat :int]] :int])))))
+  (testing ":catn input is accepted"
+    (is (true? (b/validate [:=> [:catn [:x :int]] :int] inc))))
+  (testing ":=> child count"
+    (is (= :balli.core/invalid-schema (ex-type #(b/schema [:=>]))))
+    (is (= :balli.core/invalid-schema (ex-type #(b/schema [:=> [:cat :int]]))))
+    (is (= :balli.core/invalid-schema
+           (ex-type #(b/schema [:=> [:cat :int] :int :any :any])))))
+  (testing ":function children must be :=>"
+    (is (= :balli.core/invalid-schema (ex-type #(b/schema [:function]))))
+    (is (= :balli.core/invalid-schema (ex-type #(b/schema [:function :int])))))
+  (testing ":function arities must be distinct (by {:min :max} pair)"
+    (is (= :balli.core/invalid-schema
+           (ex-type #(b/schema [:function
+                                [:=> [:cat :int] :int]
+                                [:=> [:cat :string] :string]])))))
+  (testing "at most one varargs child"
+    (is (= :balli.core/invalid-schema
+           (ex-type #(b/schema [:function
+                                [:=> [:cat [:* :int]] :int]
+                                [:=> [:cat :int [:* :int]] :int]])))))
+  (testing "distinct arities + one varargs is fine"
+    (is (b/schema? (b/schema [:function
+                              [:=> [:cat :int] :int]
+                              [:=> [:cat :int :int] :int]
+                              [:=> [:cat :int :int :int [:* :int]] :int]])))))
+
+;; ---------------------------------------------------------------------------
+;; Generative checking (function-checker)
+
+(deftest checker-catches-wrong-fn
+  (let [chk (bg/function-checker)]
+    (testing "schema says int->int, str returns strings"
+      (is (false? (b/validate =>int->int str {:balli.core/function-checker chk}))))
+    (testing "a correct fn passes"
+      (is (true? (b/validate =>int->int inc {:balli.core/function-checker chk}))))
+    (testing "wrong arity raises inside the check -> failure"
+      (is (false? (b/validate =>int->int (fn [x y] (+ x y))
+                              {:balli.core/function-checker chk}))))
+    (testing "non-callables still fail the callable pre-check"
+      (is (false? (b/validate =>int->int :kw {:balli.core/function-checker chk}))))
+    (testing ":function checks every :=> child"
+      (let [fs [:function [:=> [:cat :int] :int] [:=> [:cat :int :int] :int]]]
+        (is (true? (b/validate fs (fn ([x] (inc x)) ([x y] (+ x y)))
+                               {:balli.core/function-checker chk})))
+        ;; correct at arity 1, wrong (string) at arity 2
+        (is (false? (b/validate fs (fn ([x] (inc x)) ([x y] (str x y)))
+                                {:balli.core/function-checker chk})))))))
+
+(deftest checker-iterations-opt
+  (is (fn? (bg/function-checker {:iterations 5})))
+  (is (true? (b/validate =>int->int inc
+                         {:balli.core/function-checker
+                          (bg/function-checker {:iterations 5})}))))
+
+(deftest checker-explain-shape
+  ;; failure map MERGED into a :balli.core/invalid-output error
+  (let [ex (b/explain =>int->int str
+                      {:balli.core/function-checker (bg/function-checker)})
+        e (first (:errors ex))]
+    (is (some? ex))
+    (is (= :balli.core/invalid-output (:type e)))
+    (is (= =>int->int (:schema e)))
+    (is (vector? (:input e)))
+    (is (string? (:balli.core/result e)))
+    (is (= :balli.core/invalid-type (:type (first (:output-errors e)))))))
+
+;; ---------------------------------------------------------------------------
+;; Checker/caching contract
+
+(deftest checker-caching-contract
+  (testing "plain -> checked -> plain on the same raw form (no cache poisoning)"
+    (let [fs [:=> [:cat :int] :int]]
+      (is (true? (b/validate fs str)))                 ; plain callable check
+      (is (false? (b/validate fs str {:balli.core/function-checker
+                                      (bg/function-checker)})))
+      (is (true? (b/validate fs str)))))               ; still callable-true
+  (testing "schema object with baked checker stays generative"
+    (let [so (b/schema =>int->int {:balli.core/function-checker
+                                   (bg/function-checker)})]
+      (is (false? (b/validate so str)))
+      (is (false? (b/validate so str)))                ; cached fn keeps checker
+      (is (true? (b/validate so inc)))
+      (is (= :balli.core/invalid-output
+             (:type (first (:errors (b/explain so str))))))))
+  (testing "call-time opts on a schema object are IGNORED"
+    (let [so (b/schema =>int->int)]
+      (is (true? (b/validate so str {:balli.core/function-checker
+                                     (bg/function-checker)}))))))
+
+;; ---------------------------------------------------------------------------
+;; function-info
+
+(deftest function-info-shapes
+  (testing "fixed arity"
+    (is (= {:min 2 :max 2 :arity 2 :input [:cat :int :int] :output :int}
+           (b/function-info [:=> [:cat :int :int] :int]))))
+  (testing "varargs: no :max, :arity :varargs"
+    (is (= {:min 1 :arity :varargs :input [:cat :int [:* :int]] :output :int}
+           (b/function-info [:=> [:cat :int [:* :int]] :int]))))
+  (testing "bounded-but-variable arity is :varargs too"
+    (let [info (b/function-info [:=> [:cat :int [:? :int]] :int])]
+      (is (= 1 (:min info)))
+      (is (= 2 (:max info)))
+      (is (= :varargs (:arity info)))))
+  (testing "guard form is carried"
+    (let [guard [:fn (fn [[args ret]] (<= (first args) ret))]]
+      (is (= guard (:guard (b/function-info [:=> [:cat :int] :int guard]))))))
+  (testing "nil for non-:=> schemas (:function included)"
+    (is (nil? (b/function-info :int)))
+    (is (nil? (b/function-info [:function =>int->int])))))
+
+;; ---------------------------------------------------------------------------
+;; instrument
+
+(deftest instrument-single-arity
+  (let [w (b/instrument {:schema =>int->int} inc)]
+    (testing "good call flows through"
+      (is (= 2 (w 1))))
+    (testing "bad input throws typed ex-info with explain data"
+      (is (= :balli.core/invalid-input (ex-type #(w "x"))))
+      (try
+        (w "x")
+        (is false "should have thrown")
+        (catch python/Exception e
+          (let [data (ex-data e)]
+            (is (= [:cat :int] (:input data)))
+            (is (= ["x"] (:args data)))
+            (is (some? (:explain data)))))))
+    (testing "wrong arg count is invalid-arity (checked before input)"
+      (is (= :balli.core/invalid-arity (ex-type #(w 1 2))))
+      (is (= :balli.core/invalid-arity (ex-type #(w)))))))
+
+(deftest instrument-output
+  (let [w (b/instrument {:schema [:=> [:cat :int] :string]} inc)]
+    (is (= :balli.core/invalid-output (ex-type #(w 1))))))
+
+(deftest instrument-scope
+  (testing "scope #{:input} skips output validation"
+    (let [w (b/instrument {:schema [:=> [:cat :int] :string]
+                           :scope #{:input}} inc)]
+      (is (= 2 (w 1)))
+      (is (= :balli.core/invalid-input (ex-type #(w "x"))))))
+  (testing "scope #{:output} skips input validation"
+    (let [w (b/instrument {:schema [:=> [:cat :int] :any]
+                           :scope #{:output}} identity)]
+      (is (= "x" (w "x"))))))
+
+(deftest instrument-custom-report
+  (let [reports (atom [])
+        w (b/instrument {:schema [:=> [:cat :int] :string]
+                         :report (fn [type data] (swap! reports conj [type data]))}
+                        inc)]
+    (testing "non-throwing report: value flows through unchanged"
+      (is (= 2 (w 1))))
+    (is (= :balli.core/invalid-output (ffirst @reports)))))
+
+(deftest instrument-guard
+  (let [gs [:=> [:cat :int] :int [:fn (fn [[args ret]] (= ret (inc (first args))))]]]
+    (testing "guard-satisfying fn passes"
+      (is (= 2 ((b/instrument {:schema gs} inc) 1))))
+    (testing "guard violation reports invalid-guard (output itself valid)"
+      (is (= :balli.core/invalid-guard
+             (ex-type #((b/instrument {:schema gs} dec) 1)))))))
+
+(deftest instrument-function-multi-arity
+  (let [w (b/instrument {:schema [:function
+                                  [:=> [:cat :int] :int]
+                                  [:=> [:cat :int :int] :int]]}
+                        (fn ([x] (inc x)) ([x y] (+ x y))))]
+    (testing "dispatch on arg count"
+      (is (= 2 (w 1)))
+      (is (= 3 (w 1 2))))
+    (testing "unmatched arity reports invalid-arity"
+      (is (= :balli.core/invalid-arity (ex-type #(w 1 2 3))))
+      (is (= :balli.core/invalid-arity (ex-type #(w)))))
+    (testing "per-branch input validation still applies"
+      (is (= :balli.core/invalid-input (ex-type #(w "x")))))))
+
+(deftest instrument-function-varargs-fallback
+  (let [w (b/instrument {:schema [:function
+                                  [:=> [:cat :int] :string]
+                                  [:=> [:cat :int [:+ :int]] :int]]}
+                        (fn ([x] (str x)) ([x & xs] (apply + x xs))))]
+    (testing "fixed arity wins at its count; varargs takes the rest"
+      (is (= "1" (w 1)))
+      (is (= 3 (w 1 2)))
+      (is (= 10 (w 1 2 3 4))))))
+
+(deftest instrument-varargs-composition
+  ;; composition case from the plan: input seqex with [:* :int] varargs
+  (let [w (b/instrument {:schema [:=> [:cat :int [:* :int]] :int]}
+                        (fn [& xs] (apply + xs)))]
+    (is (= 6 (w 1 2 3)))
+    (is (= 1 (w 1)))
+    (is (= :balli.core/invalid-arity (ex-type #(w))))
+    (is (= :balli.core/invalid-input (ex-type #(w 1 "a"))))))
+
+(deftest instrument-requires-function-schema
+  (is (= :balli.core/invalid-schema
+         (ex-type #(b/instrument {:schema :int} inc)))))
+
+;; ---------------------------------------------------------------------------
+;; Generation
+
+(deftest generate-=>-fn
+  (let [s [:=> [:cat :int] [:int {:min 0 :max 9}]]
+        f (bg/generate s {:seed 7})]
+    (testing "generates a fn that ignores args and emits valid outputs"
+      (is (fn? f))
+      (doseq [v [(f 1) (f 2) (f 999) (apply f [0])]]
+        (is (int? v))
+        (is (<= 0 v 9))))
+    (testing "the generated fn validates, plainly and generatively"
+      (is (true? (b/validate s f)))
+      (is (true? (b/validate s f {:balli.core/function-checker
+                                  (bg/function-checker {:iterations 20})}))))
+    (testing "construction-level determinism: same seed, same output stream"
+      (let [f1 (bg/generate s {:seed 11})
+            f2 (bg/generate s {:seed 11})]
+        (is (= [(f1 0) (f1 0) (f1 0)] [(f2 0) (f2 0) (f2 0)]))))))
+
+(deftest generate-function-schema
+  (let [s [:function [:=> [:cat :int] [:int {:min 0 :max 9}]]]
+        f (bg/generate s {:seed 3})]
+    (is (fn? f))
+    (is (<= 0 (f 1) 9))
+    (is (true? (b/validate s f)))))
+
+;; ---------------------------------------------------------------------------
+;; Additive integration with earlier surfaces
+
+(deftest additive-surfaces
+  (testing "parse is validate-then-value with the PLAIN callable check"
+    (is (= inc (b/parse =>int->int inc)))
+    (is (b/invalid? (b/parse =>int->int :kw))))
+  (testing "walk rebuilds :=>/:function forms"
+    (is (= =>int->int (b/walk =>int->int (b/schema-walker identity))))
+    (is (= [:function =>int->int]
+           (b/walk [:function =>int->int] (b/schema-walker identity)))))
+  (testing "json-schema exports lossy {} like :fn"
+    (is (= {} (bjs/transform =>int->int)))
+    (is (= {} (bjs/transform [:function =>int->int]))))
+  (testing ":=> inside a map schema"
+    (let [s [:map [:handler =>int->int]]]
+      (is (true? (b/validate s {:handler inc})))
+      (is (false? (b/validate s {:handler :not-a-fn}))))))

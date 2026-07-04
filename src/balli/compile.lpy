@@ -215,44 +215,39 @@
       :repeat (let [[mn mx] (repeat-bounds node)]
                 (rx/repeat* mn mx (child* (first (:children node))))))))
 
-(defn regex-min-max
+(def regex-min-max
   "Matched-element count bounds for seqex AST node `ast`: {:min n :max m},
-  :max absent when unbounded (:*/:+/unbounded :repeat). Any non-seqex node
-  counts as one element {:min 1 :max 1} -- including [:schema ...] wrappers,
-  which is exactly their point. Phase 8 uses this for :=>/:function arities."
-  [ast]
-  (letfn [(entry-nodes [node]
-            (if (contains? #{:catn :altn} (:type node))
-              (mapv :schema (:children node))
-              (:children node)))
-          (mm [node]
-            (case (:type node)
-              (:cat :catn)
-              (reduce (fn [[amin amax] c]
-                        (let [[cmin cmax] (mm c)]
-                          [(+ amin cmin) (when (and amax cmax) (+ amax cmax))]))
-                      [0 0]
-                      (entry-nodes node))
+  :max absent when unbounded. Moved to balli.normalize in Phase 8 (so
+  :function normalization can check arity distinctness); re-exported here at
+  its original Phase 6 home."
+  norm/regex-min-max)
 
-              (:alt :altn)
-              (reduce (fn [[amin amax] [cmin cmax]]
-                        [(min amin cmin) (when (and amax cmax) (max amax cmax))])
-                      (mapv mm (entry-nodes node)))
+;; ---------------------------------------------------------------------------
+;; Function schemas: :=> / :function (Phase 8)
+;;
+;; Validation is a callable check (fn-like?, below) UNLESS a function checker
+;; is in effect for this compilation -- then it is generative: the checker
+;; (see balli.generator/function-checker) generates input seqs from the input
+;; seqex, applies the value, and validates outputs; nil means all iterations
+;; passed. The checker threads into compile-node through the per-compilation
+;; cache atom under ::function-checker (the atom's other keys are ref
+;; keywords, which cannot collide with this namespaced key).
 
-              :? (let [[_ cmax] (mm (first (:children node)))]
-                   [0 cmax])
-              :* [0 nil]
-              :+ (let [[cmin _] (mm (first (:children node)))]
-                   [cmin nil])
-              :repeat (let [[cmin cmax] (mm (first (:children node)))
-                            props (:properties node)
-                            mn (or (:min props) 0)
-                            mx (:max props)]
-                        [(* mn cmin) (when (and mx cmax) (* mx cmax))])
-
-              [1 1]))]
-    (let [[mn mx] (mm ast)]
-      (if mx {:min mn :max mx} {:min mn}))))
+(defn fn-like?
+  "True when `x` is function-like: a Basilisp fn, or a Python callable that
+  is not a Basilisp collection, keyword, or symbol. Bare `python/callable`
+  is deliberately NOT used -- keywords, maps, sets, vectors, and symbols all
+  implement __call__ in Basilisp and would validate as functions. `fn?` alone
+  is too narrow (false for Python builtins and bound methods, both legitimate
+  callables in interop). Note the filtered-callable arm still admits any
+  non-collection Python callable (classes, bound methods, functools.partial
+  objects) -- intentional."
+  [x]
+  (or (fn? x)
+      (and (python/callable x)
+           (not (coll? x))
+           (not (keyword? x))
+           (not (symbol? x)))))
 
 (defn- compile-node
   [node registry cache]
@@ -315,15 +310,32 @@
     ;; transparent wrapper: validates exactly as its child
     :schema (compile-node (first (:children node)) registry cache)
 
+    (:=> :function)
+    (if-some [checker (get @cache ::function-checker)]
+      (fn [x] (and (fn-like? x) (nil? (checker node x registry))))
+      (fn [x] (fn-like? x)))
+
     (:cat :catn :alt :altn :? :* :+ :repeat)
     (rx/validator (regex-validator node registry cache))))
+
+(defn- fresh-cache
+  "Per-compilation cache atom, seeded with the function checker from `opts`
+  (:balli.core/function-checker) when present so the :=>/:function compilers
+  can bake it into their closures."
+  [opts]
+  (atom (if-some [checker (:balli.core/function-checker opts)]
+          {::function-checker checker}
+          {})))
 
 (defn compile-validator
   "Compile AST node `ast` against `registry` into a 1-arg validator fn
   returning a boolean. Refs are resolved via the registry; unresolved refs
-  throw ex-info {:type :balli.core/unresolved-ref}."
-  [ast registry]
-  (compile-node ast registry (atom {})))
+  throw ex-info {:type :balli.core/unresolved-ref}. `opts` supports
+  {:balli.core/function-checker chk} -- when present, :=>/:function validate
+  generatively through the checker instead of by callable check."
+  ([ast registry] (compile-validator ast registry {}))
+  ([ast registry opts]
+   (compile-node ast registry (fresh-cache opts))))
 
 ;; ===========================================================================
 ;; Explainers
@@ -667,6 +679,25 @@
     ;; transparent wrapper: explains exactly as its child (no :path segment)
     :schema (explain-node (first (:children node)) registry cache)
 
+    ;; :=>/:function: non-callable -> invalid-type. With a checker in effect,
+    ;; a checker failure map is MERGED into a :balli.core/invalid-output
+    ;; error (pragmatic shape: the standard error keys plus the checker's
+    ;; :balli.core/result / :input / :output-errors keys).
+    (:=> :function)
+    (let [form (:form node)
+          checker (get @cache ::function-checker)]
+      (fn [x path in]
+        (cond
+          (not (fn-like? x))
+          [(err path in form x :balli.core/invalid-type)]
+
+          (nil? checker) []
+
+          :else
+          (if-some [failure (checker node x registry)]
+            [(merge (err path in form x :balli.core/invalid-output) failure)]
+            []))))
+
     (:cat :catn :alt :altn :? :* :+ :repeat)
     (rx/explainer (regex-explainer node registry cache []) (:form node))))
 
@@ -674,9 +705,11 @@
   "Compile AST node `ast` against `registry` into an explainer fn
   [value path in] returning a vector of error maps (empty when valid).
   Error :schema carries the original form fragment stored on the AST node
-  as :form, not the AST itself."
-  [ast registry]
-  (explain-node ast registry (atom {})))
+  as :form, not the AST itself. `opts` supports
+  {:balli.core/function-checker chk} -- see compile-validator."
+  ([ast registry] (compile-explainer ast registry {}))
+  ([ast registry opts]
+   (explain-node ast registry (fresh-cache opts))))
 
 ;; ===========================================================================
 ;; Parsers / Unparsers
@@ -993,9 +1026,11 @@
 (defn- coder-node
   [node registry cache mode]
   (case (:type node)
-    ;; non-transforming leaves: parse == unparse == validate-then-value
+    ;; non-transforming leaves: parse == unparse == validate-then-value.
+    ;; :=>/:function parse with the PLAIN callable check -- function checkers
+    ;; are a validate/explain concern only, never part of parse.
     (:any :nil :string :int :float :double :number :boolean :keyword :symbol
-          :uuid :enum := :fn :re :not)
+          :uuid :enum := :fn :re :not :=> :function)
     (let [valid? (compile-node node registry (atom {}))]
       (fn [x] (if (valid? x) x -invalid)))
 

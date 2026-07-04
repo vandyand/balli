@@ -35,8 +35,12 @@
   schema -- the branch schema itself must produce the dispatch value (e.g.
   contain a [:dispatch-key [:= tag]] entry); :re/:fn have NO default
   generator and throw :balli.core/no-generator unless a :gen/* hook is
-  supplied. :=>/:function generation lands in Phase 8 (function-checker) --
-  those types do not normalize yet, so no cases exist here.
+  supplied. :=> generates a constant-ish fn that ignores its arguments and
+  returns a freshly generated OUTPUT value per call, drawing from the Random
+  threaded through the enclosing generate/sample call -- determinism holds at
+  generator-CONSTRUCTION level (equal seeds give fns whose successive calls
+  yield equal value sequences), not per call. :function generates from its
+  first :=> child.
 
   Sequence schemas generate FLAT vectors by concat-splicing child chunks
   (:cat/:catn concat, :alt/:altn pick, :? 0-or-1, :* 0..size/3 reps,
@@ -304,8 +308,13 @@
       :set (gen-set ast registry rnd size depth)
       :tuple (mapv child (:children ast))
       ;; no default strategy -- only :gen/* hooks (checked before this
-      ;; dispatch) can generate these. :=>/:function join here in Phase 8.
+      ;; dispatch) can generate these.
       (:re :fn) (no-generator! ast)
+      ;; constant-ish fn: ignores args, generates a fresh output value per
+      ;; call from the threaded rnd (see the ns docstring on determinism)
+      :=> (let [out-ast (nth (:children ast) 1)]
+            (fn [& _args] (gen out-ast registry rnd size depth)))
+      :function (child (first (:children ast)))
       :ref (gen-ref ast registry rnd size depth)
       :schema (child (first (:children ast)))
       (:cat :catn :alt :altn :? :* :+ :repeat)
@@ -373,5 +382,54 @@
      (mapv (fn [_] (gen (:ast so) (:registry so) rnd default-size 0))
            (range n)))))
 
-;; `function-checker` (generative :=>/:function validation) is Phase 8 -- it
-;; will live here and lean on `generate` for input seqs via the input seqex.
+;; ---------------------------------------------------------------------------
+;; function-checker (generative :=>/:function validation, Phase 8)
+
+(defn function-checker
+  "Generative checker for :=>/:function schemas, for use as the
+  :balli.core/function-checker opt of balli.core/schema (baked) or raw-form
+  validate/explain (cache-bypassing). Returns
+    (fn [schema-form-or-ast value registry]) -> nil | failure map
+  which generates `:iterations` (default 100) input argument seqs from the
+  :=> input seqex (at the default generation size, fresh unseeded Random per
+  check), applies `value` to each, and validates every return against the
+  output schema. nil when all iterations pass; on the first failure a map
+    {:balli.core/result <return value, or the raised exception>
+     :input <the generated argument vector>
+     :output-errors <explain error vector, or nil when the call raised>}
+  A :function schema checks each :=> child in order and returns the first
+  failure. Guards are NOT exercised by the checker (instrument's concern);
+  input generation follows generate's seqex semantics, so :re/:fn inputs
+  without :gen/* hooks throw :balli.core/no-generator."
+  ([] (function-checker {}))
+  ([opts]
+   (let [iterations (or (:iterations opts) 100)]
+     (fn check [schema value registry]
+       (let [registry (or registry (reg/default-registry))
+             ast (if (and (map? schema) (:type schema))
+                   schema
+                   (norm/normalize schema {:registry registry}))]
+         (if (= :function (:type ast))
+           (some #(check % value registry) (:children ast))
+           (let [input-ast (nth (:children ast) 0)
+                 output-ast (nth (:children ast) 1)
+                 output-ef (c/compile-explainer output-ast registry)
+                 rnd (random/Random)]
+             (loop [i 0]
+               (when (< i iterations)
+                 (let [args (gen-seqex-chunk input-ast registry rnd
+                                             default-size 0)
+                       failure (try
+                                 (let [ret (apply value args)
+                                       errors (output-ef ret [] [])]
+                                   (when (seq errors)
+                                     {:balli.core/result ret
+                                      :input args
+                                      :output-errors (vec errors)}))
+                                 (catch python/Exception e
+                                   {:balli.core/result e
+                                    :input args
+                                    :output-errors nil}))]
+                   (if failure
+                     failure
+                     (recur (inc i)))))))))))))

@@ -247,7 +247,7 @@
 
 (def ^:private indexed-child-types
   #{:maybe :not :vector :sequential :set :and :or :tuple :map-of
-    :cat :alt :? :* :+ :repeat :schema})
+    :cat :alt :? :* :+ :repeat :schema :=> :function})
 
 (defn get
   "Sub-schema form of `s` at key/index `k`: :map/:multi/:orn/:catn/:altn

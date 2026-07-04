@@ -9,7 +9,8 @@
   #{:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid
     :map :map-of :vector :sequential :set :tuple :enum := :maybe :and :or :orn
     :not :fn :multi :re :ref
-    :cat :catn :alt :altn :? :* :+ :repeat :schema})
+    :cat :catn :alt :altn :? :* :+ :repeat :schema
+    :=> :function})
 
 (defn default-registry
   "Returns the default registry: builtin types, no custom schemas."

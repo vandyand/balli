@@ -125,7 +125,8 @@
         children (:children node)
         child #(-transform % registry ctx)]
     (case (:type node)
-      (:any :fn) {}
+      ;; :=>/:function: JSON Schema has no function values -- lossy {} like :fn
+      (:any :fn :=> :function) {}
       :nil {"type" "null"}
       :string (with-min-max {"type" "string"} props "minLength" "maxLength")
       :int (with-min-max {"type" "integer"} props "minimum" "maximum")

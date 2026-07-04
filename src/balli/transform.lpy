@@ -326,6 +326,10 @@
     (:cat :catn :alt :altn :? :* :+ :repeat :schema)
     nil
 
+    ;; function schemas: leaf pass-through (fns are not transformed)
+    (:=> :function)
+    nil
+
     (:maybe :and :not)
     (children-in-order node registry chain method opts cache)
 

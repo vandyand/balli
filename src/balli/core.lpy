@@ -21,19 +21,25 @@
   (boolean (and (map? x) (:balli/schema x))))
 
 (defn schema
-  "Wrap schema `form` into a schema object. `opts` supports {:registry r};
-  defaults to the builtin registry. Passing an existing schema object returns
-  it unchanged (its baked-in registry wins)."
+  "Wrap schema `form` into a schema object. `opts` supports {:registry r}
+  (defaults to the builtin registry) and {:balli.core/function-checker chk}
+  -- a function checker (see balli.generator/function-checker) BAKED into the
+  object at construction: every validator/explainer compiled for this object
+  checks :=>/:function generatively. Passing an existing schema object
+  returns it unchanged (its baked-in registry AND checker win; opts are
+  ignored)."
   ([form] (schema form {}))
   ([form opts]
    (if (schema? form)
      form
-     (let [registry (or (:registry opts) (reg/default-registry))]
-       {:balli/schema true
-        :form form
-        :ast (norm/normalize form {:registry registry})
-        :registry registry
-        :cache (atom {})}))))
+     (let [registry (or (:registry opts) (reg/default-registry))
+           checker (::function-checker opts)]
+       (cond-> {:balli/schema true
+                :form form
+                :ast (norm/normalize form {:registry registry})
+                :registry registry
+                :cache (atom {})}
+         checker (assoc :checker checker))))))
 
 (defn form
   "The original schema form of `s` (raw form or schema object)."
@@ -109,10 +115,12 @@
   f)
 
 (defn- compile-validator!
-  "Compile a validator for schema object `s`, caching it under :validator in
-  the schema's :cache atom."
+  "Compile a validator for schema object `s` (honoring its baked-in function
+  checker, when any), caching it under :validator in the schema's :cache
+  atom."
   [s]
-  (let [f (c/compile-validator (:ast s) (:registry s))]
+  (let [f (c/compile-validator (:ast s) (:registry s)
+                               {::function-checker (:checker s)})]
     (swap! (:cache s) assoc :validator f)
     f))
 
@@ -121,7 +129,8 @@
   success or {:schema <original form> :value <input> :errors [...]} — caching
   it under :explainer in the schema's :cache atom."
   [s]
-  (let [ef (c/compile-explainer (:ast s) (:registry s))
+  (let [ef (c/compile-explainer (:ast s) (:registry s)
+                                {::function-checker (:checker s)})
         root-form (:form s)
         f (fn [value]
             (let [errors (ef value [] [])]
@@ -132,14 +141,25 @@
 
 (defn validator
   "Compiled 1-arg boolean validator for `s` (raw form or schema object).
-  `opts` supports {:registry r} and is ignored when `s` is already a schema
-  object."
+  `opts` supports {:registry r} and {:balli.core/function-checker chk}, and
+  is ignored when `s` is already a schema object (its baked-in registry and
+  checker win). Raw-form calls whose opts carry a checker BYPASS the global
+  raw-form cache entirely -- compiled fresh per call, so checked and plain
+  compilations of the same form never poison each other; hoist `(schema form
+  {::function-checker chk})` into a def for hot paths."
   ([s] (validator s {}))
   ([s opts]
-   (if (schema? s)
+   (cond
+     (schema? s)
      (or (:validator @(:cache s))
          (compile-validator! s))
+
+     ;; raw form + checker: bypass the global raw-form cache (see docstring)
+     (some? (::function-checker opts))
+     (validator (schema s opts))
+
      ;; raw form: bounded global cache keyed by [form registry-id]
+     :else
      (let [k [s (registry-id (:registry opts))]]
        (or (get-in @raw-cache [k :validator])
            (raw-cache-put! k :validator (validator (schema s opts))))))))
@@ -148,14 +168,22 @@
   "Compiled 1-arg explainer for `s` (raw form or schema object): returns nil
   on success, else {:schema <original form> :value <input> :errors [...]}
   where each error is {:path :in :schema <form fragment> :value :type}.
-  `opts` supports {:registry r} and is ignored when `s` is already a schema
-  object. Cached like `validator`."
+  `opts` supports {:registry r} and {:balli.core/function-checker chk}, and
+  is ignored when `s` is already a schema object. Cached like `validator`
+  (incl. the checker raw-cache bypass -- see `validator`)."
   ([s] (explainer s {}))
   ([s opts]
-   (if (schema? s)
+   (cond
+     (schema? s)
      (or (:explainer @(:cache s))
          (compile-explainer! s))
+
+     ;; raw form + checker: bypass the global raw-form cache (see validator)
+     (some? (::function-checker opts))
+     (explainer (schema s opts))
+
      ;; raw form: bounded global cache keyed by [form registry-id]
+     :else
      (let [k [s (registry-id (:registry opts))]]
        (or (get-in @raw-cache [k :explainer])
            (raw-cache-put! k :explainer (explainer (schema s opts))))))))
@@ -412,7 +440,7 @@
 
       :else
       ;; indexed children: :maybe :not :vector :sequential :set :and :or
-      ;; :tuple :map-of :cat :alt :? :* :+ :repeat :schema
+      ;; :tuple :map-of :cat :alt :? :* :+ :repeat :schema :=> :function
       (let [children (into []
                            (map-indexed (fn [i c] (walk-ast c (conj path i) f))
                                         (:children node)))
@@ -452,3 +480,136 @@
    (if-let [ex (explain s value opts)]
      (throw (ex-info "Validation failed" (assoc ex :type :balli.core/invalid-input)))
      value)))
+
+;; ---------------------------------------------------------------------------
+;; Function schemas: function-info + instrument (Phase 8)
+
+(defn function-info
+  "Arity/shape info for a :=> schema `s` (raw form or schema object):
+  {:min n :max m? :arity <n or :varargs> :input <form> :output <form>
+  :guard <form?>} from regex-min-max on the input seqex. :max is absent (and
+  :arity :varargs) when the input is unbounded; :arity is also :varargs for
+  bounded-but-variable inputs (min < max, e.g. [:cat :int [:? :int]]). nil
+  when `s` is not a :=> schema."
+  ([s] (function-info s {}))
+  ([s opts]
+   (let [so (schema s opts)
+         ast (:ast so)]
+     (when (= :=> (:type ast))
+       (let [[input output guard] (:children ast)
+             {:keys [min max]} (norm/regex-min-max input)]
+         (cond-> {:min min
+                  :arity (if (and max (= min max)) min :varargs)
+                  :input (:form input)
+                  :output (:form output)}
+           max (assoc :max max)
+           guard (assoc :guard (:form guard))))))))
+
+(defn- default-report
+  "Default instrument reporter: throw ex-info with the error type in both the
+  message and the data map."
+  [type data]
+  (throw (ex-info (str "Instrumentation failed: " type)
+                  (assoc data :type type))))
+
+(defn- node-explain
+  "Ad-hoc explain for AST `node`: value -> nil | {:schema :value :errors}."
+  [node registry]
+  (let [ef (c/compile-explainer node registry)
+        form (:form node)]
+    (fn [value]
+      (let [errors (ef value [] [])]
+        (when (seq errors)
+          {:schema form :value value :errors errors})))))
+
+(defn- arity-wrapper
+  "Wrapped fn for one :=> AST node: per call, arity check (always), input
+  seqex validation (:input scope), the call itself, output validation
+  (:output scope), guard validation of [args ret] (whenever a guard child is
+  present), then the return value. Failures go through `report` (type,
+  data) -- when report returns instead of throwing, execution continues and
+  the value flows through unchanged."
+  [node registry scope report f]
+  (let [[input output guard] (:children node)
+        {:keys [min max]} (norm/regex-min-max input)
+        form (:form node)
+        check-input? (contains? scope :input)
+        check-output? (contains? scope :output)
+        input-valid? (when check-input? (c/compile-validator input registry))
+        input-explain (when check-input? (node-explain input registry))
+        output-valid? (when check-output? (c/compile-validator output registry))
+        output-explain (when check-output? (node-explain output registry))
+        guard-valid? (when guard (c/compile-validator guard registry))
+        guard-explain (when guard (node-explain guard registry))]
+    (fn [& args]
+      (let [args (vec args)
+            n (count args)]
+        (when (or (< n min) (and max (> n max)))
+          (report :balli.core/invalid-arity
+                  {:schema form :args args :arity n
+                   :arities {:min min :max max}}))
+        (when (and check-input? (not (input-valid? args)))
+          (report :balli.core/invalid-input
+                  {:schema form :input (:form input) :args args
+                   :explain (input-explain args)}))
+        (let [ret (apply f args)]
+          (when (and check-output? (not (output-valid? ret)))
+            (report :balli.core/invalid-output
+                    {:schema form :output (:form output) :args args :value ret
+                     :explain (output-explain ret)}))
+          (when (and guard-valid? (not (guard-valid? [args ret])))
+            (report :balli.core/invalid-guard
+                    {:schema form :guard (:form guard) :args args :value ret
+                     :explain (guard-explain [args ret])}))
+          ret)))))
+
+(defn instrument
+  "Wrap fn `f` with validation per `props`:
+    {:schema s                    ;; :=> or :function (raw form or object)
+     :scope #{:input :output}     ;; default both
+     :report (fn [type data] ..)} ;; default: throw ex-info
+  Per call: arity check against the input seqex bounds
+  (:balli.core/invalid-arity), argument-vector validation against the input
+  seqex (:balli.core/invalid-input, with :explain data), the call, return
+  validation (:balli.core/invalid-output), and -- when the :=> has a guard
+  child -- [args ret] guard validation (:balli.core/invalid-guard).
+  A :function schema dispatches on (count args) over its :=> children's
+  regex-min-max ranges (bounded arities first, the varargs child as
+  fallback); an argument count matching no child reports
+  :balli.core/invalid-arity and then calls `f` unwrapped. `props` may also
+  carry {:registry r} for raw-form schemas."
+  [props f]
+  (let [so (schema (:schema props) props)
+        scope (or (:scope props) #{:input :output})
+        report (or (:report props) default-report)
+        ast (:ast so)
+        registry (:registry so)]
+    (case (:type ast)
+      :=> (arity-wrapper ast registry scope report f)
+
+      :function
+      (let [wrappers (->> (:children ast)
+                          (mapv (fn [c]
+                                  (let [{:keys [min max]} (norm/regex-min-max
+                                                           (first (:children c)))]
+                                    {:min min :max max
+                                     :wrapper (arity-wrapper c registry scope report f)})))
+                          ;; bounded arities dispatch before the varargs child
+                          (sort-by #(if (:max %) 0 1))
+                          vec)
+            arities (mapv #(select-keys % [:min :max]) wrappers)]
+        (fn [& args]
+          (let [n (count args)
+                entry (some (fn [{:keys [min max] :as e}]
+                              (when (and (<= min n) (or (nil? max) (<= n max)))
+                                e))
+                            wrappers)]
+            (if entry
+              (apply (:wrapper entry) args)
+              (do (report :balli.core/invalid-arity
+                          {:schema (:form ast) :args (vec args) :arity n
+                           :arities arities})
+                  (apply f args))))))
+
+      (throw (ex-info "instrument requires a :=> or :function schema"
+                      {:type :balli.core/invalid-schema :form (:form ast)})))))

@@ -64,7 +64,9 @@
    :sequential "should be sequential"
    :tuple "should be a tuple"
    :re "should be a string"
-   :nil "should be nil"})
+   :nil "should be nil"
+   :=> "should be a function"
+   :function "should be a function"})
 
 (def ^:private numeric-types #{:int :float :double :number})
 (def ^:private counted-types #{:vector :sequential :set :map-of})
