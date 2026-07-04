@@ -53,7 +53,7 @@ See [research.md](research.md) for codebase context and REPL findings, and the [
 
 - [x] Phase 0: Project scaffold + toolchain spike
 - [x] Phase 1: Normalize + builtin registry (form → AST)
-- [ ] Phase 2: Validator compiler + public core API
+- [x] Phase 2: Validator compiler + public core API
 - [ ] Phase 3: Explainer + explain data + assert-valid
 - [ ] Phase 4: Humanize
 - [ ] Phase 5: Custom registries, :ref, recursion, caching
