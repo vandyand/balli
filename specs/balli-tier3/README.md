@@ -45,4 +45,4 @@ See [research.md](research.md) and the [implementation plan](implementation-plan
 - [x] Phase 3: Local registries in schema properties
 - [x] Phase 4: :balli.core/default branches (:map + :multi)
 - [x] Phase 5: balli.time
-- [ ] Phase 6: Docs, 0.3.0, full sweep (3× PYTHONHASHSEED)
+- [x] Phase 6: Docs, 0.3.0, full sweep (3× PYTHONHASHSEED)

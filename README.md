@@ -2,7 +2,7 @@
 
 Data-driven schemas for [Basilisp](https://github.com/basilisp-lang/basilisp), inspired by [Malli](https://github.com/metosin/malli).
 
-Schemas are plain data in Malli's vector syntax — no macros, no protocols to implement. Balli covers most of Malli's surface: validation and Malli-shaped explain data with `:path`/`:in`, humanized errors with key spell-checking, value transformation (decode/encode/coerce), parse/unparse with tagged branches, sequence (regex) schemas with an iterative backtracking engine, function schemas with generative checking and instrumentation, deterministic seeded generators, JSON Schema export, schema utilities (`merge`/`union`/`closed-schema`/...), form walking, schema inference from sample data, and custom registries with (recursive) refs. Malli-inspired, not a strict port — see [Differences from Malli](#differences-from-malli). Pure Basilisp; no Python dependencies beyond the standard library.
+Schemas are plain data in Malli's vector syntax — no macros, no protocols to implement. Balli covers most of Malli's surface: validation and Malli-shaped explain data with `:path`/`:in`, humanized errors with key spell-checking, value transformation (decode/encode/coerce), parse/unparse with tagged branches, sequence (regex) schemas with an iterative backtracking engine, function schemas with generative checking and instrumentation, deterministic seeded generators, JSON Schema export, schema utilities (`merge`/`union`/`closed-schema`/...), form walking, schema inference from sample data, predicate/comparator schemas, time schemas, default branches, self-contained local registries, and mutable custom registries with recursive refs. Malli-inspired, not a strict port — see [Differences from Malli](#differences-from-malli). Pure Basilisp; no Python dependencies beyond the standard library.
 
 ## Install
 
@@ -90,6 +90,61 @@ Recursive schemas terminate on finite data:
 ;; => false
 ```
 
+Make a schema self-contained with a local `:registry` property. The registry
+scopes over the whole subtree, including recursive refs:
+
+```clojure
+(def local-tree
+  [:schema {:registry {:tree/node [:maybe [:map
+                                           [:value :int]
+                                           [:children [:vector [:ref :tree/node]]]]]}}
+   :tree/node])
+
+(b/validate local-tree {:value 1 :children [{:value 2 :children []}]})
+;; => true
+```
+
+Use `:balli.core/default` entries for residual map keys or fallback `:multi`
+branches:
+
+```clojure
+(def with-default
+  [:map {:closed true}
+   [:id :int]
+   [:balli.core/default [:map-of :keyword :string]]])
+
+(b/validate with-default {:id 1 :extra "ok"})
+;; => true
+
+(be/humanize (b/explain with-default {:id 1 :extra 2}))
+;; => {:extra ["should be a string"]}
+```
+
+Decode time values with the separate time transformer:
+
+```clojure
+(require '[balli.transform :as bt])
+
+(def decoded
+  (b/decode [:map [:created :time/instant] [:ttl :time/duration]]
+            {:created "2024-06-01T12:00:00+00:00" :ttl "PT15M"}
+            (bt/transformer (bt/json-transformer) (bt/time-transformer))))
+
+(b/validate [:map [:created :time/instant] [:ttl :time/duration]] decoded)
+;; => true
+```
+
+Predicate functions/symbols and comparators are schemas:
+
+```clojure
+(b/validate int? 1)     ;; => true
+(b/validate 'int? "x")  ;; => false
+(b/validate [:> 10] 11) ;; => true
+
+(be/humanize (b/explain [:<= 10] 11))
+;; => ["should be at most 10"]
+```
+
 Assert, getting the value back or an `ex-info` carrying the explain map:
 
 ```clojure
@@ -152,7 +207,9 @@ Infer a schema from sample data:
 
 ## Supported schemas
 
-All 39 schema types, each with a validating example:
+All 49 builtin schema type keywords, each with a validating example. Predicate
+schemas are supported too, but they are not builtin keywords: the schema is the
+predicate fn or quoted symbol itself, e.g. `int?` or `'int?`.
 
 | Type | Example |
 |---|---|
@@ -167,6 +224,11 @@ All 39 schema types, each with a validating example:
 | `:keyword` | `(b/validate :keyword :a)` |
 | `:symbol` | `(b/validate :symbol 'foo)` |
 | `:uuid` | `(b/validate :uuid (random-uuid))` |
+| `:time/instant` | `(b/validate :time/instant (datetime/datetime 2024 1 1 0 0 0 0 ** :tzinfo datetime.timezone/utc))` |
+| `:time/local-date-time` | `(b/validate :time/local-date-time (datetime/datetime 2024 1 1))` |
+| `:time/local-date` | `(b/validate :time/local-date (datetime/date 2024 1 1))` |
+| `:time/local-time` | `(b/validate :time/local-time (datetime/time 10 0 0))` |
+| `:time/duration` | `(b/validate :time/duration (datetime/timedelta ** :seconds 900))` |
 | `:map` | `(b/validate [:map [:x :int] [:y {:optional true} :string]] {:x 1})` |
 | `:map-of` | `(b/validate [:map-of :keyword :int] {:a 1 :b 2})` |
 | `:vector` | `(b/validate [:vector :int] [1 2 3])` |
@@ -195,19 +257,169 @@ All 39 schema types, each with a validating example:
 | `:schema` | `(b/validate [:schema :int] 5)` (transparent wrapper; stops seqex splicing) |
 | `:=>` | `(b/validate [:=> [:cat :int] :int] inc)` (function schema: input seqex + output) |
 | `:function` | `(b/validate [:function [:=> [:cat :int] :int] [:=> [:cat :int :int] :int]] +)` (multi-arity) |
+| `:>` | `(b/validate [:> 10] 11)` |
+| `:>=` | `(b/validate [:>= 10] 10)` |
+| `:<` | `(b/validate [:< 10] 9)` |
+| `:<=` | `(b/validate [:<= 10] 10)` |
+| `:not=` | `(b/validate [:not= 10] 11)` |
 
 ## Properties
 
 | Property | Applies to | Meaning |
 |---|---|---|
-| `:min` / `:max` | `:string` (length), `:int`/`:float`/`:double`/`:number` (value), `:vector`/`:sequential`/`:set`/`:map-of` (element count), `:repeat` (repetition count) | Inclusive bounds; violations produce `:balli.core/limits` errors |
+| `:min` / `:max` | `:string` (length), `:int`/`:float`/`:double`/`:number` (value), `:time/*` (value), `:vector`/`:sequential`/`:set`/`:map-of` (element count), `:repeat` (repetition count) | Inclusive bounds; violations produce `:balli.core/limits` errors |
 | `:closed` | `:map` | When `true`, keys not declared in the schema are rejected (`:balli.core/extra-key`); maps are open by default |
 | `:optional` | `:map` entries (entry-level props: `[:k {:optional true} schema]`) | Key may be absent; when present its value must still match |
 | `:error/message` | any schema | Overrides the default humanized message for errors at that schema |
 | `:dispatch` | `:multi` (required) | Keyword or function used to pick the child schema; unknown dispatch values are invalid (`:balli.core/invalid-dispatch-value`) |
+| `:registry` | any vector-form schema | Local `{qualified-keyword schema-form}` registry scoped to that schema subtree |
 | `:default` | any schema / `:map` entries | Replacement for nil (and missing map keys) under `default-value-transformer` |
 | `:decode/<name>` / `:encode/<name>` | any schema | Per-schema transformer override for the transformer named `<name>` (e.g. `:decode/string`); a real fn or `{:enter f :leave g}` map |
 | `:gen/return` `:gen/elements` `:gen/schema` `:gen/fmap` `:gen/min` `:gen/max` | any schema | Generator hooks — constant, uniform pick, alternate schema, post-map fn, bound overrides |
+
+## Self-contained schemas and local registries
+
+Any vector-form schema may carry `{:registry {qualified-keyword schema-form}}`
+in its properties. The local registry is layered over the effective registry
+for that whole subtree, including nested map entries, refs, transformers,
+generators, and JSON Schema export. Local entries can refer to each other and
+to outer entries, so recursive schemas can be shipped as one self-contained
+form:
+
+```clojure
+(def local-tree
+  [:schema {:registry {:tree/node [:maybe [:map
+                                           [:value :int]
+                                           [:children [:vector [:ref :tree/node]]]]]}}
+   :tree/node])
+
+(b/validate local-tree {:value 1 :children [{:value 2 :children []}]})
+;; => true
+```
+
+Shadowed ref names stay distinct in JSON Schema definitions:
+
+```clojure
+(require '[balli.json-schema :as bjs])
+
+(bjs/transform
+ [:schema {:registry {:x :int}}
+  [:map
+   [:outer [:ref :x]]
+   [:inner [:schema {:registry {:x :string}} [:ref :x]]]]])
+;; => {"type" "object"
+;;     "properties" {"outer" {"$ref" "#/definitions/x"}
+;;                   "inner" {"$ref" "#/definitions/x__2"}}
+;;     "required" ["outer" "inner"]
+;;     "definitions" {"x" {"type" "integer"}
+;;                    "x__2" {"type" "string"}}}
+```
+
+## Default branches
+
+In a `:map`, an entry keyed `:balli.core/default` validates the residual map
+of keys not explicitly declared. A default entry disables `:closed` extra-key
+checking because undeclared keys are claimed by the default schema:
+
+```clojure
+(def with-default
+  [:map {:closed true}
+   [:id :int]
+   [:balli.core/default [:map-of :keyword :string]]])
+
+(b/validate with-default {:id 1 :extra "ok"}) ;; => true
+(b/validate with-default {:id 1 :extra 2})    ;; => false
+```
+
+In a `:multi`, `:balli.core/default` is the fallback branch for dispatch
+misses:
+
+```clojure
+(def multi-default
+  [:multi {:dispatch :kind}
+   [:user [:map [:kind [:= :user]] [:name :string]]]
+   [:balli.core/default [:map [:kind :keyword]]]])
+
+(:key (b/parse multi-default {:kind :system}))
+;; => :balli.core/default
+```
+
+## Time schemas
+
+`balli.time` maps Malli-style time schemas onto Python `datetime` types:
+
+| Schema | Python value |
+|---|---|
+| `:time/instant` | aware `datetime.datetime` (`tzinfo` not nil) |
+| `:time/local-date-time` | naive `datetime.datetime` |
+| `:time/local-date` | `datetime.date`, excluding `datetime.datetime` |
+| `:time/local-time` | naive `datetime.time` |
+| `:time/duration` | `datetime.timedelta` |
+
+Time schemas support inclusive `:min`/`:max`, seeded generation, JSON Schema
+formats, and a separate transformer. The time transformer is intentionally
+not folded into `string-transformer` or `json-transformer`; compose it where
+you want string parsing or ISO encoding:
+
+```clojure
+(require '[balli.transform :as bt])
+
+(def decoded
+  (b/decode [:map [:created :time/instant] [:ttl :time/duration]]
+            {:created "2024-06-01T12:00:00+00:00" :ttl "PT15M"}
+            (bt/transformer (bt/json-transformer) (bt/time-transformer))))
+
+(b/validate [:map [:created :time/instant] [:ttl :time/duration]] decoded)
+;; => true
+
+(b/encode :time/duration (:ttl decoded) (bt/time-transformer))
+;; => "PT15M"
+```
+
+## Predicate and comparator schemas
+
+The 41 Basilisp core predicates in `balli.normalize/predicates` are schemas
+when used as a function value or quoted symbol. Predicate calls are
+exception-safe: a thrown host exception means invalid, not a thrown validator.
+
+```clojure
+(b/validate int? 1)     ;; => true
+(b/validate 'int? "x")  ;; => false
+(b/validate [:vector pos-int?] [1 2 3])
+;; => true
+```
+
+Comparators validate by comparing the input value to their child value. They
+are leaves: the child is a literal value, not a nested schema.
+
+```clojure
+(b/validate [:> 10] 11) ;; => true
+
+(be/humanize (b/explain [:<= 10] 11))
+;; => ["should be at most 10"]
+```
+
+## Mutable registry
+
+The default registry is mutable. `register!` adds schemas to the live default
+registry and bumps an epoch so raw-form calls pick up the new meaning
+immediately. Schema objects keep snapshot semantics: they bake the registry
+seen at construction.
+
+```clojure
+(reg/register! :demo/id :int)
+(def baked (b/schema :demo/id))
+
+(reg/register! :demo/id :string)
+
+(b/validate :demo/id "x") ;; => true  (live default)
+(b/validate baked 1)      ;; => true  (snapshot)
+(b/validate baked "x")    ;; => false
+```
+
+`reg/composite` eagerly merges registries with first-hit schema lookup and
+unioned builtin type sets. `set-default-registry!` replaces the live default;
+tests that mutate it should restore the old default in `try`/`finally`.
 
 ## Transformers
 
@@ -235,12 +447,13 @@ All 39 schema types, each with a validating example:
 ;; => :balli.core/coercion
 ```
 
-The six built-ins:
+The seven built-ins:
 
 | Transformer | Behavior |
 |---|---|
 | `string-transformer` | Decode scalars from strings (int/double/boolean/keyword/symbol/uuid/enum), sequentials into vectors/sets; encode scalars to strings |
 | `json-transformer` | Assumes JSON-parsed input: no string→number/boolean coercion; keyword/symbol/uuid from string, sets from sequentials, `:map-of` keys via string rules |
+| `time-transformer` | Decode/encode `:time/*` values with ISO strings; parse failures and awareness-policy misses pass through unchanged |
 | `strip-extra-keys-transformer` | `:map` — drop undeclared keys (unless explicitly `{:closed false}`); `:map-of` — drop entries failing the key/value schemas |
 | `key-transformer` | `{:decode f :encode g}` applied to map keys |
 | `default-value-transformer` | Replace nil (and fill missing required map keys) from the `:default` property; opts `{:key ... :defaults {type f} :add-optional-keys bool}` |
@@ -538,7 +751,7 @@ Maps with many distinct keys but uniform key/value shapes become `[:map-of k v]`
 |---|---|
 | `transformer` | Compose chain-link maps / transformers / 0-arg fns into one transformer (decode in chain order, encode reversed). |
 | `transformer?` / `into-transformer` | Predicate / coercion into a transformer object. |
-| `string-transformer` `json-transformer` `strip-extra-keys-transformer` `key-transformer` `default-value-transformer` `collection-transformer` | The built-ins (see [Transformers](#transformers)). |
+| `string-transformer` `json-transformer` `time-transformer` `strip-extra-keys-transformer` `key-transformer` `default-value-transformer` `collection-transformer` | The built-ins (see [Transformers](#transformers)). |
 
 ### `balli.util`
 
@@ -563,9 +776,13 @@ Maps with many distinct keys but uniform key/value shapes become `[:map-of k v]`
 | `balli.generator/function-checker` | `(function-checker opts?)` — generative `:=>`/`:function` checker; `{:iterations n}` (default 100). |
 | `balli.provider/provide` | `(provide samples opts?)` — infer a schema form; `{:map-of-threshold n}`. |
 | `balli.registry/registry` | `(registry & schema-maps)` — layer `{qualified-kw form}` maps over the default registry. |
-| `balli.registry/default-registry` | Builtin types, no custom schemas. |
+| `balli.registry/default-registry` | `(default-registry)` — returns the current mutable default registry. |
+| `balli.registry/register!` | `(register! kw form)` / `(register! {kw form ...})` — merge schemas into the current default registry. |
+| `balli.registry/set-default-registry!` | `(set-default-registry! r)` — replace the mutable default registry. |
+| `balli.registry/composite` | `(composite r1 r2 ...)` — eager first-hit registry merge. |
+| `balli.registry/mutation-epoch` | atom — bumped by default-registry mutations; raw-form caches use it for invalidation. |
 | `balli.registry/resolve-ref` | `(resolve-ref reg k)` — registered form or nil. |
-| `balli.registry/builtin-types` | var — the set of 39 builtin type keywords. |
+| `balli.registry/builtin-types` | var — the set of 49 builtin type keywords. |
 
 Unknown or malformed schema forms throw `ex-info` with `:type :balli.core/invalid-schema`; a `:ref` to an unregistered keyword throws `:balli.core/unresolved-ref` at compile time (fail fast, not at validate).
 
@@ -575,6 +792,8 @@ Balli covers most of Malli's core surface but is Malli-**inspired**, not a port.
 
 - **No sexpr/serialized property code** — schema properties take real Basilisp fns (`:fn` children, `:dispatch`, `:gen/fmap`, `:decode/*` overrides, ...); there is no sci and no evaluation of quoted code.
 - **No `:andn`** and **no old (pre-0.18) parse format** shim.
+- **No var/dynamic/lazy registries** — Balli has plain registry maps, eager `composite`, local `:registry` properties, and a mutable default registry.
+- **Time schemas use Python's stdlib model** — `:time/instant`, `:time/local-date-time`, `:time/local-date`, `:time/local-time`, and `:time/duration` are implemented. Skipped: offset/zoned date-times as distinct types, offset-time, calendar periods, zone ids, and zone offsets.
 - **No test.check shrinking** — generators produce single values; failures are not minimized.
 - **`:re`/`:fn` generation requires `:gen/*` props** — otherwise `:balli.core/no-generator` is thrown (Malli dynaloads test.chuck for regex generation).
 - **No `malli.dev`, `malli.experimental`, OpenAPI/Swagger, DOT, or clj-kondo modules.**
@@ -583,12 +802,13 @@ Behavioral deviations:
 
 - **Basilisp data only** — validators check Basilisp data structures. Python `dict`/`list` values are *not* accepted; convert at the interop boundary first.
 - **`walk` is form-level** — `f` is `(fn [rebuilt-form path] form')` over forms, not Malli's 4-arg walker over schema objects; `schema-walker` keeps the familiar call shape. Refs are not entered.
-- **Schema-object opts are baked** — call-time opts (registry, `:balli.core/function-checker`) are ignored when the schema argument is already a schema object; bake them at `(b/schema form opts)`. Raw-form calls carrying a checker bypass the global raw-form cache.
+- **Schema-object opts and registries are baked** — call-time opts (registry, `:balli.core/function-checker`) are ignored when the schema argument is already a schema object; bake them at `(b/schema form opts)`. Mutating the default registry affects future raw-form calls but not existing schema objects. Raw-form calls carrying a checker bypass the global raw-form cache.
 - **`instrument` always arity-checks** — the argument-count check against the input seqex bounds runs on every call regardless of `:scope`.
 - **`:multi` keyword dispatch uses `get`** — a keyword `:dispatch` is looked up with `(get value k)` (nil on non-associative values → `:balli.core/invalid-dispatch-value`); it is not invoked as an arbitrary ifn. Fn dispatch must be Python-callable.
+- **`ifn?` uses `ifn-like?`** — real fns plus keywords, maps, and sets count as ifn-like; vectors and symbols are rejected even though Python/Basilisp callability is broader.
 - **Provider never tuple-izes** — same-arity vector samples infer `[:vector x]`, never `:tuple`; and mixed int/float samples infer `[:or :int :double]` (Basilisp `float?` rejects ints, so no single scalar type covers both). No `:enum` inference.
 - **`:?` unparse is stricter** — the child unparser is tried first; only a nil the child rejects unparses to `[]`, and shape mismatches return `:balli.core/invalid` rather than best-effort output.
-- **JSON Schema ref names are JSON-Pointer-escaped** in `$ref` strings (`:tree/node` → `"#/definitions/tree~1node"`) with unescaped `"definitions"` keys; seqex types export as lossy `{"type" "array"}`.
+- **JSON Schema ref names are JSON-Pointer-escaped** in `$ref` strings (`:tree/node` → `"#/definitions/tree~1node"`) with unescaped `"definitions"` keys; local-registry shadow collisions get `__2`, `__3`, ... suffixes; seqex types export as lossy `{"type" "array"}`.
 - **Set element `:in`** uses the element's seq-order ordinal (sets are unordered; the index identifies which element in seq order failed, not a stable position).
 - **Mixed-level humanize uses `:balli/error`** — when a value has errors of its own *and* nested child errors (e.g. `[:vector {:min 3} :int]` on `[1 "x"]`), `humanize` renders that level as a map with child entries plus the level's own messages under the reserved `:balli/error` key: `{1 ["should be an integer"] :balli/error ["should have at least 3 elements"]}`.
 

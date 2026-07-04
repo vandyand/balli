@@ -108,9 +108,9 @@ Seven phases: spike → predicates/comparators → mutable registry → local re
 
 ## Phase 6: Docs, 0.3.0, full sweep
 
-- [ ] README: new sections (Self-contained schemas/local registries, Default branches, Time schemas, Predicate & comparator schemas, Mutable registry) — every example run-verified; schema table + API reference extended; Differences updated (time subset + skipped types, no var/dynamic/lazy registries, snapshot semantics for baked objects, shadowed-def json-schema suffix rule, ifn? ≈ ifn-like)
-- [ ] Version 0.3.0 (pyproject + core/version + toolchain test)
-- [ ] Full sweep: `basilisp test` under `PYTHONHASHSEED=1,2,3`; compile_check; wheel check ships `time.lpy`; out-of-cwd smoke using a local-registry schema
+- [x] README: new sections (Self-contained schemas/local registries, Default branches, Time schemas, Predicate & comparator schemas, Mutable registry) — every example run-verified; schema table + API reference extended; Differences updated (time subset + skipped types, no var/dynamic/lazy registries, snapshot semantics for baked objects, shadowed-def json-schema suffix rule, ifn? ≈ ifn-like)
+- [x] Version 0.3.0 (pyproject + core/version + toolchain test)
+- [x] Full sweep: `basilisp test` under `PYTHONHASHSEED=1,2,3`; compile_check; wheel check ships `time.lpy`; out-of-cwd smoke using a local-registry schema
 
 **Checkpoints:** 3× seeded full runs green; compile_check 12 namespaces; wheel `.lpy` listing; `/tmp` smoke.
 
