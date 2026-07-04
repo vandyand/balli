@@ -1,0 +1,48 @@
+;; Compile-check every Basilisp namespace under src/.
+;;
+;; Run from the repo root: basilisp run scripts/compile_check.lpy
+;; Imports each src/**/*.lpy via importlib; prints each namespace + OK and
+;; exits nonzero when any namespace fails to compile/import.
+(import glob importlib os os.path sys traceback)
+
+(def repo-root (os/getcwd))
+
+(def src-dir (os.path/join repo-root "src"))
+
+(defn namespaces
+  "[[ns module path] ...] for every .lpy file under src/."
+  []
+  (for [path (sort (glob/glob (os.path/join src-dir "**" "*.lpy") ** :recursive true))]
+    (let [rel (os.path/relpath path src-dir)
+          mod (-> (subs rel 0 (- (count rel) (count ".lpy")))
+                  (.replace (.-sep os) "."))
+          ns (.replace mod "_" "-")]
+      [ns mod path])))
+
+(defn eprintln
+  [& xs]
+  (python/print (apply str xs) ** :file (.-stderr sys)))
+
+(defn main
+  []
+  (when-not (.startswith (first (.-path sys)) src-dir)
+    (.insert (.-path sys) 0 src-dir))
+  (let [failures (atom 0)
+        checked (atom 0)]
+    (doseq [[ns mod path] (namespaces)]
+      (swap! checked inc)
+      (try
+        (importlib/import_module mod)
+        (println (str ns " OK"))
+        (catch python/Exception _
+          (swap! failures inc)
+          (eprintln "COMPILE FAILURE: " ns " (" path ")")
+          (traceback/print_exc)
+          (eprintln (apply str (repeat 72 "-"))))))
+    (if (> @failures 0)
+      (do
+        (eprintln "compile_check: " @failures "/" @checked " namespaces FAILED")
+        (python/exit 1))
+      (println (str "compile_check: " @checked " namespaces OK")))))
+
+(main)
