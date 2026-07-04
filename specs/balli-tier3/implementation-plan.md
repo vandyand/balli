@@ -75,13 +75,14 @@ Seven phases: spike → predicates/comparators → mutable registry → local re
 
 ## Phase 4: :balli.core/default branches (§2)
 
-- [ ] normalize: `:map`/`:multi` entries with key `:balli.core/default` are legal (any schema value); at most ONE default entry each (else invalid-schema)
-- [ ] compile `:map` (validator/explainer/parser/unparser): residual-map semantics per §2 — validate once on map-minus-explicit-keys; default DISABLES `:closed`; explain at path `(conj path :balli.core/default)` original `in`; parse merge-back
-- [ ] compile `:multi`: dispatch fallback branch (validate/explain/parse; parse tags `:balli.core/default`)
-- [ ] transform: `:map` default-residual transform + merge-under; `:multi` fallback descent; strip-extra-keys: default entry present → strip nothing
-- [ ] json-schema: `:map` default entry → merge default-schema's export as `"additionalProperties"` when it's a `:map-of` (val schema), else best-effort merge per §B of post-mvp semantics (properties/required merged); `:multi` default branch included in `oneOf`
-- [ ] error/humanize: default-branch errors render at their `:in` as usual
-- [ ] `tests/test_default_branch.lpy`: map+default validate/explain/parse/decode matrix incl. closed-disabled, strip-nothing, residual-invalid; multi fallback validate/explain/parse-tag; two default entries → invalid-schema; **composition: default entry whose schema is a local-registry ref (`[:balli.core/default [:map-of :keyword [:ref ::v]]]` with `:registry` prop); schema-object through decode**
+- [x] normalize: `:map`/`:multi` entries with key `:balli.core/default` are legal (any schema value); at most ONE default entry each (else invalid-schema) — AST splits the default entry onto the node as `:default-entry` (same entry-map shape); `:children` holds only explicit entries; `:form` keeps the original (commit: 7358514)
+- [x] compile `:map` (validator/explainer/parser/unparser): residual-map semantics per §2 — validate once on map-minus-explicit-keys; default DISABLES `:closed`; explain at path `(conj path :balli.core/default)` original `in`; parse merge-back (commit: 7358514)
+- [x] compile `:multi`: dispatch fallback branch (validate/explain/parse; parse tags `:balli.core/default`) — a THROWING dispatch fn now counts as a miss in the validator too (was: plain false), matching the explainer/coder `::dispatch-threw` handling (commit: 7358514)
+- [x] transform: `:map` default-residual transform + merge-under; `:multi` fallback descent; strip-extra-keys: default entry present → strip nothing (commit: 7358514)
+- [x] json-schema: `:map` default entry → merge default-schema's export as `"additionalProperties"` when it's a `:map-of` (val schema), else best-effort merge per §B of post-mvp semantics (properties/required merged); `:multi` default branch included in `oneOf` (commit: 7358514)
+- [x] error/humanize: default-branch errors render at their `:in` as usual (verified by test; no code change needed)
+- [x] core walk: default entry visited at `(conj path :balli.core/default)` and rebuilt into the form (appended LAST regardless of original position — documented deviation)
+- [x] `tests/test_default_branch.lpy` (14 tests): map+default validate/explain/parse/decode matrix incl. closed-disabled, strip-nothing, residual-invalid; multi fallback validate/explain/parse-tag; two default entries → invalid-schema; **composition: default entry whose schema is a local-registry ref (`[:balli.core/default [:map-of :keyword [:ref ::v]]]` with `:registry` prop); schema-object through decode** (commit: 7358514)
 
 **Checkpoints:**
 - `(b/validate [:map {:closed true} [:x :int] [:balli.core/default [:map-of :keyword :string]]] {:x 1 :extra "ok"})` → `true` (closed disabled by default entry)
