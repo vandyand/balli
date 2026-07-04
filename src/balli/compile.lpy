@@ -233,21 +233,9 @@
 ;; cache atom under ::function-checker (the atom's other keys are ref
 ;; keywords, which cannot collide with this namespaced key).
 
-(defn fn-like?
-  "True when `x` is function-like: a Basilisp fn, or a Python callable that
-  is not a Basilisp collection, keyword, or symbol. Bare `python/callable`
-  is deliberately NOT used -- keywords, maps, sets, vectors, and symbols all
-  implement __call__ in Basilisp and would validate as functions. `fn?` alone
-  is too narrow (false for Python builtins and bound methods, both legitimate
-  callables in interop). Note the filtered-callable arm still admits any
-  non-collection Python callable (classes, bound methods, functools.partial
-  objects) -- intentional."
-  [x]
-  (or (fn? x)
-      (and (python/callable x)
-           (not (coll? x))
-           (not (keyword? x))
-           (not (symbol? x)))))
+;; Canonical fn-like? lives in balli.normalize (compile requires normalize;
+;; the reverse import would be circular). Re-exported here for the public API.
+(def fn-like? norm/fn-like?)
 
 (defn- compile-node
   [node registry cache]

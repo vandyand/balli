@@ -16,6 +16,27 @@
   [msg form]
   (throw (ex-info msg {:type :balli.core/invalid-schema :form form})))
 
+(defn fn-like?
+  "True when `x` is function-like: a Basilisp fn, or a Python callable that
+  is not a Basilisp collection, keyword, or symbol. Bare `python/callable`
+  is too broad — keywords, maps, sets, vectors, and symbols all implement
+  __call__ in Basilisp. Canonical home of this predicate (balli.compile
+  aliases it)."
+  [x]
+  (or (fn? x)
+      (and (python/callable x)
+           (not (coll? x))
+           (not (keyword? x))
+           (not (symbol? x)))))
+
+(defn ifn-like?
+  "Clojure-idiom predicate position: real fns plus keywords, maps, and sets
+  (all callable lookups routinely used as predicates). Vectors and symbols
+  are callable in Basilisp too but are rejected — they are far more likely
+  to be schema-authoring mistakes than intentional predicates."
+  [x]
+  (or (fn-like? x) (keyword? x) (map? x) (set? x)))
+
 (def ^:private bounded-types
   "Types whose :min/:max properties participate in numeric comparisons at
   validate time (string length, numeric value, collection count)."
@@ -176,8 +197,9 @@
   (let [[props elems] (split-props-leading (rest form))]
     (when-not (contains? props :dispatch)
       (invalid! ":multi requires a :dispatch property" form))
-    (when-not (python/callable (:dispatch props))
-      (invalid! ":multi :dispatch must be a keyword or fn" form))
+    (let [d (:dispatch props)]
+      (when-not (or (keyword? d) (fn-like? d))
+        (invalid! ":multi :dispatch must be a keyword or fn" form)))
     (node :multi props (mapv #(normalize-entry % opts) elems) form)))
 
 (defmethod normalize :orn [form opts]
@@ -209,8 +231,8 @@
     (when-not (= 1 (count elems))
       (invalid! ":fn expects exactly 1 predicate child" form))
     (let [pred (first elems)]
-      (when-not (python/callable pred)
-        (invalid! ":fn child must be callable" form))
+      (when-not (ifn-like? pred)
+        (invalid! ":fn child must be a fn, keyword, map, or set" form))
       (node :fn props [pred] form))))
 
 ;; ---------------------------------------------------------------------------
@@ -370,13 +392,22 @@
       (doseq [c children]
         (when-not (= :=> (:type c))
           (invalid! ":function children must be :=> schemas" form)))
-      ;; distinct arities: the {:min :max} pair of each :=> input seqex must
-      ;; be unique, and at most one child may be varargs (unbounded :max).
-      (let [mms (mapv #(regex-min-max (first (:children %))) children)]
-        (when (not= (count mms) (count (set mms)))
+      ;; Arity grouping (malli -group-by-arity! semantics): each :=> child's
+      ;; arity key is its input min when min == max (fixed), else :varargs.
+      ;; Duplicate fixed arities, more than one varargs, and any fixed arity
+      ;; >= the varargs min are all ambiguous for instrument dispatch.
+      (let [mms (mapv #(regex-min-max (first (:children %))) children)
+            arity-key (fn [{:keys [min max]}] (if (= min max) min :varargs))
+            keys* (mapv arity-key mms)
+            fixed (filterv number? keys*)
+            varargs-mms (filterv #(= :varargs (arity-key %)) mms)]
+        (when (not= (count fixed) (count (set fixed)))
           (invalid! ":function :=> children must have distinct arities" form))
-        (when (< 1 (count (remove :max mms)))
-          (invalid! ":function allows at most one varargs :=> child" form)))
+        (when (< 1 (count varargs-mms))
+          (invalid! ":function allows at most one varargs :=> child" form))
+        (when-let [v (first varargs-mms)]
+          (when (some #(>= % (:min v)) fixed)
+            (invalid! ":function fixed arities must be below the varargs :=> child's minimum" form))))
       (node :function props children form))))
 
 ;; ---------------------------------------------------------------------------

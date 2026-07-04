@@ -312,3 +312,15 @@
     (let [s [:map [:handler =>int->int]]]
       (is (true? (b/validate s {:handler inc})))
       (is (false? (b/validate s {:handler :not-a-fn}))))))
+
+(deftest function-overlapping-arities-rejected
+  (testing "fixed arity inside a varargs range is ambiguous"
+    (is (= :balli.core/invalid-schema
+           (try (b/validate [:function
+                             [:=> [:cat :int] :int]
+                             [:=> [:cat :int [:? :int]] :string]] inc)
+                (catch python/Exception e (:type (ex-data e)))))))
+  (testing "fixed arity below the varargs minimum is fine"
+    (is (true? (b/validate [:function
+                            [:=> [:cat :int] :int]
+                            [:=> [:cat :int :int [:* :int]] :int]] +)))))
