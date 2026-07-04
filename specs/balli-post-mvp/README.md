@@ -48,6 +48,6 @@ See [research.md](research.md) and the [implementation plan](implementation-plan
 - [x] Phase 5: parse/unparse + :orn
 - [x] Phase 6: Sequence schemas (balli.regex)
 - [x] Phase 7: Generators
-- [ ] Phase 8: Function schemas + instrument
+- [x] Phase 8: Function schemas + instrument
 - [ ] Phase 9: Provider (schema inference)
 - [ ] Phase 10: Docs + full sweep
