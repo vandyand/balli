@@ -140,6 +140,8 @@
       :not {"not" (child (first children))}
       :and {"allOf" (mapv child children)}
       :or {"anyOf" (mapv child children)}
+      ;; entry tags are a parse-time concern -- JSON Schema sees the branches
+      :orn {"anyOf" (mapv #(child (:schema %)) children)}
       :maybe {"oneOf" [(child (first children)) {"type" "null"}]}
       :multi {"oneOf" (mapv #(child (:schema %)) children)}
       :map-of (with-min-max {"type" "object"

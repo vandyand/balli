@@ -186,15 +186,16 @@
     (when (seq ts)
       (chain-fns ts))))
 
-(defn- transform-or
-  "Decode: try each child's transformer in order, return the first result
-  that validates against that child; none valid -> the FIRST child's
-  transformed result. Encode: first child whose validator accepts the raw
+(defn- transform-or*
+  "Decode: try each branch's transformer in order, return the first result
+  that validates against that branch; none valid -> the FIRST branch's
+  transformed result. Encode: first branch whose validator accepts the raw
   value gets its transformer; none match -> unchanged. Collapses to nil when
-  no child has a transformer (identity either way)."
-  [node registry chain method opts cache]
-  (let [children (:children node)
-        ts (mapv #(transform-node % registry chain method opts cache) children)]
+  no branch has a transformer (identity either way). `children` are branch
+  AST nodes -- (:children node) for :or, the entry :schema nodes for :orn
+  (branch-select is tag-agnostic)."
+  [children registry chain method opts cache]
+  (let [ts (mapv #(transform-node % registry chain method opts cache) children)]
     (when (some some? ts)
       (let [ts (mapv #(or % identity) ts)
             vs (mapv #(c/compile-validator % registry) children)
@@ -323,7 +324,8 @@
     (:maybe :and :not)
     (children-in-order node registry chain method opts cache)
 
-    :or (transform-or node registry chain method opts cache)
+    :or (transform-or* (:children node) registry chain method opts cache)
+    :orn (transform-or* (mapv :schema (:children node)) registry chain method opts cache)
     :multi (transform-multi node registry chain method opts cache)
     :map (transform-map node registry chain method opts cache)
     :map-of (transform-map-of node registry chain method opts cache)

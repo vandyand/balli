@@ -7,8 +7,8 @@
 (def builtin-types
   "The set of schema type keywords balli supports natively."
   #{:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid
-    :map :map-of :vector :sequential :set :tuple :enum := :maybe :and :or :not
-    :fn :multi :re :ref})
+    :map :map-of :vector :sequential :set :tuple :enum := :maybe :and :or :orn
+    :not :fn :multi :re :ref})
 
 (defn default-registry
   "Returns the default registry: builtin types, no custom schemas."

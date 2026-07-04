@@ -232,7 +232,7 @@
 (deftest registry-basics
   (is (contains? reg/builtin-types :map))
   (is (contains? reg/builtin-types :=))
-  (is (= 27 (count reg/builtin-types)))
+  (is (= 28 (count reg/builtin-types)))
   (is (= {} (:schemas (reg/default-registry))))
   (is (= reg/builtin-types (:types (reg/default-registry))))
   (let [r (reg/registry {:user/id :string} {:user/age :int})]

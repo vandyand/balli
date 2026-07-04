@@ -257,6 +257,112 @@
   ([s value t opts] ((coercer s t opts) value)))
 
 ;; ---------------------------------------------------------------------------
+;; parse/unparse (Phase 5)
+;;
+;; (parse s x) -> parsed value | :balli.core/invalid (see `invalid?`);
+;; (unparse s parsed) is the exact inverse, same sentinel on mismatch.
+;; Non-transforming schemas parse as validate-then-value; :orn/:multi wrap
+;; branch parses in Tag records. The Tag/Tags record types physically live in
+;; balli.compile (this ns requires it, so defining them here would be a
+;; circular require) -- the ctor/pred fns below are the public surface.
+;; NOTE: Tag/Tags satisfy map? (Basilisp records are maps), but the :map
+;; parser guard rejects them explicitly, so parsed output cannot masquerade
+;; as plain map data.
+
+(defn tag
+  "Construct a Tag record {:key k :value v} -- the parse container for
+  :orn/:multi (and, from Phase 6, :altn) branch results."
+  [key value]
+  (c/->Tag key value))
+
+(defn tag?
+  "True when `x` is a Tag record."
+  [x]
+  (instance? c/Tag x))
+
+(defn tags
+  "Construct a Tags record {:values m} -- the parse container for :catn
+  (Phase 6)."
+  [values]
+  (c/->Tags values))
+
+(defn tags?
+  "True when `x` is a Tags record."
+  [x]
+  (instance? c/Tags x))
+
+(defn invalid?
+  "True when `x` is the parse/unparse failure sentinel :balli.core/invalid.
+  Compared with = rather than identical?: Basilisp keyword literals loaded
+  from cached namespace bytecode are not globally interned, so keyword
+  identity does not hold across modules (keyword = is a cheap name/ns
+  compare and IS reliable)."
+  [x]
+  (= ::invalid x))
+
+(defn- compile-parser!
+  "Compile a parser for schema object `s`, caching it under :parser in the
+  schema's :cache atom."
+  [s]
+  (let [f (c/compile-parser (:ast s) (:registry s))]
+    (swap! (:cache s) assoc :parser f)
+    f))
+
+(defn- compile-unparser!
+  "Compile an unparser for schema object `s`, caching it under :unparser in
+  the schema's :cache atom."
+  [s]
+  (let [f (c/compile-unparser (:ast s) (:registry s))]
+    (swap! (:cache s) assoc :unparser f)
+    f))
+
+(defn parser
+  "Compiled 1-arg parser for `s` (raw form or schema object): value ->
+  parsed value | :balli.core/invalid. `opts` supports {:registry r} and is
+  ignored when `s` is already a schema object. Cached like `validator`
+  (schema-object cache under :parser, raw forms in the bounded global cache).
+  An :and schema with two or more transforming children (:orn/:multi,
+  directly or through refs) throws ex-info
+  {:type :balli.core/invalid-schema} at compile time."
+  ([s] (parser s {}))
+  ([s opts]
+   (if (schema? s)
+     (or (:parser @(:cache s))
+         (compile-parser! s))
+     ;; raw form: bounded global cache keyed by [form registry-id]
+     (let [k [s (registry-id (:registry opts))]]
+       (or (get-in @raw-cache [k :parser])
+           (raw-cache-put! k :parser (parser (schema s opts))))))))
+
+(defn unparser
+  "Compiled 1-arg unparser for `s` -- the exact inverse of `parser`: parsed
+  value -> original value | :balli.core/invalid. Cached under :unparser.
+  See `parser`."
+  ([s] (unparser s {}))
+  ([s opts]
+   (if (schema? s)
+     (or (:unparser @(:cache s))
+         (compile-unparser! s))
+     ;; raw form: bounded global cache keyed by [form registry-id]
+     (let [k [s (registry-id (:registry opts))]]
+       (or (get-in @raw-cache [k :unparser])
+           (raw-cache-put! k :unparser (unparser (schema s opts))))))))
+
+(defn parse
+  "Parse `value` against `s`: the value itself for non-transforming schemas
+  (validate-then-value), Tag records for :orn/:multi branches, or
+  :balli.core/invalid on mismatch. `opts` supports {:registry r} and is
+  ignored when `s` is a schema object."
+  ([s value] ((parser s) value))
+  ([s value opts] ((parser s opts) value)))
+
+(defn unparse
+  "Unparse `value` (a parse result) against `s` back into the original
+  value, or :balli.core/invalid on mismatch. Exact inverse of `parse`."
+  ([s value] ((unparser s) value))
+  ([s value opts] ((unparser s opts) value)))
+
+;; ---------------------------------------------------------------------------
 ;; walk (Phase 2)
 ;;
 ;; FORM-level postwalk. Signature deviation from Malli: Malli's `m/walk` takes
@@ -269,11 +375,11 @@
 ;; `(walk s (schema-walker f))` reads like Malli's
 ;; `(m/walk s (m/schema-walker f))`. No separate walker protocol.
 ;;
-;; Path semantics (mirrors explain :path): map/:multi entry value schemas get
-;; (conj path key); indexed children (single-child colls, :and/:or/:tuple,
-;; :map-of, :maybe, :not) get (conj path i); scalars/leaves keep the node's
-;; own path. Refs are NOT entered — the ref node is a leaf and its form
-;; (bare keyword or [:ref k]) is passed to f unchanged.
+;; Path semantics (mirrors explain :path): :map/:multi/:orn entry value
+;; schemas get (conj path key); indexed children (single-child colls,
+;; :and/:or/:tuple, :map-of, :maybe, :not) get (conj path i); scalars/leaves
+;; keep the node's own path. Refs are NOT entered — the ref node is a leaf
+;; and its form (bare keyword or [:ref k]) is passed to f unchanged.
 
 (def ^:private walk-leaf-types
   "AST node types walked as leaves: no schema children to descend into (:enum
@@ -292,7 +398,7 @@
       (contains? walk-leaf-types t)
       (f (:form node) path)
 
-      (contains? #{:map :multi} t)
+      (contains? #{:map :multi :orn} t)
       (let [entries (mapv (fn [{:keys [key properties schema]}]
                             (let [v (walk-ast schema (conj path key) f)]
                               (if (seq properties)
@@ -318,9 +424,10 @@
   node — children first — the form is rebuilt from the walked children and
   `(f rebuilt-form path)` is called; f's return value replaces the node's
   form in its parent. Returns f's result at the root. `opts` supports
-  {:registry r} for raw forms (ignored when `s` is a schema object). Map and
-  :multi entry value schemas are visited with (conj path key); indexed
-  children with (conj path i); refs are not entered (leaf, form unchanged)."
+  {:registry r} for raw forms (ignored when `s` is a schema object). :map,
+  :multi, and :orn entry value schemas are visited with (conj path key);
+  indexed children with (conj path i); refs are not entered (leaf, form
+  unchanged)."
   ([s f] (walk s f {}))
   ([s f opts]
    (let [ast (if (schema? s)

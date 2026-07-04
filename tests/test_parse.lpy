@@ -1,0 +1,409 @@
+(ns tests.test-parse
+  "Phase 5: parse/unparse + :orn per malli-semantics section E. Round-trips
+  for every schema type, Tag shapes for :orn/:multi, the :balli.core/invalid
+  sentinel in both directions, the Tag/Tags :map guard, :and transforming-
+  child analysis (zero/one/ref-hidden/recursive/>=2), and :orn's additive
+  integration into validate/explain/humanize/transformers/json-schema/
+  walk/util."
+  (:import uuid)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.error :as be]
+            [balli.json-schema :as bjs]
+            [balli.registry :as reg]
+            [balli.transform :as bt]
+            [balli.util :as u]))
+
+(defn- round-trips?
+  "(unparse s (parse s x)) = x, and the parse itself was not invalid."
+  ([s x] (round-trips? s x {}))
+  ([s x opts]
+   (let [p (b/parse s x opts)]
+     (and (not (b/invalid? p))
+          (= x (b/unparse s p opts))))))
+
+;; ---------------------------------------------------------------------------
+;; Tag/Tags ctors + preds
+
+(deftest tag-ctors-and-preds
+  (let [t (b/tag :num 42)]
+    (is (b/tag? t))
+    (is (= :num (:key t)))
+    (is (= 42 (:value t)))
+    (is (= (b/tag :num 42) t))
+    (is (not= (b/tag :num 43) t))
+    (testing "a plain map is not a Tag (value equality cannot fool the pred)"
+      (is (not (b/tag? {:key :num :value 42})))
+      (is (not= {:key :num :value 42} t))))
+  (let [ts (b/tags {:a 1})]
+    (is (b/tags? ts))
+    (is (= {:a 1} (:values ts)))
+    (is (not (b/tags? (b/tag :a 1))))
+    (is (not (b/tag? ts)))))
+
+(deftest invalid-sentinel
+  (is (b/invalid? :balli.core/invalid))
+  (is (not (b/invalid? nil)))
+  (is (not (b/invalid? :other)))
+  (is (= :balli.core/invalid (b/parse :int "x"))))
+
+;; ---------------------------------------------------------------------------
+;; Simple types: parse == validate-then-value (both directions)
+
+(deftest parse-simple-types
+  (is (= 42 (b/parse :int 42)))
+  (is (= "a" (b/parse :string "a")))
+  (is (= :k (b/parse :keyword :k)))
+  (is (nil? (b/parse :nil nil)))
+  (is (true? (b/parse :boolean true)))
+  (is (= 1.5 (b/parse :double 1.5)))
+  (is (= 'sym (b/parse :symbol 'sym)))
+  (is (= :a (b/parse [:enum :a :b] :a)))
+  (is (= 5 (b/parse [:= 5] 5)))
+  (is (= 4 (b/parse [:fn even?] 4)))
+  (is (= "aa" (b/parse [:re "^a+$"] "aa")))
+  (is (= 42 (b/parse [:not :string] 42)))
+  (testing "invalid -> sentinel"
+    (is (b/invalid? (b/parse :int "x")))
+    (is (b/invalid? (b/parse [:enum :a :b] :c)))
+    (is (b/invalid? (b/parse [:= 5] 6)))
+    (is (b/invalid? (b/parse [:fn even?] 3)))
+    (is (b/invalid? (b/parse [:re "^a+$"] "b")))
+    (is (b/invalid? (b/parse [:not :string] "s")))
+    (is (b/invalid? (b/parse [:string {:min 3}] "ab"))))
+  (testing "unparse mirrors (sentinel both directions)"
+    (is (= 42 (b/unparse :int 42)))
+    (is (b/invalid? (b/unparse :int "x")))))
+
+;; ---------------------------------------------------------------------------
+;; :orn -- Tag shapes, unparse dispatch, validate/explain
+
+(deftest orn-parse-tag-shape
+  (let [s [:orn [:num :int] [:str :string]]]
+    (is (= (b/tag :num 42) (b/parse s 42)))
+    (is (= (b/tag :str "x") (b/parse s "x")))
+    (testing "first matching branch wins"
+      (is (= (b/tag :num 7) (b/parse [:orn [:num :int] [:also :int]] 7))))
+    (testing "no branch matches -> invalid"
+      (is (b/invalid? (b/parse s :kw))))
+    (testing "entry properties are allowed"
+      (is (= (b/tag :num 1) (b/parse [:orn [:num {:doc "n"} :int]] 1))))))
+
+(deftest orn-unparse
+  (let [s [:orn [:num :int] [:str :string]]]
+    (is (= 42 (b/unparse s (b/parse s 42))))
+    (is (= "x" (b/unparse s (b/parse s "x"))))
+    (testing "Tag with unknown :key -> invalid"
+      (is (b/invalid? (b/unparse s (b/tag :nope 42)))))
+    (testing "Tag whose value fails its branch -> invalid"
+      (is (b/invalid? (b/unparse s (b/tag :num "not-an-int")))))
+    (testing "non-Tag input -> invalid"
+      (is (b/invalid? (b/unparse s 42))))))
+
+(deftest orn-validate-and-explain
+  (is (b/validate [:orn [:num :int] [:str :string]] 42))
+  (is (b/validate [:orn [:num :int] [:str :string]] "x"))
+  (is (not (b/validate [:orn [:num :int] [:str :string]] :kw)))
+  (testing "all branches fail -> per-branch errors with the TAG in :path"
+    (let [{:keys [errors]} (b/explain [:orn [:num :int] [:str :string]] :kw)]
+      (is (= 2 (count errors)))
+      (is (= [[:num] [:str]] (mapv :path errors)))
+      (is (= [[] []] (mapv :in errors)))))
+  (testing "schema-boundary validation"
+    (doseq [bad [[:orn]
+                 [:orn {:props true}]
+                 [:orn [:only-a-tag]]
+                 [:orn [:t :not-a-known-schema]]]]
+      (is (= :balli.core/invalid-schema
+             (try (b/schema bad) nil
+                  (catch python/Exception e (:type (ex-data e)))))
+          (str bad)))
+    (testing "bare :orn keyword is not a schema"
+      (is (= :balli.core/invalid-schema
+             (try (b/schema :orn) nil
+                  (catch python/Exception e (:type (ex-data e)))))))))
+
+;; ---------------------------------------------------------------------------
+;; :multi -- Tag(dispatch-value, branch-parse)
+
+(deftest multi-parse-unparse
+  (let [s [:multi {:dispatch :type}
+           [:cat [:map [:type :keyword] [:lives :int]]]
+           [:dog [:map [:type :keyword] [:breed :string]]]]
+        v {:type :cat :lives 9}]
+    (let [p (b/parse s v)]
+      (is (b/tag? p))
+      (is (= :cat (:key p)))
+      (is (= v (:value p)))
+      (is (= v (b/unparse s p))))
+    (testing "unknown dispatch -> invalid"
+      (is (b/invalid? (b/parse s {:type :fish}))))
+    (testing "matching dispatch, invalid branch -> invalid"
+      (is (b/invalid? (b/parse s {:type :cat :lives "nine"}))))
+    (testing "unparse: unknown Tag key / non-Tag -> invalid"
+      (is (b/invalid? (b/unparse s (b/tag :fish {}))))
+      (is (b/invalid? (b/unparse s v))))))
+
+;; ---------------------------------------------------------------------------
+;; :maybe / :or
+
+(deftest maybe-parse
+  (is (nil? (b/parse [:maybe :int] nil)))
+  (is (= 5 (b/parse [:maybe :int] 5)))
+  (is (b/invalid? (b/parse [:maybe :int] "x")))
+  (is (nil? (b/unparse [:maybe :int] nil)))
+  (testing "maybe over orn"
+    (is (= (b/tag :i 3) (b/parse [:maybe [:orn [:i :int]]] 3)))
+    (is (nil? (b/parse [:maybe [:orn [:i :int]]] nil)))))
+
+(deftest or-parse-untagged
+  (let [s [:or :int :string]]
+    (is (= 5 (b/parse s 5)))
+    (is (= "a" (b/parse s "a")))
+    (is (b/invalid? (b/parse s :k))))
+  (testing "an :orn branch inside :or still tags (or itself adds nothing)"
+    (is (= (b/tag :i 5) (b/parse [:or [:orn [:i :int]] :string] 5)))
+    (is (= "a" (b/parse [:or [:orn [:i :int]] :string] "a")))
+    (is (= 5 (b/unparse [:or [:orn [:i :int]] :string] (b/tag :i 5))))))
+
+;; ---------------------------------------------------------------------------
+;; Collections / :tuple / :map / :map-of
+
+(deftest coll-parse
+  (is (= [1 2] (b/parse [:vector :int] [1 2])))
+  (is (= #{:a :b} (b/parse [:set :keyword] #{:a :b})))
+  (is (= [1 2] (b/parse [:sequential :int] (list 1 2))))
+  (testing "any invalid element -> whole coll invalid"
+    (is (b/invalid? (b/parse [:vector :int] [1 "x"])))
+    (is (b/invalid? (b/parse [:set :keyword] #{:a "b"}))))
+  (testing "validate semantics carry through (type + bounds)"
+    (is (b/invalid? (b/parse [:vector :int] (list 1 2))))
+    (is (b/invalid? (b/parse [:vector {:min 2} :int] [1])))
+    (is (b/invalid? (b/parse [:vector {:max 1} :int] [1 2]))))
+  (testing "elements parse structurally (orn elements -> Tags) and round-trip"
+    (let [s [:vector [:orn [:i :int] [:s :string]]]]
+      (is (= [(b/tag :i 1) (b/tag :s "a")] (b/parse s [1 "a"])))
+      (is (= [1 "a"] (b/unparse s (b/parse s [1 "a"])))))))
+
+(deftest tuple-parse
+  (let [s [:tuple :int [:orn [:s :string]]]]
+    (is (= [1 (b/tag :s "a")] (b/parse s [1 "a"])))
+    (is (= [1 "a"] (b/unparse s (b/parse s [1 "a"])))))
+  (is (b/invalid? (b/parse [:tuple :int :string] [1])))
+  (is (b/invalid? (b/parse [:tuple :int :string] [1 2])))
+  (is (b/invalid? (b/parse [:tuple :int :string] (list 1 "a")))))
+
+(deftest map-parse
+  (testing "stays a map; entry values parse; extra keys pass through when open"
+    (is (= {:x 1 :y "z"} (b/parse [:map [:x :int]] {:x 1 :y "z"}))))
+  (testing "missing required key -> invalid; optional missing ok"
+    (is (b/invalid? (b/parse [:map [:x :int]] {})))
+    (is (= {} (b/parse [:map [:x {:optional true} :int]] {}))))
+  (testing "closed + extra -> invalid"
+    (is (b/invalid? (b/parse [:map {:closed true} [:x :int]] {:x 1 :y 2})))
+    (is (= {:x 1} (b/parse [:map {:closed true} [:x :int]] {:x 1}))))
+  (testing "invalid entry value -> invalid"
+    (is (b/invalid? (b/parse [:map [:x :int]] {:x "one"})))))
+
+(deftest map-guard-rejects-tag-records
+  (let [s [:map [:key :keyword] [:value :int]]]
+    (testing "a plain map that LOOKS like a Tag parses fine"
+      (is (= {:key :num :value 42} (b/parse s {:key :num :value 42}))))
+    (testing "a real Tag record is rejected by the :map guard, even though
+              records satisfy map? and this one has matching fields"
+      (is (b/validate s (b/tag :num 42))) ; validate keeps plain map? semantics
+      (is (b/invalid? (b/parse s (b/tag :num 42))))
+      (is (b/invalid? (b/unparse s (b/tag :num 42)))))
+    (testing "Tags records are rejected too"
+      (is (b/invalid? (b/parse [:map [:values :any]] (b/tags {:a 1}))))))
+  (testing "the guard is per-:map-node: a Tag as a :map-of VALUE is fine"
+    (is (= {:a (b/tag :i 1)}
+           (b/parse [:map-of :keyword :any] {:a (b/tag :i 1)})))))
+
+(deftest map-of-parse
+  (let [s [:map-of :keyword [:orn [:i :int] [:s :string]]]]
+    (is (= {:a (b/tag :i 1) :b (b/tag :s "x")} (b/parse s {:a 1 :b "x"})))
+    (is (= {:a 1 :b "x"} (b/unparse s (b/parse s {:a 1 :b "x"})))))
+  (testing "keys parse too, and an invalid key or value kills the whole map"
+    (is (b/invalid? (b/parse [:map-of :keyword :int] {"str" 1})))
+    (is (b/invalid? (b/parse [:map-of :keyword :int] {:a "x"}))))
+  (testing "bounds carry through"
+    (is (b/invalid? (b/parse [:map-of {:min 2} :keyword :int] {:a 1})))))
+
+;; ---------------------------------------------------------------------------
+;; :and -- transforming-child analysis
+
+(deftest and-zero-transforming
+  (let [s [:and :int [:fn even?]]]
+    (testing "parse via first child, ALL other children validate the original"
+      (is (= 4 (b/parse s 4)))
+      (is (b/invalid? (b/parse s 3)))
+      (is (b/invalid? (b/parse s "x"))))
+    (is (= 4 (b/unparse s 4)))
+    (is (b/invalid? (b/unparse s 3)))))
+
+(deftest and-one-transforming
+  (let [ok? (fn [x] (or (string? x) (even? x)))
+        s [:and [:orn [:i :int] [:s :string]] [:fn ok?]]]
+    (testing "parse via the transforming child; :fn checks the ORIGINAL value"
+      (is (= (b/tag :i 4) (b/parse s 4)))
+      (is (= (b/tag :s "x") (b/parse s "x")))
+      (is (b/invalid? (b/parse s 3))))
+    (testing "unparse via the transforming child; :fn checks the RESULT"
+      (is (= 4 (b/unparse s (b/tag :i 4))))
+      (is (b/invalid? (b/unparse s (b/tag :i 3))))
+      (is (b/invalid? (b/unparse s 4))))
+    (testing "transforming child not in first position works the same"
+      (let [s2 [:and [:fn ok?] [:orn [:i :int] [:s :string]]]]
+        (is (= (b/tag :i 4) (b/parse s2 4)))
+        (is (b/invalid? (b/parse s2 3)))))))
+
+(deftest and-ref-hidden-transforming
+  (let [r (reg/registry {:result [:orn [:ok :int] [:err :string]]})
+        s [:and :result [:fn (fn [x] (or (string? x) (pos? x)))]]]
+    (testing "the analysis derefs the registry: :result hides an :orn"
+      (is (= (b/tag :ok 5) (b/parse s 5 {:registry r})))
+      (is (= (b/tag :err "boom") (b/parse s "boom" {:registry r})))
+      (is (b/invalid? (b/parse s 0 {:registry r}))))
+    (is (= 5 (b/unparse s (b/tag :ok 5) {:registry r})))))
+
+(deftest and-recursive-non-transforming-ref-terminates
+  ;; :num-tree references itself through :or -- the analysis walks the ref
+  ;; cycle once (visited set) and counts it as non-transforming instead of
+  ;; looping; parser compilation terminates via the lazy ref cache.
+  (let [r (reg/registry {:num-tree [:and [:or :int :num-tree] [:fn number?]]})]
+    (is (= 5 (b/parse :num-tree 5 {:registry r})))
+    (is (b/invalid? (b/parse :num-tree "x" {:registry r})))
+    (is (= 5 (b/unparse :num-tree 5 {:registry r})))))
+
+(deftest and-two-transforming-throws-at-compile
+  (testing "two direct transforming children"
+    (is (= :balli.core/invalid-schema
+           (try (b/parser [:and [:orn [:i :int]] [:orn [:s :string]]]) nil
+                (catch python/Exception e (:type (ex-data e)))))))
+  (testing "unparser compile throws the same"
+    (is (= :balli.core/invalid-schema
+           (try (b/unparser [:and [:orn [:i :int]] [:orn [:s :string]]]) nil
+                (catch python/Exception e (:type (ex-data e)))))))
+  (testing "one direct + one ref-hidden also counts as two"
+    (let [r (reg/registry {:result [:orn [:ok :int] [:err :string]]})]
+      (is (= :balli.core/invalid-schema
+             (try (b/parser [:and :result [:orn [:i :int]]] {:registry r}) nil
+                  (catch python/Exception e (:type (ex-data e))))))))
+  (testing "validate on the same form is unaffected (no compile throw; the
+            parse restriction does not apply to validation)"
+    (is (b/validate [:and [:orn [:i :int]] [:orn [:e [:fn even?]]]] 4))
+    (is (not (b/validate [:and [:orn [:i :int]] [:orn [:s :string]]] 5)))))
+
+;; ---------------------------------------------------------------------------
+;; :ref -- lazy cache + recursion
+
+(deftest ref-parse-recursive
+  (let [r (reg/registry {:tree [:map
+                                [:v [:orn [:n :int] [:w :string]]]
+                                [:kids {:optional true} [:vector [:ref :tree]]]]})
+        v {:v 1 :kids [{:v "two"} {:v 3 :kids [{:v 4}]}]}
+        p (b/parse [:ref :tree] v {:registry r})]
+    (is (= (b/tag :n 1) (:v p)))
+    (is (= (b/tag :w "two") (:v (first (:kids p)))))
+    (is (= (b/tag :n 4) (:v (first (:kids (second (:kids p)))))))
+    (is (= v (b/unparse [:ref :tree] p {:registry r})))
+    (is (b/invalid? (b/parse [:ref :tree] {:v :kw} {:registry r})))))
+
+;; ---------------------------------------------------------------------------
+;; Round-trip (unparse s (parse s x)) = x for every type
+
+(deftest round-trip-every-type
+  (let [u (uuid/uuid4)
+        multi-reg (reg/registry {:user [:map [:name :string]]})]
+    (doseq [[s x] [[:any 42]
+                   [:nil nil]
+                   [:string "a"]
+                   [:int 1]
+                   [:float 1.5]
+                   [:double 2.5]
+                   [:number 3]
+                   [:boolean false]
+                   [:keyword :k]
+                   [:symbol 'sym]
+                   [:uuid u]
+                   [[:enum :a :b] :b]
+                   [[:= 5] 5]
+                   [[:fn even?] 2]
+                   [[:re "^a+$"] "aaa"]
+                   [[:not :string] :kw]
+                   [[:maybe :int] nil]
+                   [[:maybe :int] 5]
+                   [[:or :int :string] "a"]
+                   [[:orn [:num :int] [:str :string]] 42]
+                   [[:and :int [:fn even?]] 4]
+                   [[:vector :int] [1 2 3]]
+                   [[:sequential :int] (list 1 2)]
+                   [[:set :keyword] #{:a :b}]
+                   [[:tuple :int :string] [1 "a"]]
+                   [[:map [:x :int] [:y {:optional true} :string]] {:x 1}]
+                   [[:map-of :keyword :int] {:a 1 :b 2}]
+                   [[:multi {:dispatch :type} [:t [:map [:type :keyword]]]] {:type :t}]]]
+      (is (round-trips? s x) (str "round-trip failed for " s)))
+    (is (round-trips? [:ref :user] {:name "jo"} {:registry multi-reg}))))
+
+;; ---------------------------------------------------------------------------
+;; parser/unparser fns + caching
+
+(deftest parser-and-unparser-caching
+  (testing "schema objects cache under :parser/:unparser"
+    (let [so (b/schema [:orn [:i :int]])]
+      (is (identical? (b/parser so) (b/parser so)))
+      (is (identical? (b/unparser so) (b/unparser so)))
+      (is (= (b/tag :i 3) ((b/parser so) 3)))
+      (is (= 3 ((b/unparser so) (b/tag :i 3))))))
+  (testing "raw forms cache in the global raw-form cache"
+    (is (identical? (b/parser [:vector [:orn [:i :int]]])
+                    (b/parser [:vector [:orn [:i :int]]])))
+    (is (identical? (b/unparser [:vector [:orn [:i :int]]])
+                    (b/unparser [:vector [:orn [:i :int]]])))))
+
+;; ---------------------------------------------------------------------------
+;; Composition: :orn inside a :map (plan checkpoint)
+
+(deftest composition-orn-in-map
+  (let [s [:map [:result [:orn [:ok :int] [:err :string]]]]]
+    (is (= {:result (b/tag :ok 42)} (b/parse s {:result 42})))
+    (is (= {:result (b/tag :err "nope")} (b/parse s {:result "nope"})))
+    (is (= {:result 42} (b/unparse s (b/parse s {:result 42}))))
+    (is (= {:result "nope"} (b/unparse s (b/parse s {:result "nope"}))))
+    (is (b/invalid? (b/parse s {:result :kw})))
+    (is (b/invalid? (b/unparse s {:result (b/tag :nope 1)})))))
+
+;; ---------------------------------------------------------------------------
+;; :orn additive integration into earlier phases' surfaces
+
+(deftest orn-json-schema-export
+  (is (= {"anyOf" [{"type" "integer"} {"type" "string"}]}
+         (bjs/transform [:orn [:i :int] [:s :string]]))))
+
+(deftest orn-transformer-descent
+  (testing "decode branch-selects like :or"
+    (is (= 42 (b/decode [:orn [:i :int] [:s :string]] "42" (bt/string-transformer))))
+    (is (= "abc" (b/decode [:orn [:i :int] [:s :string]] "abc" (bt/string-transformer))))
+    (is (= :kw (b/decode [:orn [:k :keyword] [:i :int]] "kw" (bt/string-transformer))))))
+
+(deftest orn-walk-and-util
+  (testing "walk treats :orn children as entries (tag in path)"
+    (let [seen (atom [])]
+      (is (= [:orn [:i :int] [:s {:doc "d"} :string]]
+             (b/walk [:orn [:i :int] [:s {:doc "d"} :string]]
+                     (fn [form path]
+                       (swap! seen conj path)
+                       form))))
+      (is (= [[:i] [:s] []] @seen))))
+  (testing "util get/get-in address entries by tag"
+    (is (= :string (u/get [:orn [:i :int] [:s :string]] :s)))
+    (is (nil? (u/get [:orn [:i :int]] :missing)))
+    (is (= :int (u/get-in [:map [:r [:orn [:ok :int]]]] [:r :ok])))))
+
+(deftest orn-humanize-transparent
+  (testing "the tag lives in :path only, so humanize mirrors :or"
+    (is (= ["should be an integer" "should be a string"]
+           (be/humanize (b/explain [:orn [:i :int] [:s :string]] :kw))))
+    (is (nil? (be/humanize (b/explain [:orn [:i :int] [:s :string]] 5))))))

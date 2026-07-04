@@ -249,15 +249,15 @@
   #{:maybe :not :vector :sequential :set :and :or :tuple :map-of})
 
 (defn get
-  "Sub-schema form of `s` at key/index `k`: :map/:multi entries by entry key,
-  indexed children (:and/:or/:tuple/:maybe/:not/colls/:map-of) by integer
+  "Sub-schema form of `s` at key/index `k`: :map/:multi/:orn entries by entry
+  key, indexed children (:and/:or/:tuple/:maybe/:not/colls/:map-of) by integer
   index. nil when absent. Refs are not dereferenced."
   ([s k] (get s k {}))
   ([s k opts]
    (let [ast (->ast s opts)
          t (:type ast)]
      (cond
-       (contains? #{:map :multi} t)
+       (contains? #{:map :multi :orn} t)
        (some (fn [{:keys [key schema]}]
                (when (= key k) (:form schema)))
              (:children ast))

@@ -4,7 +4,7 @@
   Every AST node is a plain map:
     {:type <kw> :properties <map> :children <vector> :form <original form fragment>}
 
-  :children is always a vector. :map and :multi children are entry maps
+  :children is always a vector. :map, :multi, and :orn children are entry maps
   {:key k :properties p :schema <ast>}. :ref nodes additionally carry :ref <kw>.
 
   Entry point: (normalize form opts) where opts may carry {:registry r}.
@@ -47,8 +47,9 @@
     [{} (vec args)]))
 
 (defn- split-props-leading
-  "Like split-props, but a leading map is always properties. Used for :map and
-  :multi, whose children are entry vectors and can never be bare maps."
+  "Like split-props, but a leading map is always properties. Used for :map,
+  :multi, and :orn, whose children are entry vectors and can never be bare
+  maps."
   [args]
   (if (map? (first args))
     [(first args) (vec (rest args))]
@@ -148,7 +149,7 @@
 (defmethod normalize :tuple [form opts] (normalize-n-children 0 form opts))
 
 ;; ---------------------------------------------------------------------------
-;; :map / :multi entries
+;; :map / :multi / :orn entries
 
 (defn- normalize-entry
   "Normalize an entry [k schema] or [k props schema] into
@@ -178,6 +179,14 @@
     (when-not (python/callable (:dispatch props))
       (invalid! ":multi :dispatch must be a keyword or fn" form))
     (node :multi props (mapv #(normalize-entry % opts) elems) form)))
+
+(defmethod normalize :orn [form opts]
+  (when (keyword? form)
+    (invalid! ":orn requires at least one entry" form))
+  (let [[props elems] (split-props-leading (rest form))]
+    (when (empty? elems)
+      (invalid! ":orn requires at least one entry" form))
+    (node :orn props (mapv #(normalize-entry % opts) elems) form)))
 
 ;; ---------------------------------------------------------------------------
 ;; :map-of
