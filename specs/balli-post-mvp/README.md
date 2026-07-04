@@ -1,6 +1,6 @@
 ---
 title: "Balli Post-MVP — close the Malli feature gap"
-status: in-progress
+status: completed
 date: 2026-07-04
 priority: 10
 ---
@@ -50,4 +50,4 @@ See [research.md](research.md) and the [implementation plan](implementation-plan
 - [x] Phase 7: Generators
 - [x] Phase 8: Function schemas + instrument
 - [x] Phase 9: Provider (schema inference)
-- [ ] Phase 10: Docs + full sweep
+- [x] Phase 10: Docs + full sweep

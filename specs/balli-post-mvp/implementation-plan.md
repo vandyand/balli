@@ -177,10 +177,10 @@ Goal: §I, `src/balli/provider.lpy`.
 
 ## Phase 10: Docs + full sweep
 
-- [ ] Root README: new sections (Transformers, Utilities, JSON Schema, Parsing, Sequence schemas, Function schemas, Generators, Inference) — every example run-verified; schema reference table extended with new types; API reference extended
-- [ ] "Differences from Malli" updated: REMOVE `:or` single-error bullet; ADD: fns-not-sexprs for property code, no `:andn`, no old-parse-format, `:re`/`:fn` gen needs `:gen/*`, no shrinking, no sci/dev/experimental modules, provider never tuple-izes
-- [ ] Version bump `0.2.0` in pyproject.toml + `balli.core/version`
-- [ ] Full sweep: `basilisp test` all green, `basilisp run scripts/compile_check.lpy` exit 0, wheel build ships new `.lpy` files, out-of-cwd import smoke
+- [x] Root README: new sections (Transformers, Utilities, JSON Schema, Spell-checking, Parsing, Sequence schemas, Function schemas, Generators, Inference) — every example run-verified via `basilisp run`; schema reference table extended to all 39 types; API reference extended, grouped by namespace (commit: 3ca671a)
+- [x] "Differences from Malli" updated: REMOVE `:or` single-error bullet (already gone since Phase 2); ADD: fns-not-sexprs for property code, no `:andn`, no old-parse-format, `:re`/`:fn` gen needs `:gen/*`, no shrinking, no sci/dev/experimental modules, provider never tuple-izes + mixed int/float → `[:or :int :double]`, `:?` unparse stricter, JSON-Pointer-escaped ref names, `:multi` keyword-dispatch via get, instrument always arity-checks, baked schema-object opts (commit: 3ca671a)
+- [x] Version bump `0.2.0` in pyproject.toml + `balli.core/version` (+ tests/test_toolchain.lpy expectation)
+- [x] Full sweep: `basilisp test` 293 green, `basilisp run scripts/compile_check.lpy` 11 namespaces OK exit 0, wheel `balli-0.2.0` ships all 11 `.lpy` files, out-of-cwd `balli.generator` import smoke OK (commit: 3ca671a)
 
 **Checkpoints:**
 - `basilisp test` → all pass (target ≥ 200 tests)
