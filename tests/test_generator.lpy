@@ -270,3 +270,11 @@
 (deftest any-generates-documented-pool
   (doseq [v (bg/sample :any {:seed 2 :size 30})]
     (is (or (nil? v) (int? v) (string? v) (boolean? v)))))
+
+(deftest float-bounds-coerced-for-integer-generation
+  (testing "float :min/:max on int/count-generating schemas don't crash"
+    (let [v (bg/generate [:int {:min 0.5 :max 5.5}] {:seed 1})]
+      (is (and (int? v) (<= 1 v 5))))
+    (is (b/validate [:repeat {:min 1.5 :max 2.5} :int]
+                    (bg/generate [:repeat {:min 1.5 :max 2.5} :int] {:seed 1})))
+    (is (string? (bg/generate [:string {:min 1.2 :max 3.9}] {:seed 1})))))

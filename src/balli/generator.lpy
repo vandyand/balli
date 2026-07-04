@@ -60,7 +60,7 @@
   collection/seqex rep counts collapse to their minimum (0 unless :min/:+
   says otherwise) -- so recursion hidden behind optional keys or 0-min
   collections terminates by omission before the ref escape is ever needed."
-  (:import random uuid)
+  (:import math random uuid)
   (:require [balli.compile :as c]
             [balli.core :as b]
             [balli.normalize :as norm]
@@ -106,14 +106,19 @@
         hi (if (some? gmx) hi (max lo hi))]
     [lo hi]))
 
+(defn- int-floor [x] (python/int (math/floor x)))
+(defn- int-ceil [x] (python/int (math/ceil x)))
+
 (defn- rand-count
   "Element/length count in [min, max|size/3] (with :gen/min/:gen/max
-  overriding :min/:max); collapses to the minimum in reduced mode."
+  overriding :min/:max); collapses to the minimum in reduced mode.
+  Bounds are ceil/floor-coerced to ints — normalize accepts float bounds
+  (they are legal for validation) but randint requires integers."
   [props rnd size reduced?]
   (let [gmn (or (:gen/min props) (:min props))
         gmx (or (:gen/max props) (:max props))
-        lo (or gmn 0)
-        hi (or gmx (max lo (quot size 3)))]
+        lo (int-ceil (or gmn 0))
+        hi (max lo (int-floor (or gmx (max lo (quot size 3)))))]
     (if reduced? lo (.randint rnd lo hi))))
 
 (def ^:private alnum-chars
@@ -129,7 +134,9 @@
 
 (defn- gen-int
   [props rnd size]
-  (let [[lo hi] (num-bounds props size)]
+  (let [[lo hi] (num-bounds props size)
+        lo (int-ceil lo)
+        hi (max lo (int-floor hi))]
     (.randint rnd lo hi)))
 
 (defn- gen-float
@@ -262,8 +269,8 @@
       :+ (let [n (if reduced? 1 (.randint rnd 1 (max 1 (quot size 3))))]
            (reps n #(chunk (first (:children node)))))
       :repeat (let [props (:properties node)
-                    mn (or (:min props) 0)
-                    mx (or (:max props) (+ mn (quot size 3)))
+                    mn (int-ceil (or (:min props) 0))
+                    mx (max mn (int-floor (or (:max props) (+ mn (quot size 3)))))
                     n (if reduced? mn (.randint rnd mn mx))]
                 (reps n #(chunk (first (:children node))))))))
 

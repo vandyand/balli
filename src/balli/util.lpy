@@ -72,13 +72,23 @@
 ;; props (s2 over s1), apply the requiredness rule, and recurse on the value
 ;; schemas (both nested :map => deep merge/union, else the :default rule).
 
+(defn- absorb-registry
+  "Thread a schema object's baked registry into opts so recursive merge-forms
+  calls (which pass raw child FORMS) resolve refs against the same registry.
+  Explicit opts registry wins; then s1's, then s2's."
+  [opts s]
+  (if (and (b/schema? s) (nil? (:registry opts)))
+    (assoc opts :registry (:registry s))
+    opts))
+
 (defn- merge-forms
   [s1 s2 opts strategy]
   (cond
     (nil? s1) (->form s2)
     (nil? s2) (->form s1)
     :else
-    (let [a1 (->ast s1 opts)
+    (let [opts (-> opts (absorb-registry s1) (absorb-registry s2))
+          a1 (->ast s1 opts)
           a2 (->ast s2 opts)]
       (if (and (= :map (:type a1)) (= :map (:type a2)))
         (let [props (core-merge (:properties a1) (:properties a2))

@@ -363,3 +363,11 @@
       (is (= [{:path [:x] :in [:x] :schema :int :value nil
                :type :balli.core/missing-key}]
              (:errors (b/explain closed {:nested {:a "s" :b 2}})))))))
+
+(deftest merge-threads-schema-object-registry
+  (testing "schema objects with baked registries merge without unresolved refs"
+    (let [r (reg/registry {:user/id [:string {:min 1}]})
+          s1 (b/schema [:map [:id :user/id]] {:registry r})
+          s2 (b/schema [:map [:id :user/id] [:x :int]] {:registry r})]
+      (is (= [:map [:id :user/id] [:x :int]] (u/merge s1 s2)))
+      (is (= [:map [:id :user/id]] (u/union s1 s1))))))
