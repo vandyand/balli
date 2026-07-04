@@ -1,0 +1,403 @@
+(ns tests.test-pred
+  "Tier 3 Phase 1: predicate + comparator schemas per malli-semantics section 4.
+  Table-driven happy/sad for all 41 registered predicates (fn identity AND
+  quoted symbol), vector forms + props, exception-safety, comparator matrix
+  incl. non-comparable safety, humanize wording, string/json decode
+  composition, schema-object u/merge composition, generator validity for
+  mapped preds + no-generator for unmappable ones, JSON Schema mappings,
+  walk/util leaf behavior, parse, and schema-boundary garbage."
+  (:import datetime)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.error :as be]
+            [balli.generator :as bg]
+            [balli.json-schema :as js]
+            [balli.normalize :as norm]
+            [balli.transform :as bt]
+            [balli.util :as u]))
+
+(def st (bt/string-transformer))
+(def jt (bt/json-transformer))
+
+(defn- ex-type
+  [thunk]
+  (try
+    (thunk)
+    nil
+    (catch python/Exception e
+      (:type (ex-data e)))))
+
+(def aware-dt
+  (datetime/datetime 2024 1 1 12 0 0 0 ** :tzinfo datetime.timezone/utc))
+
+;; ---------------------------------------------------------------------------
+;; Table-driven happy/sad for all 41 predicates
+;;
+;; [pred-key happy sad] -- sad is ::none for any? (nothing fails it).
+
+(def pred-cases
+  [['any? 1 ::none]
+   ['some? 1 nil]
+   ['number? 1.5 "x"]
+   ['integer? 5 1.5]
+   ['int? 5 "x"]
+   ['pos-int? 5 0]
+   ['neg-int? -5 0]
+   ['nat-int? 0 -1]
+   ['pos? 5 -1]
+   ['neg? -1 1]
+   ['float? 1.5 1]
+   ['double? 1.5 1]
+   ['boolean? true 1]
+   ['string? "a" 5]
+   ['ident? :a "a"]
+   ['keyword? :a "a"]
+   ['simple-keyword? :a :a/b]
+   ['qualified-keyword? :a/b :a]
+   ['symbol? 'x :a]
+   ['simple-symbol? 'x 'a/b]
+   ['qualified-symbol? 'a/b 'x]
+   ['uuid? (random-uuid) "x"]
+   ['inst? aware-dt "2024-01-01"]
+   ['seqable? [1] 5]
+   ['indexed? [1] {:a 1}]
+   ['map? {:a 1} [1]]
+   ['vector? [1] '(1)]
+   ['list? '(1 2) [1]]
+   ['seq? (seq [1]) [1]]
+   ['set? #{1} [1]]
+   ['nil? nil 1]
+   ['false? false true]
+   ['true? true false]
+   ['zero? 0 1]
+   ['coll? [1] "x"]
+   ['associative? {:a 1} "x"]
+   ['sequential? [1] {:a 1}]
+   ['fn? inc :a]
+   ['ifn? :a 5]
+   ['empty? [] [1]]
+   ['char? "a" "ab"]])
+
+(deftest all-41-predicates-registered
+  (is (= 41 (count pred-cases)))
+  (is (= 41 (count norm/predicates)))
+  (doseq [[sym _ _] pred-cases]
+    (is (contains? norm/predicates sym) (str sym " registered"))))
+
+(deftest predicates-happy-sad-fn-identity
+  (doseq [[sym happy sad] pred-cases]
+    (testing (str sym " (fn identity)")
+      (let [f @(resolve sym)]
+        (is (true? (b/validate f happy)))
+        (when-not (= ::none sad)
+          (is (false? (b/validate f sad))))))))
+
+(deftest predicates-happy-sad-quoted-symbol
+  (doseq [[sym happy sad] pred-cases]
+    (testing (str sym " (quoted symbol)")
+      (is (true? (b/validate sym happy)))
+      (when-not (= ::none sad)
+        (is (false? (b/validate sym sad)))))))
+
+(deftest predicate-vector-forms-and-props
+  (is (true? (b/validate [int?] 5)))
+  (is (false? (b/validate [int?] "x")))
+  (is (true? (b/validate ['int?] 5)))
+  (is (true? (b/validate [int? {:error/message "int plz"}] 5)))
+  (is (= ["int plz"] (be/humanize (b/explain [int? {:error/message "int plz"}] "x"))))
+  (testing "schema-object surface"
+    (let [so (b/schema [pos-int? {:error/message "positive!"}])]
+      (is (= :balli/pred (:type (:ast so))))
+      (is (= 'pos-int? (:pred-key (:ast so))))
+      (is (= {:error/message "positive!"} (b/properties so)))
+      (is (true? (b/validate so 3)))
+      (is (= ["positive!"] (be/humanize (b/explain so 0)))))))
+
+(deftest predicate-exception-safety
+  ;; preds that throw on the host level must validate false, never raise
+  (is (false? (b/validate pos? "x")))
+  (is (false? (b/validate neg? "x")))
+  (is (false? (b/validate empty? 5)))
+  (is (false? (b/validate 'pos? {:a 1}))))
+
+(deftest predicate-documented-deviations
+  (testing "char? = single-character string"
+    (is (true? (b/validate char? "a")))
+    (is (false? (b/validate char? "")))
+    (is (false? (b/validate char? 97))))
+  (testing "double? and float? identical"
+    (is (true? (b/validate double? 1.5)))
+    (is (false? (b/validate double? 1)))
+    (is (= (b/validate float? 1.5) (b/validate double? 1.5))))
+  (testing "ifn? validates via ifn-like? (keywords/maps/sets yes; vectors/symbols no)"
+    (is (true? (b/validate ifn? {:a 1})))
+    (is (true? (b/validate ifn? #{:a})))
+    (is (false? (b/validate ifn? [1])))
+    (is (false? (b/validate ifn? 'sym))))
+  (testing "empty? = (and (seqable? x) (empty? x))"
+    (is (true? (b/validate empty? "")))
+    (is (true? (b/validate empty? nil)))
+    (is (false? (b/validate empty? 5)))))
+
+(deftest predicate-in-child-and-head-positions
+  (testing "pred in HEAD position vs :fn CHILD position"
+    (is (true? (b/validate [:fn int?] 5)))
+    (is (false? (b/validate [:fn int?] "x")))
+    (is (= :fn (:type (norm/normalize [:fn int?] {}))))
+    (is (= :balli/pred (:type (norm/normalize int? {})))))
+  (testing "pred as a collection child schema"
+    (is (true? (b/validate [:vector int?] [1 2])))
+    (is (false? (b/validate [:vector int?] [1 "x"])))
+    (is (true? (b/validate [:map [:n pos-int?]] {:n 3})))
+    (is (true? (b/validate [:cat int? string?] [1 "a"])))
+    (is (false? (b/validate [:cat int? string?] ["a" 1])))))
+
+(deftest predicate-schema-boundary
+  (testing "unregistered fns/symbols in schema position are invalid"
+    (is (= :balli.core/invalid-schema (ex-type #(b/validate even? 2))))
+    (is (= :balli.core/invalid-schema (ex-type #(b/validate 'even? 2)))))
+  (testing "preds take no :min/:max"
+    (is (= :balli.core/invalid-schema (ex-type #(b/validate [int? {:min 1}] 5))))
+    (is (= :balli.core/invalid-schema (ex-type #(b/validate ['string? {:max 3}] "a")))))
+  (testing "preds take only an optional props map"
+    (is (= :balli.core/invalid-schema (ex-type #(b/validate [int? 5] 5))))
+    (is (= :balli.core/invalid-schema (ex-type #(b/validate [int? {} 5] 5))))))
+
+;; ---------------------------------------------------------------------------
+;; Comparators
+
+(deftest comparator-matrix
+  (is (true? (b/validate [:> 5] 6)))
+  (is (false? (b/validate [:> 5] 5)))
+  (is (true? (b/validate [:>= 5] 5)))
+  (is (false? (b/validate [:>= 5] 4)))
+  (is (true? (b/validate [:< 5] 4)))
+  (is (false? (b/validate [:< 5] 5)))
+  (is (true? (b/validate [:<= 5] 5)))
+  (is (false? (b/validate [:<= 5] 6)))
+  (is (true? (b/validate [:not= 5] 6)))
+  (is (false? (b/validate [:not= 5] 5)))
+  (testing "floats mix with ints"
+    (is (true? (b/validate [:> 5.5] 6)))
+    (is (false? (b/validate [:> 5.5] 5))))
+  (testing "strings compare lexicographically for free"
+    (is (true? (b/validate [:> "a"] "b")))
+    (is (false? (b/validate [:> "b"] "a")))))
+
+(deftest comparator-non-comparable-safety
+  ;; Python TypeError on mixed comparisons -> false, never a throw
+  (is (false? (b/validate [:> 5] "x")))
+  (is (false? (b/validate [:< 5] nil)))
+  (is (false? (b/validate [:>= "a"] 5)))
+  (is (false? (b/validate [:<= 5] {:a 1})))
+  (testing ":not= compares anything"
+    (is (true? (b/validate [:not= 5] "x")))
+    (is (true? (b/validate [:not= {:a 1}] {:b 2})))
+    (is (false? (b/validate [:not= {:a 1}] {:a 1})))))
+
+(deftest comparator-schema-boundary
+  (is (= :balli.core/invalid-schema (ex-type #(b/validate :> 5))))
+  (is (= :balli.core/invalid-schema (ex-type #(b/validate [:>] 5))))
+  (is (= :balli.core/invalid-schema (ex-type #(b/validate [:> 1 2] 5))))
+  (testing "props map + child"
+    (is (true? (b/validate [:>= {:error/message "too small"} 5] 5)))
+    (is (= ["too small"] (be/humanize (b/explain [:>= {:error/message "too small"} 5] 1)))))
+  (testing "a lone map child is the VALUE, not props"
+    (is (true? (b/validate [:not= {:a 1}] {:b 2})))
+    (is (false? (b/validate [:not= {:a 1}] {:a 1})))))
+
+;; ---------------------------------------------------------------------------
+;; Explain + humanize
+
+(deftest explain-error-shape
+  (let [e (-> (b/explain [:> 5] 3) :errors first)]
+    (is (= :balli.core/invalid (:type e)))
+    (is (= [:> 5] (:schema e)))
+    (is (= 3 (:value e))))
+  (let [e (-> (b/explain pos-int? 0) :errors first)]
+    (is (= :balli.core/invalid (:type e)))
+    (is (= pos-int? (:schema e)))))
+
+(deftest humanize-comparator-wording
+  (is (= ["should be larger than 5"] (be/humanize (b/explain [:> 5] 3))))
+  (is (= ["should be at least 5"] (be/humanize (b/explain [:>= 5] 3))))
+  (is (= ["should be smaller than 5"] (be/humanize (b/explain [:< 5] 7))))
+  (is (= ["should be at most 100"] (be/humanize (b/explain [:<= 100] 200))))
+  (is (= ["should not be equal to 5"] (be/humanize (b/explain [:not= 5] 5)))))
+
+(deftest humanize-pred-wording
+  (is (= ["should be an integer"] (be/humanize (b/explain int? "x"))))
+  (is (= ["should be a positive integer"] (be/humanize (b/explain pos-int? 0))))
+  (is (= ["should be a non-negative integer"] (be/humanize (b/explain 'nat-int? -1))))
+  (is (= ["should be a string"] (be/humanize (b/explain string? 5))))
+  (is (= ["should be a vector"] (be/humanize (b/explain vector? '(1)))))
+  (is (= ["should be zero"] (be/humanize (b/explain zero? 3))))
+  (testing "preds outside the message table say invalid value"
+    (is (= ["invalid value"] (be/humanize (b/explain some? nil))))
+    (is (= ["invalid value"] (be/humanize (b/explain ident? "x")))))
+  (testing "nested at :in"
+    (is (= {:n ["should be a positive integer"]}
+           (be/humanize (b/explain [:map [:n pos-int?]] {:n 0}))))))
+
+;; ---------------------------------------------------------------------------
+;; Transformers (pred-key fallthrough dispatch)
+
+(deftest string-decode-preds
+  (is (= 42 (b/decode int? "42" st)))
+  (is (= 42 (b/decode 'integer? "42" st)))
+  (is (= 5 (b/decode pos-int? "5" st)))
+  (is (= 1.5 (b/decode double? "1.5" st)))
+  (is (= 1.5 (b/decode number? "1.5" st)))
+  (is (true? (b/decode boolean? "true" st)))
+  (is (= :kw (b/decode keyword? "kw" st)))
+  (is (= 'sym (b/decode symbol? "sym" st)))
+  (let [s "550e8400-e29b-41d4-a716-446655440000"]
+    (is (uuid? (b/decode uuid? s st))))
+  (testing "lenient: mismatches unchanged, then fail validation"
+    (is (= "abc" (b/decode int? "abc" st)))
+    (is (= 0 (b/decode pos-int? "0" st)))
+    (is (false? (b/validate pos-int? (b/decode pos-int? "0" st)))))
+  (testing "preds without coders untouched"
+    (is (= "x" (b/decode string? "x" st)))
+    (is (= "[]" (b/decode vector? "[]" st)))))
+
+(deftest string-encode-preds
+  (is (= "42" (b/encode int? 42 st)))
+  (is (= "1.5" (b/encode double? 1.5 st)))
+  (is (= "kw" (b/encode keyword? :kw st)))
+  (testing "booleans not stringified (malli parity)"
+    (is (true? (b/encode boolean? true st)))))
+
+(deftest json-decode-preds
+  (is (= 42 (b/decode int? 42.0 jt)))
+  (is (= :a (b/decode keyword? "a" jt)))
+  (is (float? (b/decode double? 1 jt)))
+  (testing "json refuses string->number for preds too"
+    (is (= "42" (b/decode int? "42" jt)))))
+
+(deftest decode-composition-in-map
+  ;; the plan's exact composition checkpoint
+  (is (= {:n 5} (b/decode [:map [:n pos-int?]] {:n "5"} st)))
+  (testing "props override beats the pred-key table"
+    (is (= 99 (b/decode [int? {:decode/string (fn [_] 99)}] "5" st))))
+  (testing "json :map-of with a pred key schema decodes keys"
+    (is (= {1 "a"} (b/decode [:map-of int? string?] {"1" "a"} jt)))))
+
+;; ---------------------------------------------------------------------------
+;; Schema-object composition through util
+
+(deftest schema-object-merge-composition
+  (let [merged (u/merge (b/schema [:map [:n int?]])
+                        (b/schema [:map [:s string?]]))]
+    (is (= [:map [:n int?] [:s string?]] merged))
+    (is (true? (b/validate merged {:n 1 :s "a"})))
+    (is (false? (b/validate merged {:n "x" :s "a"})))
+    (testing "round-trip: merged form re-wraps into a schema object"
+      (let [so (b/schema merged)]
+        (is (true? (b/validate so {:n 1 :s "a"})))
+        (is (= merged (b/form so)))))))
+
+(deftest util-get-and-walk-leaves
+  (is (= int? (u/get [:vector int?] 0)))
+  (is (= [:> 5] (u/get [:map [:n [:> 5]]] :n)))
+  (testing "comparator child is a value: no sub-schema at index 0"
+    (is (nil? (u/get [:> 5] 0))))
+  (testing "walk round-trips preds + comparators as leaves"
+    (is (= [:vector int?] (b/walk [:vector int?] (fn [f _] f))))
+    (is (= [:> 5] (b/walk [:> 5] (fn [f _] f))))
+    (is (= pos-int? (b/walk pos-int? (fn [f _] f))))
+    (let [seen (atom [])]
+      (b/walk [:map [:n [:> 5]]] (fn [form path] (swap! seen conj [form path]) form))
+      (is (= [[[:> 5] [:n]] [[:map [:n [:> 5]]] []]] @seen)))))
+
+;; ---------------------------------------------------------------------------
+;; parse / unparse
+
+(deftest parse-preds-and-comparators
+  (is (= 5 (b/parse pos-int? 5)))
+  (is (b/invalid? (b/parse pos-int? 0)))
+  (is (= 5 (b/unparse pos-int? 5)))
+  (is (= 6 (b/parse [:> 5] 6)))
+  (is (b/invalid? (b/parse [:> 5] "x")))
+  (is (= 6 (b/unparse [:> 5] 6))))
+
+;; ---------------------------------------------------------------------------
+;; Generators
+
+(def mapped-gen-preds
+  ['any? 'number? 'integer? 'int? 'pos-int? 'neg-int? 'nat-int? 'pos? 'neg?
+   'float? 'double? 'boolean? 'string? 'char? 'keyword? 'simple-keyword?
+   'symbol? 'simple-symbol? 'uuid? 'nil? 'false? 'true? 'zero? 'coll?
+   'vector? 'sequential? 'seqable? 'indexed? 'seq? 'list? 'map? 'set?])
+
+(deftest generator-mapped-preds-validity
+  (doseq [sym mapped-gen-preds
+          seed [1 2 3]]
+    (testing (str sym " seed " seed)
+      (let [v (bg/generate sym {:seed seed})]
+        (is (true? (b/validate sym v)))))))
+
+(deftest generator-unmappable-preds
+  (doseq [sym ['some? 'ident? 'qualified-keyword? 'qualified-symbol? 'inst?
+               'associative? 'fn? 'ifn? 'empty?]]
+    (testing (str sym)
+      (is (= :balli.core/no-generator (ex-type #(bg/generate sym {:seed 1}))))))
+  (testing "inst? is no-generator THIS phase; :gen/return unblocks it"
+    (is (= aware-dt (bg/generate [inst? {:gen/return aware-dt}] {:seed 1})))))
+
+(deftest generator-comparators
+  (doseq [form [[:> 5] [:>= 5] [:< 5] [:<= 5] [:> 5.5] [:>= -2.5] [:<= -3.2]]
+          seed [1 2 3]]
+    (testing (str form " seed " seed)
+      (let [v (bg/generate form {:seed seed})]
+        (is (true? (b/validate form v))))))
+  (testing "seeded determinism"
+    (is (= (bg/generate [:> 5] {:seed 7}) (bg/generate [:> 5] {:seed 7}))))
+  (testing "non-numeric child -> no-generator"
+    (is (= :balli.core/no-generator (ex-type #(bg/generate [:> "a"] {:seed 1})))))
+  (testing ":not= filters the any-pool"
+    (doseq [seed [1 2 3 4 5]]
+      (let [v (bg/generate [:not= 5] {:seed seed})]
+        (is (not= 5 v))))))
+
+;; ---------------------------------------------------------------------------
+;; JSON Schema
+
+(deftest json-schema-preds
+  (is (= {"type" "integer"} (js/transform int?)))
+  (is (= {"type" "integer" "minimum" 1} (js/transform pos-int?)))
+  (is (= {"type" "integer" "minimum" 0} (js/transform 'nat-int?)))
+  (is (= {"type" "integer" "maximum" -1} (js/transform neg-int?)))
+  (is (= {"type" "number"} (js/transform number?)))
+  (is (= {"type" "string"} (js/transform string?)))
+  (is (= {"type" "string" "minLength" 1 "maxLength" 1} (js/transform char?)))
+  (is (= {"type" "boolean"} (js/transform boolean?)))
+  (is (= {"type" "string"} (js/transform keyword?)))
+  (is (= {"type" "string" "format" "uuid"} (js/transform uuid?)))
+  (is (= {"type" "null"} (js/transform nil?)))
+  (is (= {"const" true} (js/transform true?)))
+  (is (= {"const" false} (js/transform false?)))
+  (is (= {"type" "array"} (js/transform vector?)))
+  (is (= {"type" "array" "uniqueItems" true} (js/transform set?)))
+  (is (= {"type" "object"} (js/transform map?)))
+  (testing "unmapped preds export lossy {}"
+    (is (= {} (js/transform some?)))
+    (is (= {} (js/transform fn?)))
+    (is (= {} (js/transform 'inst?))))
+  (testing "props still merge"
+    (is (= {"type" "integer" "title" "n"} (js/transform [int? {:title "n"}])))))
+
+(deftest json-schema-comparators
+  (is (= {"exclusiveMinimum" 5} (js/transform [:> 5])))
+  (is (= {"minimum" 5} (js/transform [:>= 5])))
+  (is (= {"exclusiveMaximum" 5} (js/transform [:< 5])))
+  (is (= {"maximum" 5} (js/transform [:<= 5])))
+  (is (= {"maximum" 5.5} (js/transform [:<= 5.5])))
+  (is (= {} (js/transform [:not= 5])))
+  (testing "non-numeric child -> lossy {}"
+    (is (= {} (js/transform [:> "a"]))))
+  (testing "composition inside a map"
+    (is (= {"type" "object"
+            "properties" {"n" {"exclusiveMinimum" 5}}
+            "required" ["n"]}
+           (js/transform [:map [:n [:> 5]]])))))

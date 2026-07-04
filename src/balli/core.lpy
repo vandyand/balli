@@ -411,10 +411,12 @@
 
 (def ^:private walk-leaf-types
   "AST node types walked as leaves: no schema children to descend into (:enum
-  and := children are literal values, :fn/:re children are host objects, refs
-  are not entered). f receives the node's original form fragment."
+  and := children are literal values, :fn/:re children are host objects,
+  predicate schemas (:balli/pred) have no children, comparator children are
+  plain values, refs are not entered). f receives the node's original form
+  fragment."
   #{:any :nil :string :int :float :double :number :boolean :keyword :symbol
-    :uuid :enum := :fn :re :ref})
+    :uuid :enum := :fn :re :ref :balli/pred :> :>= :< :<= :not=})
 
 (defn- walk-ast
   "Postwalk AST `node` at `path`, rebuilding the form bottom-up and calling

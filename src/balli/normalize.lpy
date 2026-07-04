@@ -6,6 +6,10 @@
 
   :children is always a vector. :map, :multi, and :orn children are entry maps
   {:key k :properties p :schema <ast>}. :ref nodes additionally carry :ref <kw>.
+  :balli/pred nodes (predicate schemas — AST-only type, never a form keyword)
+  additionally carry :pred-key <symbol> and :pred <fn>. Comparator nodes
+  (:> :>= :< :<= :not=) hold their single child as a plain VALUE, not a
+  schema AST.
 
   Entry point: (normalize form opts) where opts may carry {:registry r}.
   Unknown/invalid forms throw ex-info with {:type :balli.core/invalid-schema}."
@@ -36,6 +40,88 @@
   to be schema-authoring mistakes than intentional predicates."
   [x]
   (or (fn-like? x) (keyword? x) (map? x) (set? x)))
+
+;; ---------------------------------------------------------------------------
+;; Predicate schemas (:balli/pred)
+;;
+;; The 41 spike-confirmed basilisp.core predicates are schemas in their own
+;; right: a bare fn value or quoted symbol in schema position, or the head of
+;; a vector form [pred] / [pred props]. Dispatch keys on core-fn IDENTITY
+;; (core fns are singleton vars — Phase 0 finding 5) AND on the quoted
+;; symbol; both normalize to one AST type :balli/pred carrying :pred-key (the
+;; symbol) plus the canonical validation fn under :pred. Only generic
+;; properties make sense on predicate schemas (:error/message, :gen/*, ...);
+;; :min/:max are explicitly rejected at the schema boundary. Documented
+;; deviations: ifn? validates via ifn-like? (bare basilisp ifn?/callable is
+;; too broad — see fn-like? above); empty? validates as malli's special pred
+;; (and (seqable? x) (empty? x)) (bare empty? throws on non-seqables); char?
+;; means "single-character string" (Basilisp \\a IS a Python str); double?
+;; and float? are identical.
+
+(def ^:private pred-specs
+  "[[pred-key core-fn validation-fn?] ...] — validation-fn defaults to the
+  core fn; ifn?/empty? override it (see the section comment)."
+  [['any? any?]
+   ['some? some?]
+   ['number? number?]
+   ['integer? integer?]
+   ['int? int?]
+   ['pos-int? pos-int?]
+   ['neg-int? neg-int?]
+   ['nat-int? nat-int?]
+   ['pos? pos?]
+   ['neg? neg?]
+   ['float? float?]
+   ['double? double?]
+   ['boolean? boolean?]
+   ['string? string?]
+   ['ident? ident?]
+   ['keyword? keyword?]
+   ['simple-keyword? simple-keyword?]
+   ['qualified-keyword? qualified-keyword?]
+   ['symbol? symbol?]
+   ['simple-symbol? simple-symbol?]
+   ['qualified-symbol? qualified-symbol?]
+   ['uuid? uuid?]
+   ['inst? inst?]
+   ['seqable? seqable?]
+   ['indexed? indexed?]
+   ['map? map?]
+   ['vector? vector?]
+   ['list? list?]
+   ['seq? seq?]
+   ['set? set?]
+   ['nil? nil?]
+   ['false? false?]
+   ['true? true?]
+   ['zero? zero?]
+   ['coll? coll?]
+   ['associative? associative?]
+   ['sequential? sequential?]
+   ['fn? fn?]
+   ['ifn? ifn? ifn-like?]
+   ['empty? empty? (fn [x] (and (seqable? x) (empty? x)))]
+   ['char? char?]])
+
+(def predicates
+  "pred-key symbol -> canonical validation fn for every predicate schema."
+  (into {} (map (fn [[k cf vf]] [k (or vf cf)])) pred-specs))
+
+(def ^:private pred-key-by-fn
+  "core-fn identity -> pred-key symbol. ifn?/empty? key their CORE fns here
+  (users write the core fn in schema position) even though the canonical
+  validation fn in `predicates` differs."
+  (into {} (map (fn [[k cf _]] [cf k])) pred-specs))
+
+(defn pred-form-key
+  "The pred-key symbol when `x` is a registered predicate schema head (a core
+  fn by identity, or its quoted symbol); nil otherwise. Public: balli.error
+  uses it to key humanize messages off an error's :schema form head."
+  [x]
+  (cond
+    (symbol? x) (when (contains? predicates x) x)
+    (fn-like? x) (get pred-key-by-fn x)
+    :else nil))
 
 (def ^:private bounded-types
   "Types whose :min/:max properties participate in numeric comparisons at
@@ -77,11 +163,18 @@
     [{} (vec args)]))
 
 (defmulti normalize
-  "Normalize schema `form` to an AST node map. `opts` may carry {:registry r}."
+  "Normalize schema `form` to an AST node map. `opts` may carry {:registry r}.
+  A registered predicate (core fn or quoted symbol) in schema position — bare
+  or as a vector HEAD — dispatches to :balli/pred; a pred in child position
+  (e.g. [:fn int?]) is untouched, since dispatch only inspects the head."
   (fn [form _opts]
     (cond
       (keyword? form) form
-      (vector? form) (first form)
+      (vector? form) (let [h (first form)]
+                       (if (and (not (keyword? h)) (some? (pred-form-key h)))
+                         :balli/pred
+                         h))
+      (some? (pred-form-key form)) :balli/pred
       :else ::unknown)))
 
 ;; ---------------------------------------------------------------------------
@@ -234,6 +327,63 @@
       (when-not (ifn-like? pred)
         (invalid! ":fn child must be a fn, keyword, map, or set" form))
       (node :fn props [pred] form))))
+
+;; ---------------------------------------------------------------------------
+;; :balli/pred — predicate schemas (see the pred table section above). The
+;; :balli/pred keyword is an AST-only type: it never appears in schema FORMS
+;; (the form is the fn/symbol itself, optionally wrapped [pred props]), so it
+;; is not part of balli.registry/builtin-types.
+
+(defn- pred-node
+  [pred-key props form]
+  (when (or (contains? props :min) (contains? props :max))
+    (invalid! "predicate schemas do not take :min/:max" form))
+  {:type :balli/pred
+   :pred-key pred-key
+   :pred (get predicates pred-key)
+   :properties (or props {})
+   :children []
+   :form form})
+
+(defmethod normalize :balli/pred [form _opts]
+  (if (vector? form)
+    (let [k (pred-form-key (first form))
+          args (vec (rest form))]
+      (cond
+        (empty? args)
+        (pred-node k {} form)
+
+        (and (= 1 (count args)) (map? (first args)))
+        (pred-node k (first args) form)
+
+        :else
+        (invalid! (str (first form) " accepts only an optional properties map") form)))
+    (pred-node (pred-form-key form) {} form)))
+
+;; ---------------------------------------------------------------------------
+;; Comparator schemas: :> :>= :< :<= :not=
+;;
+;; Exactly one child, which is a plain VALUE, not a schema: [:> 5],
+;; [:>= {:error/message "..."} 5]. Downstream surfaces treat the child as a
+;; value — walk/util see comparators as leaves and never enter the child.
+;; A leading map with nothing after it is the child value (split-props),
+;; mirroring :=.
+
+(defn- normalize-comparator
+  [form _opts]
+  (when (keyword? form)
+    (invalid! (str form " requires exactly one value") form))
+  (let [t (first form)
+        [props elems] (split-props (rest form))]
+    (when-not (= 1 (count elems))
+      (invalid! (str t " expects exactly 1 child value") form))
+    (node t props [(first elems)] form)))
+
+(defmethod normalize :> [form opts] (normalize-comparator form opts))
+(defmethod normalize :>= [form opts] (normalize-comparator form opts))
+(defmethod normalize :< [form opts] (normalize-comparator form opts))
+(defmethod normalize :<= [form opts] (normalize-comparator form opts))
+(defmethod normalize :not= [form opts] (normalize-comparator form opts))
 
 ;; ---------------------------------------------------------------------------
 ;; :re

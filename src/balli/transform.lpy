@@ -136,8 +136,10 @@
   `chain` in order. Per link, resolution priority:
     1. schema prop under the method map, e.g. {:decode {:string f}}
     2. schema prop under the qualified name, e.g. :decode/string
-    3. the link's per-type table (:decoders/:encoders) keyed by node type
-    4. the link's :default-decoder/:default-encoder
+    3. for :balli/pred nodes, the link's per-type table keyed by the node's
+       :pred-key SYMBOL (coder tables mix type keywords and pred-key symbols)
+    4. the link's per-type table (:decoders/:encoders) keyed by node type
+    5. the link's :default-decoder/:default-encoder
   Returns {:enter f :leave g} or nil."
   [chain ast method opts]
   (reduce
@@ -150,6 +152,8 @@
            default (if (= :decode method) (:default-decoder link) (:default-encoder link))
            spec (or (when nm (get (get props method) nm))
                     (when qname (get props qname))
+                    (when (= :balli/pred (:type ast))
+                      (get table (:pred-key ast)))
                     (get table (:type ast))
                     default)
            i (when (some? spec) (-interceptor spec ast opts))]
@@ -317,8 +321,10 @@
   subtree has no transformations."
   [node registry chain method opts cache]
   (case (:type node)
+    ;; predicate + comparator schemas are leaves too (a comparator's child is
+    ;; a plain value, never descended into)
     (:any :nil :string :int :float :double :number :boolean :keyword :symbol
-          :uuid :enum := :fn :re)
+          :uuid :enum := :fn :re :balli/pred :> :>= :< :<= :not=)
     nil
 
     ;; seqex types + :schema: pass-through (no per-element descent -- a seqex
@@ -483,6 +489,12 @@
 
 ;; ---------------------------------------------------------------------------
 ;; Built-in coder tables
+;;
+;; Tables mix TYPE KEYWORDS and PRED-KEY SYMBOLS: :balli/pred nodes resolve
+;; through the same tables via the -value-transformer pred-key fallthrough
+;; (e.g. `pos-int?` decodes from strings exactly like :int). Coercions reuse
+;; the scalar fns above and stay LENIENT — e.g. `pos-int?` string-decodes
+;; "0" to 0, which then fails validation, matching malli.
 
 (defn- base-json-decoders []
   {:keyword -string->keyword
@@ -491,7 +503,17 @@
    :float -number->float
    :double -number->double
    :int -number->long
-   :set -sequential->set})
+   :set -sequential->set
+   'keyword? -string->keyword
+   'symbol? -string->symbol
+   'uuid? -string->uuid
+   'float? -number->float
+   'double? -number->double
+   'int? -number->long
+   'integer? -number->long
+   'pos-int? -number->long
+   'neg-int? -number->long
+   'nat-int? -number->long})
 
 (defn -string-decoders []
   (add-child-compilers
@@ -501,6 +523,15 @@
            :double -string->double
            :number -string->double
            :boolean -string->boolean
+           'int? -string->long
+           'integer? -string->long
+           'pos-int? -string->long
+           'neg-int? -string->long
+           'nat-int? -string->long
+           'float? -string->float
+           'double? -string->double
+           'number? -string->double
+           'boolean? -string->boolean
            ;; :map-of key decoding under the string transformer happens via
            ;; ordinary key-schema descent (string decoders parse strings);
            ;; this enter interceptor only stringifies keyword keys, matching
@@ -512,7 +543,10 @@
 (defn- base-json-encoders []
   {:keyword -keyword->string
    :symbol -any->string
-   :uuid -any->string})
+   :uuid -any->string
+   'keyword? -keyword->string
+   'symbol? -any->string
+   'uuid? -any->string})
 
 (defn -json-encoders []
   (add-child-compilers (base-json-encoders)))
@@ -524,7 +558,16 @@
            :float -any->string
            :double -any->string
            :number -any->string
-           ;; booleans intentionally NOT stringified (malli parity)
+           'int? -any->string
+           'integer? -any->string
+           'pos-int? -any->string
+           'neg-int? -any->string
+           'nat-int? -any->string
+           'float? -any->string
+           'double? -any->string
+           'number? -any->string
+           ;; booleans (incl. boolean?) intentionally NOT stringified
+           ;; (malli parity)
            })))
 
 (defn- transform-if-valid
@@ -546,7 +589,9 @@
    (fn [ast opts]
      (let [registry (or (:registry opts) (reg/default-registry))
            key-ast (first (:children ast))
-           f (some-> (get map-of-key-decoders (:type key-ast))
+           f (some-> (or (when (= :balli/pred (:type key-ast))
+                           (get map-of-key-decoders (:pred-key key-ast)))
+                         (get map-of-key-decoders (:type key-ast)))
                      (-interceptor key-ast opts)
                      (-intercepting))]
        (if f

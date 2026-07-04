@@ -85,6 +85,58 @@
 ;; ---------------------------------------------------------------------------
 ;; Per-type mapping
 
+(def ^:private pred-json-schemas
+  "pred-key symbol -> JSON Schema fragment for :balli/pred nodes. Anything
+  absent exports as the lossy {} (any? some? pos? neg? zero? associative?
+  fn? ifn? empty? — and inst?, which Phase 5 upgrades alongside the time
+  types)."
+  {'int? {"type" "integer"}
+   'integer? {"type" "integer"}
+   'pos-int? {"type" "integer" "minimum" 1}
+   'nat-int? {"type" "integer" "minimum" 0}
+   'neg-int? {"type" "integer" "maximum" -1}
+   'number? {"type" "number"}
+   'float? {"type" "number"}
+   'double? {"type" "number"}
+   'string? {"type" "string"}
+   'char? {"type" "string" "minLength" 1 "maxLength" 1}
+   'boolean? {"type" "boolean"}
+   'keyword? {"type" "string"}
+   'simple-keyword? {"type" "string"}
+   'qualified-keyword? {"type" "string"}
+   'symbol? {"type" "string"}
+   'simple-symbol? {"type" "string"}
+   'qualified-symbol? {"type" "string"}
+   'ident? {"type" "string"}
+   'uuid? {"type" "string" "format" "uuid"}
+   'nil? {"type" "null"}
+   'false? {"const" false}
+   'true? {"const" true}
+   'coll? {"type" "array"}
+   'vector? {"type" "array"}
+   'sequential? {"type" "array"}
+   'seqable? {"type" "array"}
+   'indexed? {"type" "array"}
+   'seq? {"type" "array"}
+   'list? {"type" "array"}
+   'set? {"type" "array" "uniqueItems" true}
+   'map? {"type" "object"}})
+
+(defn- transform-comparator
+  "Comparators map to the draft-2020-12 numeric bound keywords when their
+  child is a number; non-numeric children (and :not=, always) export as the
+  lossy {}."
+  [node]
+  (let [v (first (:children node))]
+    (if (or (int? v) (float? v))
+      (case (:type node)
+        :> {"exclusiveMinimum" v}
+        :>= {"minimum" v}
+        :< {"exclusiveMaximum" v}
+        :<= {"maximum" v}
+        :not= {})
+      {})))
+
 (defn- transform-ref
   "Emit {\"$ref\" \"#/definitions/<escaped-name>\"} for ref node `node`,
   transforming the target into (:definitions ctx) under the UNESCAPED name.
@@ -127,6 +179,8 @@
     (case (:type node)
       ;; :=>/:function: JSON Schema has no function values -- lossy {} like :fn
       (:any :fn :=> :function) {}
+      :balli/pred (get pred-json-schemas (:pred-key node) {})
+      (:> :>= :< :<= :not=) (transform-comparator node)
       :nil {"type" "null"}
       :string (with-min-max {"type" "string"} props "minLength" "maxLength")
       :int (with-min-max {"type" "integer"} props "minimum" "maximum")

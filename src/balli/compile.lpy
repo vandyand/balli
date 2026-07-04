@@ -56,6 +56,19 @@
   [x]
   (or (int? x) (float? x)))
 
+(defn- comparator-op
+  "The comparison fn for a comparator AST node type. Basilisp </<= etc.
+  delegate to Python rich comparison (Phase 0 finding 7), so mixed
+  non-comparable operands raise TypeError — every call site wraps the call
+  exception-safe (throw -> false)."
+  [type]
+  (case type
+    :> >
+    :>= >=
+    :< <
+    :<= <=
+    :not= not=))
+
 ;; ---------------------------------------------------------------------------
 ;; Per-type compilers
 
@@ -288,6 +301,23 @@
           (boolean (pred x))
           (catch python/Exception _ false))))
 
+    ;; predicate schema: the canonical pred fn, exception-safe (throw -> false)
+    :balli/pred
+    (let [pred (:pred node)]
+      (fn [x]
+        (try
+          (boolean (pred x))
+          (catch python/Exception _ false))))
+
+    ;; comparators: (op x child-value), exception-safe (non-comparable -> false)
+    (:> :>= :< :<= :not=)
+    (let [v (first (:children node))
+          op (comparator-op (:type node))]
+      (fn [x]
+        (try
+          (boolean (op x v))
+          (catch python/Exception _ false))))
+
     :re
     (let [pattern (first (:children node))]
       (fn [x] (boolean (and (string? x) (re-matches pattern x)))))
@@ -347,7 +377,10 @@
 ;;                              (:in unchanged) — Malli semantics
 ;;   - :orn                  -> like :or, but the entry TAG is appended to
 ;;                              :path instead of the branch index
-;;   - :balli.core/invalid   -> reserved for :fn / :not / :re-mismatch only
+;;   - :balli.core/invalid   -> :fn / :not / :re-mismatch / predicate
+;;                              (:balli/pred) / comparator failures; humanize
+;;                              recovers pred/comparator wording from the
+;;                              error's :schema form head (balli.error)
 ;;   - :re non-match on a string -> :balli.core/invalid (non-strings get
 ;;                              :balli.core/invalid-type)
 
@@ -648,6 +681,32 @@
       (fn [x path in]
         (if (try
               (boolean (pred x))
+              (catch python/Exception _ false))
+          []
+          [(err path in form x :balli.core/invalid)])))
+
+    ;; predicate schema failure: :balli.core/invalid with the ORIGINAL form
+    ;; (fn, symbol, or [pred props] vector) as :schema — balli.error keys its
+    ;; pred message table off that form's head.
+    :balli/pred
+    (let [pred (:pred node)
+          form (:form node)]
+      (fn [x path in]
+        (if (try
+              (boolean (pred x))
+              (catch python/Exception _ false))
+          []
+          [(err path in form x :balli.core/invalid)])))
+
+    ;; comparator failure: same :balli.core/invalid type; :schema carries the
+    ;; original [:> 5] form so humanize can render comparator wording.
+    (:> :>= :< :<= :not=)
+    (let [v (first (:children node))
+          op (comparator-op (:type node))
+          form (:form node)]
+      (fn [x path in]
+        (if (try
+              (boolean (op x v))
               (catch python/Exception _ false))
           []
           [(err path in form x :balli.core/invalid)])))
@@ -1016,9 +1075,11 @@
   (case (:type node)
     ;; non-transforming leaves: parse == unparse == validate-then-value.
     ;; :=>/:function parse with the PLAIN callable check -- function checkers
-    ;; are a validate/explain concern only, never part of parse.
+    ;; are a validate/explain concern only, never part of parse. Predicate
+    ;; (:balli/pred) and comparator schemas are leaves too.
     (:any :nil :string :int :float :double :number :boolean :keyword :symbol
-          :uuid :enum := :fn :re :not :=> :function)
+          :uuid :enum := :fn :re :not :=> :function
+          :balli/pred :> :>= :< :<= :not=)
     (let [valid? (compile-node node registry (atom {}))]
       (fn [x] (if (valid? x) x -invalid)))
 

@@ -233,8 +233,12 @@
   (is (contains? reg/builtin-types :map))
   (is (contains? reg/builtin-types :=))
   ;; 28 MVP types + Phase 6: :cat :catn :alt :altn :? :* :+ :repeat :schema
-  ;; + Phase 8: :=> :function
-  (is (= 39 (count reg/builtin-types)))
+  ;; + Phase 8: :=> :function + Tier 3: :> :>= :< :<= :not= (predicate
+  ;; schemas are AST-only -- :balli/pred is deliberately NOT a builtin type)
+  (is (= 44 (count reg/builtin-types)))
+  (is (contains? reg/builtin-types :>))
+  (is (contains? reg/builtin-types :not=))
+  (is (not (contains? reg/builtin-types :balli/pred)))
   (is (contains? reg/builtin-types :cat))
   (is (contains? reg/builtin-types :schema))
   (is (contains? reg/builtin-types :=>))

@@ -19,7 +19,8 @@
   into :balli.error/misspelled-key / :balli.error/misspelled-value errors
   (levenshtein distance vs the declared keys) and drops the missing-key
   errors those typos explain."
-  (:require [basilisp.string :as str]))
+  (:require [balli.normalize :as norm]
+            [basilisp.string :as str]))
 
 ;; ---------------------------------------------------------------------------
 ;; Schema-fragment introspection
@@ -31,13 +32,14 @@
 (defn- split-form
   "Split a schema form fragment into [type properties children]. Mirrors the
   normalize rule: a map in 2nd position is a properties map, except for
-  :enum/:= where it only counts as properties when >=1 further child follows
-  (otherwise it is a literal child)."
+  :enum/:=/comparators (whose children are literal values) where it only
+  counts as properties when >=1 further child follows (otherwise it is a
+  literal child)."
   [form]
   (if (vector? form)
     (let [[t & args] form]
       (if (and (map? (first args))
-               (or (not (contains? #{:enum :=} t))
+               (or (not (contains? #{:enum := :> :>= :< :<= :not=} t))
                    (seq (rest args))))
         [t (first args) (vec (rest args))]
         [t {} (vec args)]))
@@ -70,6 +72,48 @@
 
 (def ^:private numeric-types #{:int :float :double :number})
 (def ^:private counted-types #{:vector :sequential :set :map-of})
+
+(def ^:private comparator-message-prefixes
+  "Humanize wording for comparator schema failures; the comparator's child
+  value is appended (\"should be at most 100\")."
+  {:> "should be larger than "
+   :>= "should be at least "
+   :< "should be smaller than "
+   :<= "should be at most "
+   :not= "should not be equal to "})
+
+(def ^:private pred-messages
+  "Humanize messages for predicate schema failures, keyed by pred-key symbol.
+  Predicates absent from this table humanize as \"invalid value\"."
+  {'int? "should be an integer"
+   'string? "should be a string"
+   'boolean? "should be a boolean"
+   'keyword? "should be a keyword"
+   'uuid? "should be a uuid"
+   'pos-int? "should be a positive integer"
+   'nat-int? "should be a non-negative integer"
+   'neg-int? "should be a negative integer"
+   'nil? "should be nil"
+   'coll? "should be a collection"
+   'map? "should be a map"
+   'vector? "should be a vector"
+   'set? "should be a set"
+   'seqable? "should be seqable"
+   'fn? "should be a function"
+   'zero? "should be zero"})
+
+(defn- invalid-message
+  "Message for a :balli.core/invalid error, dispatching on the failing form's
+  HEAD (already split by split-form): comparator keywords render their bound
+  value; predicate heads (core fn or quoted symbol) hit the pred message
+  table; everything else (:fn / :not / :re mismatches, unlisted preds) stays
+  \"invalid value\"."
+  [t children]
+  (or (when-some [prefix (get comparator-message-prefixes t)]
+        (str prefix (first children)))
+      (when-some [k (norm/pred-form-key t)]
+        (get pred-messages k))
+      "invalid value"))
 
 (defn- limits-message
   "Interpolated message for a :balli.core/limits error from the failing
@@ -114,6 +158,7 @@
     (or (:error/message props)
         (case type
           :balli.core/invalid-type (get type-messages t "invalid type")
+          :balli.core/invalid (invalid-message t children)
           :balli.core/limits (limits-message schema)
           :balli.core/missing-key "missing required key"
           :balli.core/extra-key "disallowed key"

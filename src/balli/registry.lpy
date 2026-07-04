@@ -5,10 +5,14 @@
                              :schemas {qualified-kw schema-form}}.")
 
 (def builtin-types
-  "The set of schema type keywords balli supports natively."
+  "The set of schema type keywords balli supports natively. Predicate schemas
+  (:balli/pred) are absent by design: that keyword is an AST-only type — in
+  FORMS a predicate schema is the fn/symbol itself (see balli.normalize's
+  pred table)."
   #{:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid
     :map :map-of :vector :sequential :set :tuple :enum := :maybe :and :or :orn
     :not :fn :multi :re :ref
+    :> :>= :< :<= :not=
     :cat :catn :alt :altn :? :* :+ :repeat :schema
     :=> :function})
 

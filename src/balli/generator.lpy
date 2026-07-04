@@ -35,7 +35,11 @@
   schema -- the branch schema itself must produce the dispatch value (e.g.
   contain a [:dispatch-key [:= tag]] entry); :re/:fn have NO default
   generator and throw :balli.core/no-generator unless a :gen/* hook is
-  supplied. :=> generates a constant-ish fn that ignores its arguments and
+  supplied. Predicate schemas (:balli/pred) generate through the
+  pred-gen-forms mapping (unmapped preds, incl. inst? until Phase 5, throw
+  no-generator); comparators generate ints relative to their child value
+  (non-numeric children throw no-generator; :not= filters the :any pool).
+  :=> generates a constant-ish fn that ignores its arguments and
   returns a freshly generated OUTPUT value per call, drawing from the Random
   threaded through the enclosing generate/sample call -- determinism holds at
   generator-CONSTRUCTION level (equal seeds give fns whose successive calls
@@ -275,6 +279,90 @@
                 (reps n #(chunk (first (:children node))))))))
 
 ;; ---------------------------------------------------------------------------
+;; Predicate + comparator schemas
+
+(def ^:private pred-gen-forms
+  "pred-key symbol -> schema form generated in the predicate's place
+  (semantics section 4: map each predicate to an existing type generator
+  where obvious). seq?/list? post-convert the generated vector into a list
+  (vectors fail seq?/list?) — see gen-pred. Absent keys throw
+  :balli.core/no-generator unless a :gen/* hook is present: some? ident?
+  qualified-keyword? qualified-symbol? associative? fn? ifn? empty? — and
+  inst?, which is intentionally UNMAPPABLE this phase (Phase 5 upgrade hook:
+  point 'inst? at :time/instant once balli.time lands)."
+  {'any? :any
+   'number? :number
+   'integer? :int
+   'int? :int
+   'pos-int? [:int {:min 1}]
+   'neg-int? [:int {:max -1}]
+   'nat-int? [:int {:min 0}]
+   'pos? [:int {:min 1}]
+   'neg? [:int {:max -1}]
+   'float? :double
+   'double? :double
+   'boolean? :boolean
+   'string? :string
+   'char? [:string {:min 1 :max 1}]
+   'keyword? :keyword
+   'simple-keyword? :keyword
+   'symbol? :symbol
+   'simple-symbol? :symbol
+   'uuid? :uuid
+   'nil? :nil
+   'false? [:= false]
+   'true? [:= true]
+   'zero? [:= 0]
+   'coll? [:vector :any]
+   'vector? [:vector :any]
+   'sequential? [:vector :any]
+   'seqable? [:vector :any]
+   'indexed? [:vector :any]
+   'seq? [:vector :any]
+   'list? [:vector :any]
+   'map? [:map-of :keyword :any]
+   'set? [:set :any]})
+
+(def ^:private listify-preds
+  "Predicates whose generated vector is converted to a list so the pred
+  itself holds on the result."
+  #{'seq? 'list?})
+
+(defn- gen-pred
+  [ast registry rnd size depth]
+  (let [k (:pred-key ast)]
+    (if-some [form (get pred-gen-forms k)]
+      (let [v (gen (norm/normalize form {:registry registry})
+                   registry rnd size depth)]
+        (if (contains? listify-preds k) (apply list v) v))
+      (no-generator! ast))))
+
+(defn- gen-comparator
+  "Int generator relative to the comparator's child value v (span size^2):
+  :> in [floor(v)+1, +span], :>= in [ceil(v), +span], :< in [-span,
+  ceil(v)-1], :<= in [-span, floor(v)] — every draw satisfies the comparator
+  for int AND float children. Non-numeric children throw
+  :balli.core/no-generator (:gen/* hooks are checked upstream). :not= draws
+  from the :any pool and filters, retry-capped."
+  [ast rnd size]
+  (let [v (first (:children ast))
+        t (:type ast)]
+    (if (= :not= t)
+      (loop [i 0]
+        (when (>= i retry-cap)
+          (unsatisfiable! ast))
+        (let [x (gen-any rnd size)]
+          (if (= x v) (recur (inc i)) x)))
+      (if (or (int? v) (float? v))
+        (let [span (* size size)]
+          (case t
+            :> (let [lo (inc (int-floor v))] (.randint rnd lo (+ lo span)))
+            :>= (let [lo (int-ceil v)] (.randint rnd lo (+ lo span)))
+            :< (let [hi (dec (int-ceil v))] (.randint rnd (- hi span) hi))
+            :<= (let [hi (int-floor v)] (.randint rnd (- hi span) hi))))
+        (no-generator! ast)))))
+
+;; ---------------------------------------------------------------------------
 ;; Dispatch
 
 (defn- gen-default
@@ -317,6 +405,10 @@
       ;; no default strategy -- only :gen/* hooks (checked before this
       ;; dispatch) can generate these.
       (:re :fn) (no-generator! ast)
+      ;; predicate schemas map to existing type generators where obvious;
+      ;; unmapped preds throw no-generator (see pred-gen-forms).
+      :balli/pred (gen-pred ast registry rnd size depth)
+      (:> :>= :< :<= :not=) (gen-comparator ast rnd size)
       ;; constant-ish fn: ignores args, generates a fresh output value per
       ;; call from the threaded rnd (see the ns docstring on determinism)
       :=> (let [out-ast (nth (:children ast) 1)]
