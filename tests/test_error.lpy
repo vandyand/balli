@@ -1,0 +1,139 @@
+(ns tests.test-error
+  "Phase 4: humanize — default message table, :min/:max interpolation,
+  :error/message override, and assembly by :in (nested maps, sparse vectors
+  with nil holes, accumulation at one path, deep mixed nesting)."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.error :as be]))
+
+;; ---------------------------------------------------------------------------
+;; nil -> nil
+
+(deftest humanize-nil-returns-nil
+  (is (nil? (be/humanize nil)))
+  (is (nil? (be/humanize (b/explain :string "ok")))))
+
+;; ---------------------------------------------------------------------------
+;; Root scalar failures -> flat vector of messages
+
+(deftest root-invalid-type
+  (is (= ["should be an integer"] (be/humanize (b/explain :int "x"))))
+  (is (= ["should be a string"] (be/humanize (b/explain :string 42))))
+  (is (= ["should be a keyword"] (be/humanize (b/explain :keyword "x"))))
+  (is (= ["should be a boolean"] (be/humanize (b/explain :boolean 1))))
+  (is (= ["should be a float"] (be/humanize (b/explain :float 1))))
+  (is (= ["should be nil"] (be/humanize (b/explain :nil 1))))
+  (is (= ["should be a vector"] (be/humanize (b/explain [:vector :int] 5)))))
+
+(deftest root-limits-interpolation
+  (testing "string length"
+    (is (= ["should be at least 3 characters"]
+           (be/humanize (b/explain [:string {:min 3}] "ab"))))
+    (is (= ["should be at most 2 characters"]
+           (be/humanize (b/explain [:string {:max 2}] "abc"))))
+    (is (= ["should be between 2 and 4 characters"]
+           (be/humanize (b/explain [:string {:min 2 :max 4}] "a")))))
+  (testing "numeric bounds"
+    (is (= ["should be at least 1"]
+           (be/humanize (b/explain [:int {:min 1}] 0))))
+    (is (= ["should be at most 5"]
+           (be/humanize (b/explain [:int {:max 5}] 6))))
+    (is (= ["should be between 1 and 5"]
+           (be/humanize (b/explain [:int {:min 1 :max 5}] 0)))))
+  (testing "collection count"
+    (is (= ["should have at least 2 elements"]
+           (be/humanize (b/explain [:vector {:min 2} :int] [1]))))
+    (is (= ["should have at most 1 elements"]
+           (be/humanize (b/explain [:vector {:max 1} :int] [1 2])))))
+  (testing "tuple exact size"
+    (is (= ["should have exactly 2 elements"]
+           (be/humanize (b/explain [:tuple :string :int] ["a"]))))))
+
+;; ---------------------------------------------------------------------------
+;; Nested map assembly
+
+(deftest nested-map
+  (is (= {:x ["should be an integer"]}
+         (be/humanize (b/explain [:map [:x :int]] {:x "s"}))))
+  (is (= {:a {:b ["should be a string"]}}
+         (be/humanize (b/explain [:map [:a [:map [:b :string]]]]
+                                 {:a {:b 1}})))))
+
+(deftest missing-and-extra-keys
+  (is (= {:x ["missing required key"]}
+         (be/humanize (b/explain [:map [:x :int]] {}))))
+  (is (= {:extra ["disallowed key"]}
+         (be/humanize (b/explain [:map {:closed true} [:id :string]]
+                                 {:id "x" :extra 1})))))
+
+;; ---------------------------------------------------------------------------
+;; Vector indices -> sparse vectors with nil holes
+
+(deftest vector-index-sparse
+  (is (= [nil ["should be an integer"]]
+         (be/humanize (b/explain [:vector :int] [1 "x"]))))
+  (is (= [["should be an integer"] nil ["should be an integer"]]
+         (be/humanize (b/explain [:vector :int] ["a" 2 "c"])))))
+
+;; ---------------------------------------------------------------------------
+;; :error/message override
+
+(deftest error-message-override
+  (is (= ["must be even"]
+         (be/humanize (b/explain [:fn {:error/message "must be even"} even?] 3))))
+  (is (= ["gotta be an int"]
+         (be/humanize (b/explain [:int {:error/message "gotta be an int"}] "x"))))
+  (is (= {:x ["custom limit"]}
+         (be/humanize (b/explain [:map [:x [:string {:min 3 :error/message "custom limit"}]]]
+                                 {:x "ab"})))))
+
+;; ---------------------------------------------------------------------------
+;; Enum / := / dispatch messages
+
+(deftest enum-and-eq-messages
+  (is (= ["should be one of: A, B"]
+         (be/humanize (b/explain [:enum "A" "B"] "C"))))
+  (is (= ["should be one of: :a, :b"]
+         (be/humanize (b/explain [:enum :a :b] :c))))
+  (is (= ["should be equal to :dm"]
+         (be/humanize (b/explain [:= :dm] :group))))
+  (is (= ["invalid dispatch value"]
+         (be/humanize (b/explain [:multi {:dispatch :kind}
+                                  [:dm [:map [:kind [:= :dm]]]]]
+                                 {:kind :nope})))))
+
+;; ---------------------------------------------------------------------------
+;; Generic invalid
+
+(deftest generic-invalid
+  (is (= ["invalid value"] (be/humanize (b/explain [:fn even?] 3))))
+  (is (= ["invalid value"] (be/humanize (b/explain [:not :int] 1))))
+  (is (= ["invalid value"] (be/humanize (b/explain [:or :string :keyword] 1)))))
+
+;; ---------------------------------------------------------------------------
+;; Multiple errors at the same :in accumulate into one vector
+
+(deftest multiple-errors-same-path
+  (is (= ["should be at least 10" "must be even"]
+         (be/humanize (b/explain [:and [:int {:min 10}]
+                                  [:fn {:error/message "must be even"} even?]]
+                                 3))))
+  (is (= {:x ["should be at least 10" "must be even"]}
+         (be/humanize (b/explain [:map [:x [:and [:int {:min 10}]
+                                            [:fn {:error/message "must be even"} even?]]]]
+                                 {:x 3})))))
+
+;; ---------------------------------------------------------------------------
+;; Deep mixed nesting: maps inside sparse vectors inside maps
+
+(deftest deep-mixed-nesting
+  (is (= {:a [nil {:b ["should be an integer"]}]}
+         (be/humanize (b/explain [:map [:a [:vector [:map [:b :int]]]]]
+                                 {:a [{:b 1} {:b "s"}]}))))
+  (is (= {:users [nil {:name ["missing required key"]
+                       :age ["should be an integer"]}]}
+         (be/humanize (b/explain [:map [:users [:vector [:map
+                                                         [:name :string]
+                                                         [:age :int]]]]]
+                                 {:users [{:name "ok" :age 1}
+                                          {:age "x"}]})))))

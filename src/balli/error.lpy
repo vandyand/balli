@@ -1,0 +1,151 @@
+(ns balli.error
+  "Humanized error messages for balli explain maps.
+
+  (humanize explain-map) turns the output of balli.core/explain into a
+  human-readable structure mirroring the shape of the value (Malli
+  semantics):
+    - nil (valid input)          -> nil
+    - root-level errors (:in []) -> flat vector of messages
+    - map keys in :in            -> nested maps    {:x [\"msg\"]}
+    - integer indices in :in     -> sparse vectors [nil [\"msg\"]]
+    - multiple errors at one :in -> accumulate into a single vector
+
+  Messages come from a default table keyed by error :type, with :min/:max
+  interpolation for :balli.core/limits. An :error/message property on the
+  failing schema fragment (the error's :schema) overrides everything."
+  (:require [basilisp.string :as str]))
+
+;; ---------------------------------------------------------------------------
+;; Schema-fragment introspection
+;;
+;; Error :schema carries the original form fragment (e.g. :int,
+;; [:string {:min 3}], [:fn {:error/message "..."} even?]) — split it into
+;; [type properties children] without normalizing (no registry needed).
+
+(defn- split-form
+  "Split a schema form fragment into [type properties children]. Mirrors the
+  normalize rule: a map in 2nd position is a properties map, except for
+  :enum/:= where it only counts as properties when >=1 further child follows
+  (otherwise it is a literal child)."
+  [form]
+  (if (vector? form)
+    (let [[t & args] form]
+      (if (and (map? (first args))
+               (or (not (contains? #{:enum :=} t))
+                   (seq (rest args))))
+        [t (first args) (vec (rest args))]
+        [t {} (vec args)]))
+    [form {} []]))
+
+;; ---------------------------------------------------------------------------
+;; Default messages
+
+(def ^:private type-messages
+  "Default messages for :balli.core/invalid-type, keyed by schema type."
+  {:int "should be an integer"
+   :string "should be a string"
+   :float "should be a float"
+   :double "should be a float"
+   :number "should be a number"
+   :boolean "should be a boolean"
+   :keyword "should be a keyword"
+   :symbol "should be a symbol"
+   :uuid "should be a uuid"
+   :map "should be a map"
+   :map-of "should be a map"
+   :vector "should be a vector"
+   :set "should be a set"
+   :sequential "should be sequential"
+   :tuple "should be a tuple"
+   :re "should be a string"
+   :nil "should be nil"})
+
+(def ^:private numeric-types #{:int :float :double :number})
+(def ^:private counted-types #{:vector :sequential :set :map-of})
+
+(defn- limits-message
+  "Interpolated message for a :balli.core/limits error from the failing
+  schema fragment's :min/:max properties (string length, numeric bounds,
+  collection count, exact tuple size)."
+  [form]
+  (let [[t props children] (split-form form)
+        mn (:min props)
+        mx (:max props)]
+    (cond
+      (= :string t)
+      (cond
+        (and mn mx) (str "should be between " mn " and " mx " characters")
+        mn (str "should be at least " mn " characters")
+        mx (str "should be at most " mx " characters")
+        :else "invalid value")
+
+      (contains? numeric-types t)
+      (cond
+        (and mn mx) (str "should be between " mn " and " mx)
+        mn (str "should be at least " mn)
+        mx (str "should be at most " mx)
+        :else "invalid value")
+
+      (= :tuple t)
+      (str "should have exactly " (count children) " elements")
+
+      (contains? counted-types t)
+      (cond
+        (and mn mx) (str "should have between " mn " and " mx " elements")
+        mn (str "should have at least " mn " elements")
+        mx (str "should have at most " mx " elements")
+        :else "invalid value")
+
+      :else "invalid value")))
+
+(defn- error-message
+  "Message for a single error map. :error/message on the failing schema
+  fragment's properties overrides the default table."
+  [{:keys [type schema]}]
+  (let [[t props children] (split-form schema)]
+    (or (:error/message props)
+        (case type
+          :balli.core/invalid-type (get type-messages t "invalid type")
+          :balli.core/limits (limits-message schema)
+          :balli.core/missing-key "missing required key"
+          :balli.core/extra-key "disallowed key"
+          :balli.core/enum-mismatch (str "should be one of: " (str/join ", " children))
+          :balli.core/not-eq (str "should be equal to " (first children))
+          :balli.core/invalid-dispatch-value "invalid dispatch value"
+          "invalid value"))))
+
+;; ---------------------------------------------------------------------------
+;; Assembly by :in
+
+(defn- pad
+  "Grow vector `v` with nil holes until it has at least `n` elements."
+  [v n]
+  (loop [v v]
+    (if (< (count v) n)
+      (recur (conj v nil))
+      v)))
+
+(defn- add-message
+  "Place `msg` into accumulator `acc` at value-path `in`. Empty `in` conjes
+  onto a message vector; integer steps build sparse vectors with nil holes;
+  other keys build nested maps."
+  [acc in msg]
+  (if (empty? in)
+    (conj (or acc []) msg)
+    (let [k (first in)
+          r (rest in)]
+      (if (int? k)
+        (let [v (pad (or acc []) (inc k))]
+          (assoc v k (add-message (nth v k) r msg)))
+        (let [m (or acc {})]
+          (assoc m k (add-message (get m k) r msg)))))))
+
+(defn humanize
+  "Turn an explain map (from balli.core/explain) into a human-readable
+  structure mirroring the value shape. nil in -> nil out."
+  [explain-map]
+  (when explain-map
+    (reduce (fn [acc error]
+              (add-message acc (:in error) (error-message error)))
+            nil
+            (:errors explain-map))))
