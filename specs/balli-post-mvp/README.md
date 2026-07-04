@@ -34,7 +34,7 @@ See [research.md](research.md) and the [implementation plan](implementation-plan
 | Property code | Real fns only, no eval | Port sci | Basilisp schemas are live data; fns embed naturally; eval adds a dependency for zero user value |
 | Generators | Pure Python `random.Random(seed)` | Hypothesis backend | Zero deps, deterministic seeding; shrinking explicitly out of scope |
 | `:re`/`:fn` generation | Throw `:balli.core/no-generator` unless `:gen/*` props given | Regex string synthesis | Malli itself dynaloads test.chuck for this; synthesis is a project on its own |
-| Function-schema validate | `python/callable` unless `:balli.core/function-checker` opt | Always generative | Malli behavior exactly |
+| Function-schema validate | `fn-like?` (fn or non-collection Python callable; bare `python/callable` rejected per Phase 0 spike) unless function-checker in effect | Always generative; bare `python/callable` | Malli behavior; Basilisp colls/keywords are callable |
 | JSON Schema draft | 2020-12 (`prefixItems`), string-keyed maps | draft-07 | Matches malli 0.20; string keys are `json/dumps`-ready |
 | Phasing | Single spec, 11 phases, parse→seqex→gen→fn order | Spec per tier | Dependency chain (gen needs seqex, fn-checker needs gen) makes separate PRs artificial |
 
