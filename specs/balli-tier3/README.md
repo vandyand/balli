@@ -41,7 +41,7 @@ See [research.md](research.md) and the [implementation plan](implementation-plan
 
 - [x] Phase 0: Spike (datetime ISO, predicate availability, fn-identity lookup)
 - [x] Phase 1: Predicate + comparator schemas
-- [ ] Phase 2: Mutable + composite default registry
+- [x] Phase 2: Mutable + composite default registry
 - [ ] Phase 3: Local registries in schema properties
 - [ ] Phase 4: :balli.core/default branches (:map + :multi)
 - [ ] Phase 5: balli.time
