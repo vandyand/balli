@@ -427,11 +427,12 @@
     (is (= {"type" "integer" "title" "n"} (bjs/transform [:schema {:title "n"} :int])))))
 
 (deftest seqex-transformers-pass-through
-  (testing "seqex types and :schema decode/encode as identity pass-through"
+  (testing "seqex types decode/encode as identity pass-through"
     (is (= ["1" "x"] (b/decode [:cat :int :string] ["1" "x"] (bt/string-transformer))))
     (is (= ["1"] (b/decode [:* :int] ["1"] (bt/string-transformer))))
-    (is (= "1" (b/decode [:schema :int] "1" (bt/string-transformer))))
     (is (= [1 2] (b/encode [:cat :int :int] [1 2] (bt/string-transformer)))))
+  (testing ":schema wrapper is transparent to transformers (balli-tier3)"
+    (is (= 1 (b/decode [:schema :int] "1" (bt/string-transformer)))))
   (testing "seqex nested in a map does not block sibling transforms"
     (is (= {:n 1 :args [:go "2"]}
            (b/decode [:map [:n :int] [:args [:cat :keyword [:* :int]]]]

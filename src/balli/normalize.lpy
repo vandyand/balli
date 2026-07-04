@@ -6,6 +6,10 @@
 
   :children is always a vector. :map, :multi, and :orn children are entry maps
   {:key k :properties p :schema <ast>}. :ref nodes additionally carry :ref <kw>.
+  Nodes whose properties carry a {:registry {kw form}} local registry
+  additionally carry :local-registry {kw form} (the prop kept verbatim in
+  :properties/:form) — every compiling surface layers it over the effective
+  registry for the subtree (balli.registry/push-layer).
   :balli/pred nodes (predicate schemas — AST-only type, never a form keyword)
   additionally carry :pred-key <symbol> and :pred <fn>. Comparator nodes
   (:> :>= :< :<= :not=) hold their single child as a plain VALUE, not a
@@ -19,6 +23,8 @@
 (defn- invalid!
   [msg form]
   (throw (ex-info msg {:type :balli.core/invalid-schema :form form})))
+
+(declare normalize)
 
 (defn fn-like?
   "True when `x` is function-like: a Basilisp fn, or a Python callable that
@@ -162,8 +168,9 @@
     [(first args) (vec (rest args))]
     [{} (vec args)]))
 
-(defmulti normalize
-  "Normalize schema `form` to an AST node map. `opts` may carry {:registry r}.
+(defmulti ^:private normalize*
+  "Per-type normalization (the public entry point is the `normalize` wrapper
+  at the bottom of this file, which handles the :registry property first).
   A registered predicate (core fn or quoted symbol) in schema position — bare
   or as a vector HEAD — dispatches to :balli/pred; a pred in child position
   (e.g. [:fn int?]) is untouched, since dispatch only inspects the head."
@@ -195,22 +202,22 @@
         :else
         (invalid! (str t " accepts only an optional properties map") form)))))
 
-(defmethod normalize :any [form opts] (normalize-scalar form opts))
-(defmethod normalize :nil [form opts] (normalize-scalar form opts))
-(defmethod normalize :string [form opts] (normalize-scalar form opts))
-(defmethod normalize :int [form opts] (normalize-scalar form opts))
-(defmethod normalize :float [form opts] (normalize-scalar form opts))
-(defmethod normalize :double [form opts] (normalize-scalar form opts))
-(defmethod normalize :number [form opts] (normalize-scalar form opts))
-(defmethod normalize :boolean [form opts] (normalize-scalar form opts))
-(defmethod normalize :keyword [form opts] (normalize-scalar form opts))
-(defmethod normalize :symbol [form opts] (normalize-scalar form opts))
-(defmethod normalize :uuid [form opts] (normalize-scalar form opts))
+(defmethod normalize* :any [form opts] (normalize-scalar form opts))
+(defmethod normalize* :nil [form opts] (normalize-scalar form opts))
+(defmethod normalize* :string [form opts] (normalize-scalar form opts))
+(defmethod normalize* :int [form opts] (normalize-scalar form opts))
+(defmethod normalize* :float [form opts] (normalize-scalar form opts))
+(defmethod normalize* :double [form opts] (normalize-scalar form opts))
+(defmethod normalize* :number [form opts] (normalize-scalar form opts))
+(defmethod normalize* :boolean [form opts] (normalize-scalar form opts))
+(defmethod normalize* :keyword [form opts] (normalize-scalar form opts))
+(defmethod normalize* :symbol [form opts] (normalize-scalar form opts))
+(defmethod normalize* :uuid [form opts] (normalize-scalar form opts))
 
 ;; ---------------------------------------------------------------------------
 ;; Literal-value schemas: :enum / :=
 
-(defmethod normalize :enum [form _opts]
+(defmethod normalize* :enum [form _opts]
   (when (keyword? form)
     (invalid! ":enum requires at least one value" form))
   (let [[props elems] (split-props (rest form))]
@@ -218,7 +225,7 @@
       (invalid! ":enum requires at least one value" form))
     (node :enum props elems form)))
 
-(defmethod normalize := [form _opts]
+(defmethod normalize* := [form _opts]
   (when (keyword? form)
     (invalid! ":= requires exactly one value" form))
   (let [[props elems] (split-props (rest form))]
@@ -239,11 +246,11 @@
       (invalid! (str t " expects exactly 1 child schema") form))
     (node t props [(normalize (first elems) opts)] form)))
 
-(defmethod normalize :maybe [form opts] (normalize-single-child form opts))
-(defmethod normalize :not [form opts] (normalize-single-child form opts))
-(defmethod normalize :vector [form opts] (normalize-single-child form opts))
-(defmethod normalize :sequential [form opts] (normalize-single-child form opts))
-(defmethod normalize :set [form opts] (normalize-single-child form opts))
+(defmethod normalize* :maybe [form opts] (normalize-single-child form opts))
+(defmethod normalize* :not [form opts] (normalize-single-child form opts))
+(defmethod normalize* :vector [form opts] (normalize-single-child form opts))
+(defmethod normalize* :sequential [form opts] (normalize-single-child form opts))
+(defmethod normalize* :set [form opts] (normalize-single-child form opts))
 
 ;; ---------------------------------------------------------------------------
 ;; N-child schemas: :and :or :tuple
@@ -258,9 +265,9 @@
       (invalid! (str t " expects at least " min-children " child schema(s)") form))
     (node t props (mapv #(normalize % opts) elems) form)))
 
-(defmethod normalize :and [form opts] (normalize-n-children 1 form opts))
-(defmethod normalize :or [form opts] (normalize-n-children 1 form opts))
-(defmethod normalize :tuple [form opts] (normalize-n-children 0 form opts))
+(defmethod normalize* :and [form opts] (normalize-n-children 1 form opts))
+(defmethod normalize* :or [form opts] (normalize-n-children 1 form opts))
+(defmethod normalize* :tuple [form opts] (normalize-n-children 0 form opts))
 
 ;; ---------------------------------------------------------------------------
 ;; :map / :multi / :orn entries
@@ -278,13 +285,13 @@
         (invalid! "Entry properties must be a map" entry))
       {:key (nth entry 0) :properties props :schema (normalize (nth entry 2) opts)})))
 
-(defmethod normalize :map [form opts]
+(defmethod normalize* :map [form opts]
   (if (keyword? form)
     (node :map {} [] form)
     (let [[props elems] (split-props-leading (rest form))]
       (node :map props (mapv #(normalize-entry % opts) elems) form))))
 
-(defmethod normalize :multi [form opts]
+(defmethod normalize* :multi [form opts]
   (when (keyword? form)
     (invalid! ":multi requires a :dispatch property" form))
   (let [[props elems] (split-props-leading (rest form))]
@@ -295,7 +302,7 @@
         (invalid! ":multi :dispatch must be a keyword or fn" form)))
     (node :multi props (mapv #(normalize-entry % opts) elems) form)))
 
-(defmethod normalize :orn [form opts]
+(defmethod normalize* :orn [form opts]
   (when (keyword? form)
     (invalid! ":orn requires at least one entry" form))
   (let [[props elems] (split-props-leading (rest form))]
@@ -306,7 +313,7 @@
 ;; ---------------------------------------------------------------------------
 ;; :map-of
 
-(defmethod normalize :map-of [form opts]
+(defmethod normalize* :map-of [form opts]
   (when (keyword? form)
     (invalid! ":map-of requires key and value schemas" form))
   (let [[props elems] (split-props (rest form))]
@@ -317,7 +324,7 @@
 ;; ---------------------------------------------------------------------------
 ;; :fn
 
-(defmethod normalize :fn [form _opts]
+(defmethod normalize* :fn [form _opts]
   (when (keyword? form)
     (invalid! ":fn requires a predicate" form))
   (let [[props elems] (split-props (rest form))]
@@ -345,7 +352,7 @@
    :children []
    :form form})
 
-(defmethod normalize :balli/pred [form _opts]
+(defmethod normalize* :balli/pred [form _opts]
   (if (vector? form)
     (let [k (pred-form-key (first form))
           args (vec (rest form))]
@@ -379,16 +386,16 @@
       (invalid! (str t " expects exactly 1 child value") form))
     (node t props [(first elems)] form)))
 
-(defmethod normalize :> [form opts] (normalize-comparator form opts))
-(defmethod normalize :>= [form opts] (normalize-comparator form opts))
-(defmethod normalize :< [form opts] (normalize-comparator form opts))
-(defmethod normalize :<= [form opts] (normalize-comparator form opts))
-(defmethod normalize :not= [form opts] (normalize-comparator form opts))
+(defmethod normalize* :> [form opts] (normalize-comparator form opts))
+(defmethod normalize* :>= [form opts] (normalize-comparator form opts))
+(defmethod normalize* :< [form opts] (normalize-comparator form opts))
+(defmethod normalize* :<= [form opts] (normalize-comparator form opts))
+(defmethod normalize* :not= [form opts] (normalize-comparator form opts))
 
 ;; ---------------------------------------------------------------------------
 ;; :re
 
-(defmethod normalize :re [form _opts]
+(defmethod normalize* :re [form _opts]
   (when (keyword? form)
     (invalid! ":re requires a pattern" form))
   (let [[props elems] (split-props (rest form))]
@@ -413,13 +420,13 @@
 ;; is always properties (split-props-leading). :catn/:altn children are entry
 ;; vectors like :map/:orn.
 
-(defmethod normalize :cat [form opts]
+(defmethod normalize* :cat [form opts]
   (if (keyword? form)
     (node :cat {} [] form)
     (let [[props elems] (split-props-leading (rest form))]
       (node :cat props (mapv #(normalize % opts) elems) form))))
 
-(defmethod normalize :alt [form opts]
+(defmethod normalize* :alt [form opts]
   (when (keyword? form)
     (invalid! ":alt requires at least one child schema" form))
   (let [[props elems] (split-props-leading (rest form))]
@@ -436,15 +443,15 @@
       (invalid! (str t " requires at least one entry") form))
     (node t props (mapv #(normalize-entry % opts) elems) form)))
 
-(defmethod normalize :catn [form opts] (normalize-seqex-entries :catn form opts))
-(defmethod normalize :altn [form opts] (normalize-seqex-entries :altn form opts))
+(defmethod normalize* :catn [form opts] (normalize-seqex-entries :catn form opts))
+(defmethod normalize* :altn [form opts] (normalize-seqex-entries :altn form opts))
 
-(defmethod normalize :? [form opts] (normalize-single-child form opts))
-(defmethod normalize :* [form opts] (normalize-single-child form opts))
-(defmethod normalize :+ [form opts] (normalize-single-child form opts))
-(defmethod normalize :schema [form opts] (normalize-single-child form opts))
+(defmethod normalize* :? [form opts] (normalize-single-child form opts))
+(defmethod normalize* :* [form opts] (normalize-single-child form opts))
+(defmethod normalize* :+ [form opts] (normalize-single-child form opts))
+(defmethod normalize* :schema [form opts] (normalize-single-child form opts))
 
-(defmethod normalize :repeat [form opts]
+(defmethod normalize* :repeat [form opts]
   (when (keyword? form)
     (invalid! ":repeat requires a child schema" form))
   (let [[props elems] (split-props-leading (rest form))]
@@ -520,7 +527,7 @@
 ;; The guard, when present, is an ordinary schema validated against
 ;; [args ret] by instrument.
 
-(defmethod normalize :=> [form opts]
+(defmethod normalize* :=> [form opts]
   (when (keyword? form)
     (invalid! ":=> requires input and output schemas" form))
   (let [[props elems] (split-props-leading (rest form))]
@@ -532,7 +539,7 @@
                         {:type :balli.core/invalid-input-schema :form form})))
       (node :=> props children form))))
 
-(defmethod normalize :function [form opts]
+(defmethod normalize* :function [form opts]
   (when (keyword? form)
     (invalid! ":function requires at least one :=> child" form))
   (let [[props elems] (split-props-leading (rest form))]
@@ -563,7 +570,7 @@
 ;; ---------------------------------------------------------------------------
 ;; :ref
 
-(defmethod normalize :ref [form _opts]
+(defmethod normalize* :ref [form _opts]
   (when (keyword? form)
     (invalid! ":ref requires a keyword target" form))
   (let [[props elems] (split-props (rest form))]
@@ -575,8 +582,78 @@
 ;; ---------------------------------------------------------------------------
 ;; Default: registered keywords normalize as refs; everything else is invalid
 
-(defmethod normalize :default [form opts]
+(defmethod normalize* :default [form opts]
   (let [registry (or (:registry opts) (reg/default-registry))]
     (if (and (keyword? form) (contains? (:schemas registry) form))
       (assoc (node :ref {} [] form) :ref form)
       (invalid! "Unknown schema" form))))
+
+;; ---------------------------------------------------------------------------
+;; Local registries (:registry property) + public entry point
+;;
+;; ANY vector-form schema may carry {:registry {kw form ...}} in its
+;; properties (tier-3 Phase 3, semantics section 1). The wrapper below
+;; validates the prop (a map with keyword keys, else invalid-schema), layers
+;; the local schemas over the effective registry for the SUBTREE (so bare
+;; registered keywords below — including in :map/:multi/:orn/:catn/:altn
+;; entry schemas — resolve to refs via the :default method), leaves the prop
+;; verbatim in :properties/:form, and stamps the AST node with
+;; :local-registry {kw form}. The local entry VALUES are NOT normalized here:
+;; ref targets normalize lazily at compile time against the compile-time
+;; layer chain (balli.registry/push-layer at every :local-registry node),
+;; which is what lets recursive and mutually recursive local entries work.
+;;
+;; `form-props` replicates each type's props-vs-child disambiguation so this
+;; never mistakes a literal map CHILD for a properties map (e.g.
+;; [:enum {:registry 1}] is an enum of one map value, [:> {:registry 1}]
+;; compares against a map value).
+
+(def ^:private leading-props-types
+  "Types whose leading map is ALWAYS properties (the split-props-leading
+  users above)."
+  #{:map :multi :orn :cat :alt :catn :altn :repeat :=> :function})
+
+(def ^:private scalar-types
+  "Types whose vector form is [t] or [t props] (the normalize-scalar users)."
+  #{:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid})
+
+(defn- form-props
+  "The properties map of vector-form `form`, or nil — replicating the
+  per-type props-vs-child rules: leading-props types always, split-props
+  types only when further elements follow, scalar/pred vector forms on a
+  single trailing map."
+  [form]
+  (when (and (vector? form) (map? (second form)))
+    (let [h (first form)]
+      (cond
+        (contains? leading-props-types h) (second form)
+        (> (count form) 2) (second form)
+        (contains? scalar-types h) (second form)
+        (and (not (keyword? h)) (some? (pred-form-key h))) (second form)
+        :else nil))))
+
+(defn- local-registry-prop
+  "The validated :registry property of vector-form `form` ({kw form} map),
+  or nil when absent. Garbage (a non-map value, or non-keyword keys) throws
+  :balli.core/invalid-schema; the VALUES are validated lazily at compile."
+  [form]
+  (when-let [props (form-props form)]
+    (when (contains? props :registry)
+      (let [local (:registry props)]
+        (when-not (and (map? local) (every? keyword? (keys local)))
+          (invalid! ":registry property must be a map of keyword -> schema form" form))
+        local))))
+
+(defn normalize
+  "Normalize schema `form` to an AST node map. `opts` may carry {:registry r}.
+  A vector form whose properties carry {:registry {kw form ...}} has the
+  local schemas layered over the effective registry — resolved ONCE here as
+  (or (:registry opts) live-default) — for its whole subtree, and its AST
+  node gains :local-registry (see the section comment above). Unknown or
+  invalid forms throw ex-info with {:type :balli.core/invalid-schema}."
+  [form opts]
+  (if-let [local (local-registry-prop form)]
+    (let [effective (or (:registry opts) (reg/default-registry))
+          opts* (assoc opts :registry (update effective :schemas merge local))]
+      (assoc (normalize* form opts*) :local-registry local))
+    (normalize* form opts)))

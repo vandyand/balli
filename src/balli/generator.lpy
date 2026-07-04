@@ -72,6 +72,16 @@
 
 (declare gen)
 
+(defn- layered-registry
+  "Registry for descending into `ast`: its :local-registry (when present)
+  pushed as a fresh layer (balli.registry/push-layer) — mirroring the
+  compile-side `layered` helper so generation resolves shadowed local-
+  registry keywords exactly like validation does."
+  [ast registry]
+  (if-let [local (:local-registry ast)]
+    (reg/push-layer registry local)
+    registry))
+
 (def ^:private ref-cap
   "Max :ref expansions along one generation path before the escape/throw
   behavior documented in the ns docstring kicks in."
@@ -225,19 +235,26 @@
 (defn- gen-ref
   "Expand the ref target with depth+1. At the cap (depth >= 5): target
   normalizing to :maybe -> nil; anything else -> unsatisfiable-schema. See
-  the ns docstring for the full cap contract."
+  the ns docstring for the full cap contract. Resolution goes through the
+  layered registry chain (innermost first) and the target normalizes +
+  generates against the resolving layer's chain prefix — the same lexical
+  scoping the compilers use, so shadowed local-registry keywords generate
+  their in-scope meaning. Depth stays a plain per-path expansion counter
+  (identity-free), which is strictly more conservative than per-[kw layer]
+  counting and terminates regardless of layering."
   [ast registry rnd size depth]
   (let [k (:ref ast)
-        target (reg/resolve-ref registry k)]
-    (when (nil? target)
+        r (reg/resolve-ref-layered registry k)]
+    (when (nil? r)
       (throw (ex-info "Unresolved ref"
                       {:type :balli.core/unresolved-ref :ref k})))
-    (let [tast (norm/normalize target {:registry registry})]
+    (let [tr (:registry r)
+          tast (norm/normalize (:form r) {:registry tr})]
       (if (>= depth ref-cap)
         (if (= :maybe (:type tast))
           nil
           (unsatisfiable! ast))
-        (gen tast registry rnd size (inc depth))))))
+        (gen tast tr rnd size (inc depth))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Sequence schemas: flat chunks via concat-splicing
@@ -256,7 +273,8 @@
   (let [reduced? (>= depth ref-cap)
         chunk (fn [c]
                 (cond
-                  (c/regex-op? c) (gen-seqex-chunk c registry rnd size depth)
+                  (c/regex-op? c) (gen-seqex-chunk c (layered-registry c registry)
+                                                   rnd size depth)
                   (= :ref (:type c)) (throw-recursive-seqex! c)
                   :else [(gen c registry rnd size depth)]))
         reps (fn [n f] (into [] (mapcat (fn [_] (f))) (range n)))]
@@ -421,9 +439,12 @@
 
 (defn- gen
   "Generate a value for AST `ast`: :gen/return -> :gen/elements ->
-  :gen/schema -> type default, then :gen/fmap post-maps the result."
+  :gen/schema -> type default, then :gen/fmap post-maps the result. Layer-
+  aware entry: a node carrying :local-registry extends the registry chain
+  for its whole subtree first (see `layered-registry`)."
   [ast registry rnd size depth]
-  (let [props (:properties ast)
+  (let [registry (layered-registry ast registry)
+        props (:properties ast)
         base (cond
                (contains? props :gen/return)
                (:gen/return props)
@@ -507,7 +528,8 @@
        (let [registry (or registry (reg/default-registry))
              ast (if (and (map? schema) (:type schema))
                    schema
-                   (norm/normalize schema {:registry registry}))]
+                   (norm/normalize schema {:registry registry}))
+             registry (layered-registry ast registry)]
          (if (= :function (:type ast))
            (some #(check % value registry) (:children ast))
            (let [input-ast (nth (:children ast) 0)
@@ -516,8 +538,9 @@
                  rnd (random/Random)]
              (loop [i 0]
                (when (< i iterations)
-                 (let [args (gen-seqex-chunk input-ast registry rnd
-                                             default-size 0)
+                 (let [args (gen-seqex-chunk input-ast
+                                             (layered-registry input-ast registry)
+                                             rnd default-size 0)
                        failure (try
                                  (let [ret (apply value args)
                                        errors (output-ef ret [] [])]

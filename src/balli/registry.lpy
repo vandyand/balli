@@ -118,3 +118,68 @@
   Returns nil when the keyword is not registered."
   [reg k]
   (get (:schemas reg) k))
+
+;; ---------------------------------------------------------------------------
+;; Layered registries (local :registry schema properties, tier-3 Phase 3)
+;;
+;; A schema node carrying a {:registry {kw form}} property extends the
+;; effective registry for its whole subtree. The layered registry is a
+;; CHAIN: still a plain registry map (:schemas is the innermost merge, so
+;; every existing `resolve-ref` / `(:schemas r)` consumer keeps working)
+;; annotated with :balli/layers -- a vector, outermost layer first, of
+;;   {:token <int> :local {kw form} :schemas <merge through this layer>}
+;; Tokens come from a global monotonic counter; their only job is IDENTITY:
+;; compilation ref caches key entries by [kw token-of-the-layer-that-
+;; supplied-the-form], so a keyword shadowed by an inner :registry property
+;; never shares a compiled fn with its outer meaning, while an inner ref to
+;; an OUTER key resolves through the outer layer and does share.
+;;
+;; Scoping is lexical, matching malli's property registries: a target found
+;; at layer L normalizes and compiles against the chain PREFIX ending at L
+;; -- local entries see the outer registry and each other, never layers
+;; nested below their definition site. `resolve-ref-layered` returns that
+;; prefix under :registry."
+
+(def ^:private layer-token-counter
+  "Monotonic ids for registry layers. Global for simplicity -- uniqueness is
+  all that matters (compilation caches are per-compilation anyway). Token 0
+  is reserved for the implicit base layer of a plain (un-layered) registry."
+  (atom 0))
+
+(defn push-layer
+  "Layer the local {kw form} map `local` over registry (or chain) `r`,
+  returning a chain map: :schemas becomes local merged over r's, and
+  :balli/layers gains a fresh-token layer. A plain registry gets an implicit
+  base layer with the constant token 0, so refs that resolve from the base
+  registry key caches identically whether or not any layering happened."
+  [r local]
+  (let [layers (or (:balli/layers r)
+                   [{:token 0 :local (:schemas r) :schemas (:schemas r)}])
+        merged (merge (:schemas (peek layers)) local)]
+    (assoc r
+           :schemas merged
+           :balli/layers (conj layers {:token (swap! layer-token-counter inc)
+                                       :local local
+                                       :schemas merged}))))
+
+(defn resolve-ref-layered
+  "Resolve keyword `k` against registry (or chain) `r`, innermost layer
+  first. Returns
+    {:form <schema form> :token <layer token> :registry <chain prefix>}
+  or nil when unregistered. The :registry is the chain prefix ending at the
+  layer that supplied the form -- what the target must normalize/compile
+  against (lexical scoping; see the section comment above). Plain registries
+  resolve at the implicit base layer with token 0."
+  [r k]
+  (if-let [layers (:balli/layers r)]
+    (loop [i (dec (count layers))]
+      (when (>= i 0)
+        (let [{:keys [token local schemas]} (nth layers i)]
+          (if (contains? local k)
+            {:form (get local k)
+             :token token
+             :registry (assoc r :schemas schemas
+                              :balli/layers (subvec layers 0 (inc i)))}
+            (recur (dec i))))))
+    (when-let [form (get (:schemas r) k)]
+      {:form form :token 0 :registry r})))

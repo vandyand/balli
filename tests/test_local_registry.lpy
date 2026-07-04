@@ -1,0 +1,343 @@
+(ns tests.test-local-registry
+  "Phase 3 (tier 3): local registries in schema properties.
+
+  Covers: the self-contained recursive tree idiom
+  ([:schema {:registry {::node ...}} ::node]) through
+  validate/explain/parse/unparse/generate, mutual recursion between two
+  local keys, the mandatory SIX-SURFACE shadowing schema (one schema, outer
+  ::x :int / inner ::x :string, asserted through validator, explainer,
+  parser, decoder, generator, and json-schema definition naming with the
+  __<n> suffix rule), token-keyed cache correctness (same keyword + same
+  form under DIFFERENT sibling environments never share), lexical scoping
+  (a local entry resolves outer keys at its DEFINITION site, unaffected by
+  deeper shadows), local keys seeing outer global keys (opts registry and
+  register!), form/walk round-trips preserving the :registry prop verbatim,
+  schema-boundary garbage (:registry non-map / non-keyword keys ->
+  invalid-schema; garbage entry VALUES invalid lazily at compile), and
+  feature composition: schema objects + transformers, :orn parse/unparse
+  through local refs (transforming-parser? layer identity), and seqex
+  subtrees under a local registry."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.generator :as bg]
+            [balli.json-schema :as bjs]
+            [balli.registry :as reg]
+            [balli.transform :as bt]))
+
+(defn- ex-type
+  [thunk]
+  (try
+    (thunk)
+    nil
+    (catch python/Exception e (:type (ex-data e)))))
+
+(defn- kw-name
+  "The json-schema definition name of keyword `k` (\"ns/name\")."
+  [k]
+  (subs (str k) 1))
+
+;; ---------------------------------------------------------------------------
+;; Self-contained recursive tree (the README/checkpoint idiom) -- NO opts
+;; registry anywhere.
+
+(def ^:private tree-form
+  [:schema {:registry {::node [:maybe [:map [:kids [:vector [:ref ::node]]]]]}}
+   ::node])
+
+(deftest recursive-tree-validate
+  (is (true? (b/validate tree-form {:kids [{:kids []}]})))
+  (is (true? (b/validate tree-form nil)))
+  (is (true? (b/validate tree-form {:kids [nil {:kids [nil]}]})))
+  (is (false? (b/validate tree-form {:kids [5]})))
+  (is (false? (b/validate tree-form {:kids [{:kids [{:wrong true}]}]}))))
+
+(deftest recursive-tree-explain
+  (is (nil? (b/explain tree-form {:kids [{:kids []}]})))
+  (let [{:keys [errors]} (b/explain tree-form {:kids [5]})]
+    (is (seq errors))
+    (is (some #(= [:kids 0] (:in %)) errors))))
+
+(deftest recursive-tree-parse-unparse
+  (testing "non-transforming recursion: parse = validate-then-value"
+    (is (= {:kids [{:kids []}]} (b/parse tree-form {:kids [{:kids []}]})))
+    (is (b/invalid? (b/parse tree-form {:kids [5]})))
+    (is (= {:kids []} (b/unparse tree-form {:kids []})))
+    (is (b/invalid? (b/unparse tree-form {:kids [5]})))))
+
+(deftest recursive-tree-generate
+  (testing "seeded generation terminates (ref cap + reduced mode) and validates"
+    (let [v (bg/generate tree-form {:seed 3})]
+      (is (true? (b/validate tree-form v))))
+    (doseq [v (bg/sample tree-form {:seed 42 :size 5})]
+      (is (true? (b/validate tree-form v))))))
+
+(deftest recursive-tree-json-schema
+  (let [out (bjs/transform tree-form)
+        node-name (kw-name ::node)]
+    (is (= (str "#/definitions/" (.replace node-name "/" "~1"))
+           (get out "$ref")))
+    (is (contains? (get out "definitions") node-name))
+    (testing "the definition refers back to itself (recursion, no expansion)"
+      (is (= (str "#/definitions/" (.replace node-name "/" "~1"))
+             (get-in out ["definitions" node-name
+                          "oneOf" 0 "properties" "kids" "items" "$ref"]))))))
+
+;; ---------------------------------------------------------------------------
+;; Mutual recursion between two local keys
+
+(def ^:private ping-form
+  [:schema {:registry {::ping [:maybe [:tuple [:= "ping"] [:ref ::pong]]]
+                       ::pong [:maybe [:tuple [:= "pong"] [:ref ::ping]]]}}
+   ::ping])
+
+(deftest mutual-recursion
+  (is (true? (b/validate ping-form nil)))
+  (is (true? (b/validate ping-form ["ping" nil])))
+  (is (true? (b/validate ping-form ["ping" ["pong" ["ping" nil]]])))
+  (is (false? (b/validate ping-form ["ping" ["ping" nil]])))
+  (is (false? (b/validate ping-form ["pong" nil])))
+  (testing "explain pinpoints the wrong branch"
+    (let [{:keys [errors]} (b/explain ping-form ["ping" ["ping" nil]])]
+      (is (some #(= [1 0] (:in %)) errors))))
+  (testing "parse round-trips (validate-then-value)"
+    (is (= ["ping" ["pong" nil]] (b/parse ping-form ["ping" ["pong" nil]])))
+    (is (b/invalid? (b/parse ping-form ["pong" nil]))))
+  (testing "generation terminates and validates"
+    (is (true? (b/validate ping-form (bg/generate ping-form {:seed 11}))))))
+
+;; ---------------------------------------------------------------------------
+;; THE six-surface shadowing schema: ONE schema, outer ::x = :int shadowed
+;; by inner ::x = :string. Every surface must honor both meanings.
+
+(def ^:private shadow-form
+  [:map {:registry {::x :int}}
+   [:outer [:ref ::x]]
+   [:inner [:map {:registry {::x :string}}
+            [:val [:ref ::x]]]]])
+
+(deftest shadowing-validator
+  (is (true? (b/validate shadow-form {:outer 5 :inner {:val "s"}})))
+  (is (false? (b/validate shadow-form {:outer "5" :inner {:val "s"}})))
+  (is (false? (b/validate shadow-form {:outer 5 :inner {:val 5}}))))
+
+(deftest shadowing-explainer
+  (is (nil? (b/explain shadow-form {:outer 5 :inner {:val "s"}})))
+  (let [{:keys [errors]} (b/explain shadow-form {:outer "no" :inner {:val 7}})]
+    (is (= 2 (count errors)))
+    (testing "outer failure explains as the :int meaning"
+      (let [e (first (filter #(= [:outer] (:in %)) errors))]
+        (is (= :int (:schema e)))
+        (is (= :balli.core/invalid-type (:type e)))))
+    (testing "inner failure explains as the :string meaning"
+      (let [e (first (filter #(= [:inner :val] (:in %)) errors))]
+        (is (= :string (:schema e)))
+        (is (= :balli.core/invalid-type (:type e)))))))
+
+(deftest shadowing-parser
+  (is (= {:outer 5 :inner {:val "s"}}
+         (b/parse shadow-form {:outer 5 :inner {:val "s"}})))
+  (is (b/invalid? (b/parse shadow-form {:outer "5" :inner {:val "s"}})))
+  (is (b/invalid? (b/parse shadow-form {:outer 5 :inner {:val 5}})))
+  (testing "unparse mirrors"
+    (is (= {:outer 5 :inner {:val "s"}}
+           (b/unparse shadow-form {:outer 5 :inner {:val "s"}})))
+    (is (b/invalid? (b/unparse shadow-form {:outer 5 :inner {:val 5}})))))
+
+(deftest shadowing-decoder
+  (testing "string-decode: outer ::x (:int) coerces \"5\"->5, inner ::x
+            (:string) leaves \"5\" alone"
+    (is (= {:outer 5 :inner {:val "5"}}
+           (b/decode shadow-form {:outer "5" :inner {:val "5"}}
+                     (bt/string-transformer)))))
+  (testing "string-encode: outer stringifies, inner untouched"
+    (is (= {:outer "5" :inner {:val "s"}}
+           (b/encode shadow-form {:outer 5 :inner {:val "s"}}
+                     (bt/string-transformer))))))
+
+(deftest shadowing-generator
+  (let [v (bg/generate shadow-form {:seed 7})]
+    (is (true? (b/validate shadow-form v)))
+    (is (int? (:outer v)))
+    (is (string? (get-in v [:inner :val])))))
+
+(deftest shadowing-json-schema
+  (let [out (bjs/transform shadow-form)
+        base (kw-name ::x)
+        defs (get out "definitions")]
+    (testing "two distinct definition keys, __2 suffix on the shadow"
+      (is (= #{base (str base "__2")} (set (keys defs))))
+      (is (= {"type" "integer"} (get defs base)))
+      (is (= {"type" "string"} (get defs (str base "__2")))))
+    (testing "$refs point at the right definition"
+      (is (= (str "#/definitions/" (.replace base "/" "~1"))
+             (get-in out ["properties" "outer" "$ref"])))
+      (is (= (str "#/definitions/" (.replace base "/" "~1") "__2")
+             (get-in out ["properties" "inner" "properties" "val" "$ref"]))))))
+
+;; ---------------------------------------------------------------------------
+;; Cache-key identity: same keyword, SAME target form, DIFFERENT sibling
+;; environments must NOT share a compiled fn (this is exactly the case where
+;; [kw form] keys would collide -- the layer-token keys must not).
+
+(def ^:private sibling-env-form
+  ;; :maybe carriers (not [:schema ...]): the :schema wrapper is a pinned
+  ;; transform PASS-THROUGH (see test_regex.lpy), and this schema goes
+  ;; through decode below.
+  [:tuple
+   [:maybe {:registry {::v [:vector [:ref ::w]] ::w :int}} [:ref ::v]]
+   [:maybe {:registry {::v [:vector [:ref ::w]] ::w :string}} [:ref ::v]]])
+
+(deftest same-form-different-environment
+  (is (true? (b/validate sibling-env-form [[1 2] ["a"]])))
+  (is (false? (b/validate sibling-env-form [["a"] [1 2]])))
+  (testing "decode honors each environment"
+    (is (= [[1] ["2"]]
+           (b/decode sibling-env-form [["1"] ["2"]] (bt/string-transformer)))))
+  (testing "generation honors each environment"
+    (let [[a b*] (bg/generate sibling-env-form {:seed 5})]
+      (is (every? int? a))
+      (is (every? string? b*)))))
+
+;; ---------------------------------------------------------------------------
+;; Lexical scoping: a local entry resolves outer keys at its DEFINITION
+;; site; a deeper shadow of those keys does not rebind it.
+
+(deftest lexical-scoping-of-local-entries
+  (let [form [:map {:registry {::x :int}}
+              [:a [:ref ::x]]
+              [:b [:map {:registry {::z [:ref ::x]}}
+                   [:c [:ref ::z]]
+                   [:d [:map {:registry {::x :keyword}}
+                        [:e [:ref ::x]]
+                        [:f [:ref ::z]]]]]]]]
+    ;; ::z is defined where ::x means :int, so :f is an :int even under the
+    ;; :keyword shadow; :e picks up the shadow.
+    (is (true? (b/validate form {:a 1 :b {:c 2 :d {:e :k :f 3}}})))
+    (is (false? (b/validate form {:a 1 :b {:c 2 :d {:e :k :f :nope}}})))
+    (is (false? (b/validate form {:a 1 :b {:c 2 :d {:e 9 :f 3}}})))))
+
+(deftest inner-ref-to-outer-key-shares-outer-meaning
+  (let [form [:map {:registry {::a :int ::b [:ref ::a]}}
+              [:x [:map {:registry {::c :string}}
+                   [:y [:ref ::b]]]]]]
+    (is (true? (b/validate form {:x {:y 3}})))
+    (is (false? (b/validate form {:x {:y "s"}})))))
+
+;; ---------------------------------------------------------------------------
+;; Local keys see OUTER global keys (opts registry + mutable default)
+
+(deftest local-sees-opts-global
+  (let [r (reg/registry {::price :int})
+        form [:map {:registry {::item [:map [:price ::price]]}}
+              [:it [:ref ::item]]]]
+    (is (true? (b/validate form {:it {:price 5}} {:registry r})))
+    (is (false? (b/validate form {:it {:price "x"}} {:registry r})))))
+
+(deftest local-sees-registered-global
+  (let [saved (reg/default-registry)]
+    (try
+      (reg/register! ::glob [:>= 0])
+      (is (true? (b/validate [:vector {:registry {::nn [:and :int ::glob]}}
+                              [:ref ::nn]]
+                             [1 2 0])))
+      (is (false? (b/validate [:vector {:registry {::nn [:and :int ::glob]}}
+                               [:ref ::nn]]
+                              [1 -2])))
+      (finally
+        (reg/set-default-registry! saved)))))
+
+;; ---------------------------------------------------------------------------
+;; Form round-trips: the :registry prop is preserved verbatim
+
+(deftest form-round-trip
+  (is (= shadow-form (b/form (b/schema shadow-form))))
+  (is (= tree-form (b/form (b/schema tree-form))))
+  (testing "properties expose the prop verbatim"
+    (is (= {::x :int} (:registry (b/properties shadow-form)))))
+  (testing "core walk rebuilds the prop untouched"
+    (is (= shadow-form (b/walk shadow-form (b/schema-walker identity))))
+    (is (= tree-form (b/walk tree-form (b/schema-walker identity))))))
+
+;; ---------------------------------------------------------------------------
+;; Schema-boundary garbage
+
+(deftest garbage-registry-prop
+  (testing "non-map :registry values"
+    (is (= :balli.core/invalid-schema
+           (ex-type #(b/schema [:map {:registry [:not-a-map]} [:x :int]]))))
+    (is (= :balli.core/invalid-schema
+           (ex-type #(b/schema [:vector {:registry "nope"} :int])))))
+  (testing "non-keyword keys"
+    (is (= :balli.core/invalid-schema
+           (ex-type #(b/schema [:int {:registry {"k" :int}}]))))
+    (is (= :balli.core/invalid-schema
+           (ex-type #(b/schema [:map {:registry {::ok :int "bad" :int}} [:x :int]])))))
+  (testing "garbage entry VALUES are invalid lazily, at compile"
+    (is (map? (:ast (b/schema [:schema {:registry {::bad 42}} :int]))))
+    (is (= :balli.core/invalid-schema
+           (ex-type #(b/validate [:schema {:registry {::bad 42}} ::bad] 1))))))
+
+(deftest literal-map-children-are-not-props
+  (testing "single trailing map on value-position types stays a CHILD"
+    ;; enum of one map value -- :registry inside is data, not a prop
+    (is (true? (b/validate [:enum {:registry {::x :int}}] {:registry {::x :int}})))
+    ;; comparator child value
+    (is (false? (b/validate [:not= {:registry 1}] {:registry 1})))
+    (is (true? (b/validate [:not= {:registry 1}] {:registry 2})))))
+
+;; ---------------------------------------------------------------------------
+;; Composition: schema objects, transformers, :orn parse through local refs,
+;; seqex under a local registry
+
+(deftest schema-object-with-transformer
+  (let [so (b/schema [:map {:registry {::n :int}}
+                      [:a [:ref ::n]]
+                      [:b ::n]])]
+    (testing "bare registered keyword under the subtree resolves as a ref"
+      (is (true? (b/validate so {:a 1 :b 2})))
+      (is (false? (b/validate so {:a 1 :b "2"}))))
+    (testing "decode/encode through the baked object"
+      (is (= {:a 5 :b 7} (b/decode so {:a "5" :b "7"} (bt/string-transformer))))
+      (is (= {:a "5" :b "7"} (b/encode so {:a 5 :b 7} (bt/string-transformer)))))
+    (testing "the object's cached compilations stay coherent"
+      (is (identical? (b/validator so) (b/validator so)))
+      (is (= shadow-form (b/form (b/schema shadow-form)))))))
+
+(deftest orn-parse-through-local-refs
+  (testing ":and's transforming-parser analysis follows layered refs"
+    (let [form [:and {:registry {::t [:orn [:i :int] [:s :string]]}} [:ref ::t]]]
+      (is (= (b/tag :i 5) (b/parse form 5)))
+      (is (= (b/tag :s "x") (b/parse form "x")))
+      (is (b/invalid? (b/parse form :kw)))
+      (is (= 5 (b/unparse form (b/tag :i 5))))))
+  (testing "shadowed :orn entries parse/unparse per layer"
+    (let [form [:map {:registry {::t [:orn [:i :int]]}}
+                [:o [:ref ::t]]
+                [:in [:map {:registry {::t [:orn [:s :string]]}}
+                      [:v [:ref ::t]]]]]
+          parsed (b/parse form {:o 1 :in {:v "a"}})]
+      (is (= (b/tag :i 1) (:o parsed)))
+      (is (= (b/tag :s "a") (get-in parsed [:in :v])))
+      (is (= {:o 1 :in {:v "a"}} (b/unparse form parsed))))))
+
+(deftest seqex-under-local-registry
+  (let [form [:cat {:registry {::n :int}}
+              [:* [:schema [:ref ::n]]]
+              :string]]
+    (is (true? (b/validate form [1 2 "x"])))
+    (is (false? (b/validate form [1 "y" "x"])))
+    (is (= [[1 2] "x"] (b/parse form [1 2 "x"])))))
+
+(deftest sibling-same-form-shares-json-definition
+  (testing "same [kw form] from different layers reuses one definition;
+            a different form under the same name gets the __2 suffix"
+    (let [out (bjs/transform
+               [:tuple
+                [:map {:registry {::v :int}} [:a [:ref ::v]]]
+                [:map {:registry {::v :int}} [:a [:ref ::v]]]
+                [:map {:registry {::v :boolean}} [:a [:ref ::v]]]])
+          base (kw-name ::v)
+          defs (get out "definitions")]
+      (is (= #{base (str base "__2")} (set (keys defs))))
+      (is (= {"type" "integer"} (get defs base)))
+      (is (= {"type" "boolean"} (get defs (str base "__2")))))))

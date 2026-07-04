@@ -301,20 +301,28 @@
   "Lazy memoized target transformer: the ref resolves (and throws on an
   unresolved target) at compile time, but the target's transformer compiles
   on first use through the per-compilation `cache` atom -- recursion-safe,
-  since nested refs only force after the outer entry is already cached."
+  since nested refs only force after the outer entry is already cached.
+  Resolution goes through the layered registry chain and the cache is keyed
+  [kw layer-token] (see balli.compile/compile-ref for the token + lexical-
+  scoping contract), so shadowed keywords never share a cached transformer;
+  the target compiles against the resolving layer's chain prefix, which also
+  replaces :registry in the opts handed to {:compile ...} interceptors."
   [node registry chain method opts cache]
   (let [k (:ref node)
-        target (reg/resolve-ref registry k)]
-    (when (nil? target)
+        r (reg/resolve-ref-layered registry k)]
+    (when (nil? r)
       (throw (ex-info "Unresolved ref" {:type :balli.core/unresolved-ref :ref k})))
-    (fn [x]
-      (let [t (or (get @cache k)
-                  (let [t* (or (transform-node (norm/normalize target {:registry registry})
-                                               registry chain method opts cache)
-                               ::identity)]
-                    (swap! cache assoc k t*)
-                    t*))]
-        (if (identical? ::identity t) x (t x))))))
+    (let [ck [k (:token r)]
+          tr (:registry r)
+          opts (assoc opts :registry tr)]
+      (fn [x]
+        (let [t (or (get @cache ck)
+                    (let [t* (or (transform-node (norm/normalize (:form r) {:registry tr})
+                                                 tr chain method opts cache)
+                                 ::identity)]
+                      (swap! cache assoc ck t*)
+                      t*))]
+          (if (identical? ::identity t) x (t x)))))))
 
 (defn- transform-children
   "Per-type descent: the child part of a node's transformer, or nil when the
@@ -327,10 +335,16 @@
           :uuid :enum := :fn :re :balli/pred :> :>= :< :<= :not=)
     nil
 
-    ;; seqex types + :schema: pass-through (no per-element descent -- a seqex
-    ;; element's schema depends on the match, which transformers do not run)
-    (:cat :catn :alt :altn :? :* :+ :repeat :schema)
+    ;; seqex types: pass-through (no per-element descent -- a seqex element's
+    ;; schema depends on the match, which transformers do not run)
+    (:cat :catn :alt :altn :? :* :+ :repeat)
     nil
+
+    ;; :schema wrapper: transparent -- descend into the single child. This is
+    ;; the canonical [:schema {:registry ...} ...] self-contained idiom, so
+    ;; decode/encode must reach the wrapped schema (matches :maybe descent).
+    :schema
+    (children-in-order node registry chain method opts cache)
 
     ;; function schemas: leaf pass-through (fns are not transformed)
     (:=> :function)
@@ -348,7 +362,7 @@
     :tuple (transform-tuple node registry chain method opts cache)
     :ref (transform-ref node registry chain method opts cache)))
 
-(defn- transform-node
+(defn- transform-node*
   "Node combinator: leave(children(enter(x))), absent parts elided; whole
   subtree nil => nil (identity pass-through)."
   [node registry chain method opts cache]
@@ -357,6 +371,20 @@
     (if this-t
       (-intercepting this-t child-t)
       child-t)))
+
+(defn- transform-node
+  "Layer-aware entry: a node carrying :local-registry extends the registry
+  chain (balli.registry/push-layer) for its whole subtree AND replaces
+  :registry in the opts handed to {:compile ...} interceptors, so
+  interceptor-compiled validators (strip-extra-keys, map-of key decoding,
+  default-value ref lookups) see the same layered registry the node's own
+  compilation does."
+  [node registry chain method opts cache]
+  (if-let [local (:local-registry node)]
+    (let [registry (reg/push-layer registry local)]
+      (transform-node* node registry chain method
+                       (assoc opts :registry registry) cache))
+    (transform-node* node registry chain method opts cache)))
 
 (defn compile-transformer
   "Compile `ast` + `registry` + transformer `t` + `method` (:decode/:encode)
