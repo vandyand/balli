@@ -137,3 +137,10 @@
                                                          [:age :int]]]]]
                                  {:users [{:name "ok" :age 1}
                                           {:age "x"}]})))))
+
+(deftest humanize-integer-map-keys
+  (testing "integer map keys nest as map keys, not vector indices"
+    (is (= {1 ["should be a string"]}
+           (be/humanize (b/explain [:map-of :int :string] {1 2}))))
+    (is (= {0 ["should be an integer"]}
+           (be/humanize (b/explain [:map [0 :int]] {0 "x"}))))))

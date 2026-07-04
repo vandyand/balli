@@ -253,3 +253,15 @@
                     (catch python/Exception e (ex-data e)))]
       (is (= :balli.core/invalid-schema (:type data)))
       (is (= [:unknown-type 1] (:form data))))))
+
+(deftest invalid-regex-string-is-invalid-schema
+  (testing "a malformed regex string throws invalid-schema, not raw re.error"
+    (is (= :balli.core/invalid-schema
+           (try (normalize [:re "(("] {})
+                (catch python/Exception e (:type (ex-data e))))))))
+
+(deftest multi-dispatch-must-be-callable
+  (testing "non-callable :dispatch rejected at normalize time"
+    (is (= :balli.core/invalid-schema
+           (try (normalize [:multi {:dispatch "kind"} [:x :int]] {})
+                (catch python/Exception e (:type (ex-data e))))))))

@@ -125,20 +125,39 @@
       (recur (conj v nil))
       v)))
 
+(defn- index-step?
+  "An :in step is a vector index only when it is an integer AND the value at
+  this level is not a map — maps can legally have integer keys (:map-of,
+  :map), and those must nest as map keys, mirroring the input shape."
+  [k value]
+  (and (int? k) (not (map? value))))
+
+(defn- child-value
+  "The value one level down along :in. Maps index by key; vectors and other
+  sequentials by position; set steps are seq-order ordinals (matching the
+  explainer's :in semantics for sets)."
+  [value k]
+  (cond
+    (map? value) (get value k)
+    (and (int? k) (vector? value) (< -1 k (count value))) (nth value k)
+    (and (int? k) (or (sequential? value) (set? value))) (nth (vec (seq value)) k nil)
+    :else nil))
+
 (defn- add-message
-  "Place `msg` into accumulator `acc` at value-path `in`. Empty `in` conjes
-  onto a message vector; integer steps build sparse vectors with nil holes;
-  other keys build nested maps."
-  [acc in msg]
+  "Place `msg` into accumulator `acc` at value-path `in`, walking `value`
+  alongside to mirror its shape. Empty `in` conjes onto a message vector;
+  index steps build sparse vectors with nil holes; map keys (including
+  integer map keys) build nested maps."
+  [acc value in msg]
   (if (empty? in)
     (conj (or acc []) msg)
     (let [k (first in)
           r (rest in)]
-      (if (int? k)
+      (if (index-step? k value)
         (let [v (pad (or acc []) (inc k))]
-          (assoc v k (add-message (nth v k) r msg)))
+          (assoc v k (add-message (nth v k) (child-value value k) r msg)))
         (let [m (or acc {})]
-          (assoc m k (add-message (get m k) r msg)))))))
+          (assoc m k (add-message (get m k) (child-value value k) r msg)))))))
 
 (defn humanize
   "Turn an explain map (from balli.core/explain) into a human-readable
@@ -146,6 +165,6 @@
   [explain-map]
   (when explain-map
     (reduce (fn [acc error]
-              (add-message acc (:in error) (error-message error)))
+              (add-message acc (:value explain-map) (:in error) (error-message error)))
             nil
             (:errors explain-map))))

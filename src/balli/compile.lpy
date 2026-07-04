@@ -120,21 +120,23 @@
         (catch python/Exception _ false)))))
 
 (defn- compile-ref
-  "Refs resolve at compile time (fail fast on unresolved), but the target
-  compiles lazily through `cache` (keyed by ref keyword) at first call —
-  fn indirection so recursive schemas don't loop during compilation."
+  "Refs resolve AND their targets compile eagerly at compile time, so
+  unresolved refs anywhere in the reachable graph fail fast. The `cache`
+  (keyed by ref keyword) doubles as the recursion guard: a ref already
+  being compiled is marked in the cache before its target compiles, and
+  the returned fn resolves the real compiled fn by late lookup — fn
+  indirection so recursive schemas don't loop during compilation."
   [node registry cache]
   (let [k (:ref node)
         target (reg/resolve-ref registry k)]
     (when (nil? target)
       (throw (ex-info "Unresolved ref" {:type :balli.core/unresolved-ref :ref k})))
-    (fn [x]
-      (let [f (or (get @cache k)
-                  (let [f (compile-node (norm/normalize target {:registry registry})
-                                        registry cache)]
-                    (swap! cache assoc k f)
-                    f))]
-        (f x)))))
+    (when-not (contains? @cache k)
+      (swap! cache assoc k ::compiling)
+      (swap! cache assoc k
+             (compile-node (norm/normalize target {:registry registry})
+                           registry cache)))
+    (fn [x] ((get @cache k) x))))
 
 (defn- compile-node
   [node registry cache]
@@ -379,20 +381,19 @@
           [(err path in form x :balli.core/invalid-dispatch-value)])))))
 
 (defn- explain-ref
-  "Same lazy fn-indirection as compile-ref, caching explainers keyed by ref
-  keyword. Transparent in both :path and :in."
+  "Same eager-compile + fn-indirection pattern as compile-ref, caching
+  explainers keyed by ref keyword. Transparent in both :path and :in."
   [node registry cache]
   (let [k (:ref node)
         target (reg/resolve-ref registry k)]
     (when (nil? target)
       (throw (ex-info "Unresolved ref" {:type :balli.core/unresolved-ref :ref k})))
-    (fn [x path in]
-      (let [f (or (get @cache k)
-                  (let [f (explain-node (norm/normalize target {:registry registry})
-                                        registry cache)]
-                    (swap! cache assoc k f)
-                    f))]
-        (f x path in)))))
+    (when-not (contains? @cache k)
+      (swap! cache assoc k ::compiling)
+      (swap! cache assoc k
+             (explain-node (norm/normalize target {:registry registry})
+                           registry cache)))
+    (fn [x path in] ((get @cache k) x path in))))
 
 (defn- explain-node
   [node registry cache]

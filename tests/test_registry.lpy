@@ -174,3 +174,13 @@
     (let [s (b/schema [:vector :int])]
       (is (identical? (b/validator s) (b/validator s)))
       (is (identical? (b/explainer s) (b/explainer s))))))
+
+(deftest nested-unresolved-ref-fails-at-compile-time
+  (testing "a ref nested inside a registered target fails fast at compile"
+    (let [r (reg/registry {:outer [:map [:x [:ref :missing]]]})]
+      (is (= :balli.core/unresolved-ref
+             (try (b/validator [:ref :outer] {:registry r})
+                  (catch python/Exception e (:type (ex-data e))))))
+      (is (= :balli.core/unresolved-ref
+             (try (b/explainer [:ref :outer] {:registry r})
+                  (catch python/Exception e (:type (ex-data e)))))))))

@@ -159,6 +159,8 @@
   (let [[props elems] (split-props-leading (rest form))]
     (when-not (contains? props :dispatch)
       (invalid! ":multi requires a :dispatch property" form))
+    (when-not (python/callable (:dispatch props))
+      (invalid! ":multi :dispatch must be a keyword or fn" form))
     (node :multi props (mapv #(normalize-entry % opts) elems) form)))
 
 ;; ---------------------------------------------------------------------------
@@ -197,7 +199,10 @@
       (invalid! ":re expects exactly 1 pattern child" form))
     (let [p (first elems)
           pattern (cond
-                    (string? p) (re-pattern p)
+                    (string? p) (try
+                                  (re-pattern p)
+                                  (catch python/Exception _
+                                    (invalid! ":re child is not a valid regex" form)))
                     (instance? re/Pattern p) p
                     :else (invalid! ":re child must be a regex pattern or string" form))]
       (node :re props [pattern] form))))
