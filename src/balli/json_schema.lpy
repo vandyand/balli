@@ -19,10 +19,14 @@
   Refs emit {\"$ref\" \"#/definitions/<name>\"} with the name JSON-Pointer
   escaped per RFC 6901 (~ -> ~0 FIRST, then / -> ~1); the top-level
   \"definitions\" map (attached only when non-empty) is keyed by the
-  UNESCAPED name. Recursion is guarded by marking a ref visited before
-  recursing into its target, so recursive registries terminate. Unresolved
-  refs throw ex-info {:type :balli.core/unresolved-ref} (same contract as
-  the validator compiler).
+  UNESCAPED name. Local {:registry ...} schema properties layer the lookup
+  per subtree; a keyword SHADOWED to a different schema form emits a second
+  definition suffixed __2 (__3, ...) with $refs pointing at the right one
+  (see transform-ref). Recursion is guarded by marking a ref's [kw form]
+  identity visited before recursing into its target, so recursive (local or
+  global) registries terminate. Unresolved refs throw ex-info
+  {:type :balli.core/unresolved-ref} (same contract as the validator
+  compiler).
 
   The output is Basilisp data, not Python data: feed it to python json.dumps
   via a small clj->py conversion (or `basilisp.json/write-str`, which accepts
@@ -85,26 +89,125 @@
 ;; ---------------------------------------------------------------------------
 ;; Per-type mapping
 
+(def ^:private pred-json-schemas
+  "pred-key symbol -> JSON Schema fragment for :balli/pred nodes. Anything
+  absent exports as the lossy {} (any? some? pos? neg? zero? associative?
+  fn? ifn? empty?)."
+  {'int? {"type" "integer"}
+   'integer? {"type" "integer"}
+   'pos-int? {"type" "integer" "minimum" 1}
+   'nat-int? {"type" "integer" "minimum" 0}
+   'neg-int? {"type" "integer" "maximum" -1}
+   'number? {"type" "number"}
+   'float? {"type" "number"}
+   'double? {"type" "number"}
+   'string? {"type" "string"}
+   'char? {"type" "string" "minLength" 1 "maxLength" 1}
+   'boolean? {"type" "boolean"}
+   'keyword? {"type" "string"}
+   'simple-keyword? {"type" "string"}
+   'qualified-keyword? {"type" "string"}
+   'symbol? {"type" "string"}
+   'simple-symbol? {"type" "string"}
+   'qualified-symbol? {"type" "string"}
+   'ident? {"type" "string"}
+   'uuid? {"type" "string" "format" "uuid"}
+   'inst? {"type" "string" "format" "date-time"}
+   'nil? {"type" "null"}
+   'false? {"const" false}
+   'true? {"const" true}
+   'coll? {"type" "array"}
+   'vector? {"type" "array"}
+   'sequential? {"type" "array"}
+   'seqable? {"type" "array"}
+   'indexed? {"type" "array"}
+   'seq? {"type" "array"}
+   'list? {"type" "array"}
+   'set? {"type" "array" "uniqueItems" true}
+   'map? {"type" "object"}})
+
+(defn- transform-comparator
+  "Comparators map to the draft-2020-12 numeric bound keywords when their
+  child is a number; non-numeric children (and :not=, always) export as the
+  lossy {}."
+  [node]
+  (let [v (first (:children node))]
+    (if (or (int? v) (float? v))
+      (case (:type node)
+        :> {"exclusiveMinimum" v}
+        :>= {"minimum" v}
+        :< {"exclusiveMaximum" v}
+        :<= {"maximum" v}
+        :not= {})
+      {})))
+
 (defn- transform-ref
   "Emit {\"$ref\" \"#/definitions/<escaped-name>\"} for ref node `node`,
   transforming the target into (:definitions ctx) under the UNESCAPED name.
-  Marks the ref visited BEFORE recursing so recursive schemas terminate."
+  Resolution goes through the layered registry chain (innermost layer first,
+  balli.registry/resolve-ref-layered) and the target transforms against the
+  resolving layer's chain prefix (lexical scoping, matching the compilers).
+
+  Definition identity is [kw resolved-target-form] — NOT the layer token the
+  compilers use — implementing the documented shadowed-name rule: the first
+  form seen for a name gets the plain name; each subsequent DIFFERENT form
+  under the same name gets a __2/__3/... suffix; the same [kw form] from any
+  layer reuses its assigned name and single definition (\"same-form
+  same-name refs share\"). Form keying keeps recursion finite (a recursive
+  target's form contains [:ref kw], never its expansion) at the documented
+  lossy cost that two same-form entries in different registry environments
+  share one definition. Marks the identity visited BEFORE recursing so
+  recursive schemas terminate."
   [node registry ctx]
   (let [k (:ref node)
-        ref-name (kw->str k)]
-    (when-not (contains? @(:visited ctx) k)
-      (swap! (:visited ctx) conj k)
-      (let [target (reg/resolve-ref registry k)]
-        (when (nil? target)
-          (throw (ex-info "Unresolved ref"
-                          {:type :balli.core/unresolved-ref :ref k})))
-        (let [ast (norm/normalize target {:registry registry})]
-          (swap! (:definitions ctx) assoc ref-name (-transform ast registry ctx)))))
-    {"$ref" (str "#/definitions/" (escape-pointer ref-name))}))
+        r (reg/resolve-ref-layered registry k)]
+    (when (nil? r)
+      (throw (ex-info "Unresolved ref"
+                      {:type :balli.core/unresolved-ref :ref k})))
+    (let [dk [k (:form r)]
+          ref-name (or (get @(:names ctx) dk)
+                       (let [base (kw->str k)
+                             n (get @(:name-counts ctx) base 0)
+                             nm (if (zero? n) base (str base "__" (inc n)))]
+                         (swap! (:name-counts ctx) assoc base (inc n))
+                         (swap! (:names ctx) assoc dk nm)
+                         nm))]
+      (when-not (contains? @(:visited ctx) dk)
+        (swap! (:visited ctx) conj dk)
+        (let [tr (:registry r)
+              ast (norm/normalize (:form r) {:registry tr})]
+          (swap! (:definitions ctx) assoc ref-name (-transform ast tr ctx))))
+      {"$ref" (str "#/definitions/" (escape-pointer ref-name))})))
+
+(defn- merge-default-export
+  "Merge a :map node's :balli.core/default entry export `d` into the map's
+  base export (tier-3 Phase 4, semantics section 2 / post-mvp section B).
+  A :map-of-shaped export ({\"additionalProperties\" X}, no \"properties\")
+  contributes its \"additionalProperties\"; a :map-shaped export merges its
+  \"properties\" and \"required\" (deduped); anything else becomes the
+  \"additionalProperties\" value wholesale."
+  [base d]
+  (cond
+    (and (map? d)
+         (contains? d "additionalProperties")
+         (not (contains? d "properties")))
+    (assoc base "additionalProperties" (get d "additionalProperties"))
+
+    (and (map? d) (contains? d "properties"))
+    (let [required (vec (distinct (concat (get base "required" [])
+                                          (get d "required" []))))]
+      (cond-> (update base "properties" merge (get d "properties"))
+        (seq required) (assoc "required" required)))
+
+    :else
+    (assoc base "additionalProperties" d)))
 
 (defn- transform-map
   "\"properties\" from entry values, \"required\" from non-optional keys
-  (omitted when empty), \"additionalProperties\" false when {:closed true}."
+  (omitted when empty), \"additionalProperties\" false when {:closed true}.
+  A :balli.core/default entry disables the :closed-derived
+  \"additionalProperties\" false and merges its own export instead (see
+  merge-default-export)."
   [node registry ctx]
   (let [entries (:children node)
         properties (into {}
@@ -112,10 +215,13 @@
                                 [(render-value key) (-transform schema registry ctx)])
                               entries))
         required (mapv #(render-value (:key %))
-                       (remove #(:optional (:properties %)) entries))]
-    (cond-> {"type" "object" "properties" properties}
-      (seq required) (assoc "required" required)
-      (:closed (:properties node)) (assoc "additionalProperties" false))))
+                       (remove #(:optional (:properties %)) entries))
+        base (cond-> {"type" "object" "properties" properties}
+               (seq required) (assoc "required" required))]
+    (if-some [de (:default-entry node)]
+      (merge-default-export base (-transform (:schema de) registry ctx))
+      (cond-> base
+        (:closed (:properties node)) (assoc "additionalProperties" false)))))
 
 (defn- -accept
   "The generated JSON Schema fragment for AST `node` (the §B type mapping
@@ -127,6 +233,8 @@
     (case (:type node)
       ;; :=>/:function: JSON Schema has no function values -- lossy {} like :fn
       (:any :fn :=> :function) {}
+      :balli/pred (get pred-json-schemas (:pred-key node) {})
+      (:> :>= :< :<= :not=) (transform-comparator node)
       :nil {"type" "null"}
       :string (with-min-max {"type" "string"} props "minLength" "maxLength")
       :int (with-min-max {"type" "integer"} props "minimum" "maximum")
@@ -134,6 +242,10 @@
       :boolean {"type" "boolean"}
       (:keyword :symbol) {"type" "string"}
       :uuid {"type" "string" "format" "uuid"}
+      (:time/instant :time/local-date-time) {"type" "string" "format" "date-time"}
+      :time/local-date {"type" "string" "format" "date"}
+      :time/local-time {"type" "string" "format" "time"}
+      :time/duration {"type" "string" "format" "duration"}
       := {"const" (render-value (first children))}
       :enum (let [t (infer-enum-type children)]
               (cond-> {"enum" (mapv render-value children)}
@@ -144,7 +256,10 @@
       ;; entry tags are a parse-time concern -- JSON Schema sees the branches
       :orn {"anyOf" (mapv #(child (:schema %)) children)}
       :maybe {"oneOf" [(child (first children)) {"type" "null"}]}
-      :multi {"oneOf" (mapv #(child (:schema %)) children)}
+      ;; a :balli.core/default branch is one more oneOf alternative
+      :multi {"oneOf" (cond-> (mapv #(child (:schema %)) children)
+                        (:default-entry node)
+                        (conj (child (:schema (:default-entry node)))))}
       :map-of (with-min-max {"type" "object"
                              "additionalProperties" (child (second children))}
                 props "minProperties" "maxProperties")
@@ -177,12 +292,18 @@
                         {"type" "array"})))))
 
 (defn- -transform
-  "AST node -> JSON Schema map. Property layering per the ns docstring:
-  whole-node :json-schema override short-circuits (returned verbatim,
-  children not visited); otherwise title/description/default under the
-  generated mapping under unlifted :json-schema/* props (unlift wins)."
+  "AST node -> JSON Schema map. Layer-aware entry: a node carrying
+  :local-registry extends the registry chain for its whole subtree first
+  (balli.registry/push-layer), mirroring the compilers. Property layering
+  per the ns docstring: whole-node :json-schema override short-circuits
+  (returned verbatim, children not visited); otherwise
+  title/description/default under the generated mapping under unlifted
+  :json-schema/* props (unlift wins)."
   [node registry ctx]
-  (let [props (:properties node)]
+  (let [registry (if-let [local (:local-registry node)]
+                   (reg/push-layer registry local)
+                   registry)
+        props (:properties node)]
     (if (contains? props :json-schema)
       (:json-schema props)
       (let [base (cond-> {}
@@ -212,7 +333,13 @@
          ast (if (b/schema? s)
                (:ast s)
                (norm/normalize s {:registry registry}))
-         ctx {:definitions (atom {}) :visited (atom #{})}
+         ctx {:definitions (atom {})
+              :visited (atom #{})
+              ;; [kw form] -> assigned definition name, and plain-name ->
+              ;; count of distinct forms seen (drives the __<n> suffixes) --
+              ;; see transform-ref.
+              :names (atom {})
+              :name-counts (atom {})}
          out (-transform ast registry ctx)
          defs @(:definitions ctx)]
      (if (and (map? out) (seq defs))

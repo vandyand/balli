@@ -14,10 +14,14 @@
   interpretation. Refs resolve eagerly at compile time (unresolved refs throw
   ex-info {:type :balli.core/unresolved-ref}) but their targets compile lazily
   through a per-compilation cache atom (fn indirection), so recursive schemas
-  (Phase 5) terminate on finite data."
+  (Phase 5) terminate on finite data. Local {:registry ...} schema properties
+  layer the registry per subtree (balli.registry/push-layer); ref caches are
+  keyed [kw layer-token] so shadowed keywords never share compiled fns (see
+  compile-ref)."
   (:require [balli.normalize :as norm]
             [balli.regex :as rx]
-            [balli.registry :as reg]))
+            [balli.registry :as reg]
+            [balli.time :as bt]))
 
 (declare compile-node explain-node)
 
@@ -56,6 +60,38 @@
   [x]
   (or (int? x) (float? x)))
 
+(defn- bounds-valid?
+  [x props]
+  (try
+    (and (or (nil? (:min props)) (<= (:min props) x))
+         (or (nil? (:max props)) (<= x (:max props))))
+    (catch python/Exception _ false)))
+
+(defn- layered
+  "Registry for descending into `node`: its :local-registry (when present)
+  pushed as a fresh layer over `registry` (balli.registry/push-layer). Every
+  node-compiler entry point below (compile-node/explain-node/coder-node,
+  transforming-parser?, and the regex child* helpers for NESTED seqex nodes,
+  which recurse without going back through compile-node) applies this before
+  per-type dispatch, so a {:registry ...} property scopes its whole subtree."
+  [node registry]
+  (if-let [local (:local-registry node)]
+    (reg/push-layer registry local)
+    registry))
+
+(defn- comparator-op
+  "The comparison fn for a comparator AST node type. Basilisp </<= etc.
+  delegate to Python rich comparison (Phase 0 finding 7), so mixed
+  non-comparable operands raise TypeError — every call site wraps the call
+  exception-safe (throw -> false)."
+  [type]
+  (case type
+    :> >
+    :>= >=
+    :< <
+    :<= <=
+    :not= not=))
+
 ;; ---------------------------------------------------------------------------
 ;; Per-type compilers
 
@@ -71,7 +107,10 @@
     :boolean boolean?
     :keyword keyword?
     :symbol symbol?
-    :uuid uuid?))
+    :uuid uuid?
+    (:time/instant :time/local-date-time :time/local-date :time/local-time :time/duration)
+    (let [check (:check (bt/type-spec type))]
+      (fn [x] (and (check x) (bounds-valid? x properties))))))
 
 (defn- compile-coll
   "Validator for a homogeneous collection: `coll-pred` on the whole value,
@@ -95,6 +134,13 @@
                ((nth fns i) (nth x i)) (recur (inc i))
                :else false))))))
 
+(defn- residual-map
+  "The value map minus the explicit entry keys — what a :map node's
+  :balli.core/default entry schema validates/parses/transforms ONCE (tier-3
+  Phase 4, semantics section 2)."
+  [x known]
+  (reduce dissoc x known))
+
 (defn- compile-map
   [node registry cache]
   (let [entries (mapv (fn [{:keys [key properties schema]}]
@@ -102,7 +148,10 @@
                          :optional (boolean (:optional properties))
                          :vf (compile-node schema registry cache)})
                       (:children node))
-        closed (boolean (:closed (:properties node)))
+        default-vf (when-some [de (:default-entry node)]
+                     (compile-node (:schema de) registry cache))
+        ;; a default entry DISABLES :closed enforcement entirely
+        closed (and (nil? default-vf) (boolean (:closed (:properties node))))
         known (set (map :k entries))]
     (fn [x]
       (and (map? x)
@@ -111,8 +160,10 @@
                        (vf (get x k))
                        optional))
                    entries)
-           (or (not closed)
-               (every? #(contains? known %) (keys x)))))))
+           (if default-vf
+             (default-vf (residual-map x known))
+             (or (not closed)
+                 (every? #(contains? known %) (keys x))))))))
 
 (defn- compile-map-of
   [node registry cache]
@@ -130,33 +181,57 @@
         dispatch-fn (if (keyword? d) (fn [x] (get x d)) d)
         table (into {}
                     (map (fn [c] [(:key c) (compile-node (:schema c) registry cache)]))
-                    (:children node))]
+                    (:children node))
+        ;; dispatch miss falls back to the default branch (whole value)
+        default-vf (when-some [de (:default-entry node)]
+                     (compile-node (:schema de) registry cache))]
     (fn [x]
       (try
-        (let [dv (dispatch-fn x)]
-          (if (contains? table dv)
-            ((get table dv) x)
-            false))
+        ;; a throwing dispatch is a MISS (falls back to the default branch),
+        ;; matching the explainer/coder ::dispatch-threw handling
+        (let [dv (try
+                   (dispatch-fn x)
+                   (catch python/Exception _ ::dispatch-threw))]
+          (cond
+            (contains? table dv) ((get table dv) x)
+            default-vf (default-vf x)
+            :else false))
         (catch python/Exception _ false)))))
 
 (defn- compile-ref
   "Refs resolve AND their targets compile eagerly at compile time, so
-  unresolved refs anywhere in the reachable graph fail fast. The `cache`
-  (keyed by ref keyword) doubles as the recursion guard: a ref already
-  being compiled is marked in the cache before its target compiles, and
-  the returned fn resolves the real compiled fn by late lookup — fn
-  indirection so recursive schemas don't loop during compilation."
+  unresolved refs anywhere in the reachable graph fail fast. Resolution goes
+  through the LAYERED registry chain, innermost layer first
+  (balli.registry/resolve-ref-layered), and the `cache` is keyed
+  [kw layer-token] — the token of the layer that SUPPLIED the entry — so a
+  keyword shadowed by an inner :registry property compiles separately per
+  meaning while an inner ref to an OUTER key shares the outer entry's
+  compiled fn. The target normalizes + compiles against the chain PREFIX
+  ending at the resolving layer (lexical scoping: local entries see the
+  outer registry and each other, never layers below their definition site).
+
+  The cache doubles as the recursion guard: a ref already being compiled is
+  marked ::compiling before its target compiles, and the returned fn
+  resolves the real compiled fn by late lookup — fn indirection so recursive
+  schemas don't loop during compilation. Termination: a recursive target's
+  refs resolve to already-marked [kw token] keys because layer tokens are
+  fixed once pushed, and any FRESH layer (hence fresh token) can only come
+  from a :local-registry node nested strictly deeper inside the entry's own
+  form — a finite tree — so the chain of fresh-layer resolutions bottoms
+  out."
   [node registry cache]
   (let [k (:ref node)
-        target (reg/resolve-ref registry k)]
-    (when (nil? target)
+        r (reg/resolve-ref-layered registry k)]
+    (when (nil? r)
       (throw (ex-info "Unresolved ref" {:type :balli.core/unresolved-ref :ref k})))
-    (when-not (contains? @cache k)
-      (swap! cache assoc k ::compiling)
-      (swap! cache assoc k
-             (compile-node (norm/normalize target {:registry registry})
-                           registry cache)))
-    (fn [x] ((get @cache k) x))))
+    (let [ck [k (:token r)]
+          tr (:registry r)]
+      (when-not (contains? @cache ck)
+        (swap! cache assoc ck ::compiling)
+        (swap! cache assoc ck
+               (compile-node (norm/normalize (:form r) {:registry tr})
+                             tr cache)))
+      (fn [x] ((get @cache ck) x)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Sequence (regex) schemas
@@ -201,7 +276,7 @@
   [node registry cache]
   (letfn [(child* [c]
             (cond
-              (regex-op? c) (regex-validator c registry cache)
+              (regex-op? c) (regex-validator c (layered c registry) cache)
               (= :ref (:type c)) (throw-recursive-seqex! c)
               :else (rx/item-validator (compile-node c registry cache))))]
     (case (:type node)
@@ -237,10 +312,11 @@
 ;; the reverse import would be circular). Re-exported here for the public API.
 (def fn-like? norm/fn-like?)
 
-(defn- compile-node
+(defn- compile-node*
   [node registry cache]
   (case (:type node)
-    (:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid)
+    (:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid
+          :time/instant :time/local-date-time :time/local-date :time/local-time :time/duration)
     (compile-scalar node)
 
     :enum
@@ -288,6 +364,23 @@
           (boolean (pred x))
           (catch python/Exception _ false))))
 
+    ;; predicate schema: the canonical pred fn, exception-safe (throw -> false)
+    :balli/pred
+    (let [pred (:pred node)]
+      (fn [x]
+        (try
+          (boolean (pred x))
+          (catch python/Exception _ false))))
+
+    ;; comparators: (op x child-value), exception-safe (non-comparable -> false)
+    (:> :>= :< :<= :not=)
+    (let [v (first (:children node))
+          op (comparator-op (:type node))]
+      (fn [x]
+        (try
+          (boolean (op x v))
+          (catch python/Exception _ false))))
+
     :re
     (let [pattern (first (:children node))]
       (fn [x] (boolean (and (string? x) (re-matches pattern x)))))
@@ -305,6 +398,12 @@
 
     (:cat :catn :alt :altn :? :* :+ :repeat)
     (rx/validator (regex-validator node registry cache))))
+
+(defn- compile-node
+  "Layer-aware entry: a node carrying :local-registry extends the registry
+  chain for its whole subtree before per-type dispatch (see `layered`)."
+  [node registry cache]
+  (compile-node* node (layered node registry) cache))
 
 (defn- fresh-cache
   "Per-compilation cache atom, seeded with the function checker from `opts`
@@ -347,7 +446,10 @@
 ;;                              (:in unchanged) — Malli semantics
 ;;   - :orn                  -> like :or, but the entry TAG is appended to
 ;;                              :path instead of the branch index
-;;   - :balli.core/invalid   -> reserved for :fn / :not / :re-mismatch only
+;;   - :balli.core/invalid   -> :fn / :not / :re-mismatch / predicate
+;;                              (:balli/pred) / comparator failures; humanize
+;;                              recovers pred/comparator wording from the
+;;                              error's :schema form head (balli.error)
 ;;   - :re non-match on a string -> :balli.core/invalid (non-strings get
 ;;                              :balli.core/invalid-type)
 
@@ -374,7 +476,9 @@
             :boolean [boolean? nil]
             :keyword [keyword? nil]
             :symbol [symbol? nil]
-            :uuid [uuid? nil])
+            :uuid [uuid? nil]
+            (:time/instant :time/local-date-time :time/local-date :time/local-time :time/duration)
+            [(:check (bt/type-spec type)) identity])
           mn (:min properties)
           mx (:max properties)]
       (fn [x path in]
@@ -383,8 +487,7 @@
           [(err path in form x :balli.core/invalid-type)]
 
           (and measure
-               (or (and mn (< (measure x) mn))
-                   (and mx (> (measure x) mx))))
+               (not (bounds-valid? (measure x) properties)))
           [(err path in form x :balli.core/limits)]
 
           :else [])))))
@@ -442,7 +545,10 @@
                          :ef (explain-node schema registry cache)
                          :entry-form (:form schema)})
                       (:children node))
-        closed (boolean (:closed (:properties node)))
+        default-ef (when-some [de (:default-entry node)]
+                     (explain-node (:schema de) registry cache))
+        ;; a default entry DISABLES :closed enforcement entirely
+        closed (and (nil? default-ef) (boolean (:closed (:properties node))))
         known (set (map :k entries))
         form (:form node)]
     (fn [x path in]
@@ -461,6 +567,14 @@
                                        entry-form nil :balli.core/missing-key))))
                    (transient [])
                    entries)
+              ;; default explainer: schema-path gets :balli.core/default
+              ;; appended, value is the RESIDUAL map, :in stays the ORIGINAL
+              ;; (sub-schemas append their own keys — e.g. :map-of conj's the
+              ;; failing key onto :in — so nested :in works naturally)
+              acc (if default-ef
+                    (into! acc (default-ef (residual-map x known)
+                                           (conj path :balli.core/default) in))
+                    acc)
               acc (if closed
                     (reduce (fn [acc [k v]]
                               (if (contains? known k)
@@ -502,29 +616,35 @@
         table (into {}
                     (map (fn [c] [(:key c) (explain-node (:schema c) registry cache)]))
                     (:children node))
+        default-ef (when-some [de (:default-entry node)]
+                     (explain-node (:schema de) registry cache))
         form (:form node)]
     (fn [x path in]
       (let [dv (try
                  (dispatch-fn x)
                  (catch python/Exception _ ::dispatch-threw))]
-        (if (contains? table dv)
-          ((get table dv) x (conj path dv) in)
-          [(err path in form x :balli.core/invalid-dispatch-value)])))))
+        (cond
+          (contains? table dv) ((get table dv) x (conj path dv) in)
+          default-ef (default-ef x (conj path :balli.core/default) in)
+          :else [(err path in form x :balli.core/invalid-dispatch-value)])))))
 
 (defn- explain-ref
-  "Same eager-compile + fn-indirection pattern as compile-ref, caching
-  explainers keyed by ref keyword. Transparent in both :path and :in."
+  "Same eager-resolve + fn-indirection pattern as compile-ref (see its
+  docstring for the [kw layer-token] cache-key + lexical-scoping contract),
+  caching explainers. Transparent in both :path and :in."
   [node registry cache]
   (let [k (:ref node)
-        target (reg/resolve-ref registry k)]
-    (when (nil? target)
+        r (reg/resolve-ref-layered registry k)]
+    (when (nil? r)
       (throw (ex-info "Unresolved ref" {:type :balli.core/unresolved-ref :ref k})))
-    (when-not (contains? @cache k)
-      (swap! cache assoc k ::compiling)
-      (swap! cache assoc k
-             (explain-node (norm/normalize target {:registry registry})
-                           registry cache)))
-    (fn [x path in] ((get @cache k) x path in))))
+    (let [ck [k (:token r)]
+          tr (:registry r)]
+      (when-not (contains? @cache ck)
+        (swap! cache assoc ck ::compiling)
+        (swap! cache assoc ck
+               (explain-node (norm/normalize (:form r) {:registry tr})
+                             tr cache)))
+      (fn [x path in] ((get @cache ck) x path in)))))
 
 (defn- regex-explainer
   "Explainer combinator for seqex AST `node`. `rel-path` is the node's
@@ -535,7 +655,7 @@
   [node registry cache rel-path]
   (letfn [(child* [c p]
             (cond
-              (regex-op? c) (regex-explainer c registry cache p)
+              (regex-op? c) (regex-explainer c (layered c registry) cache p)
               (= :ref (:type c)) (throw-recursive-seqex! c)
               :else (rx/item-explainer (explain-node c registry cache) p (:form c))))
           (indexed [children]
@@ -554,10 +674,11 @@
       :repeat (let [[mn mx] (repeat-bounds node)]
                 (rx/repeat* mn mx (child* (first (:children node)) (conj rel-path 0)))))))
 
-(defn- explain-node
+(defn- explain-node*
   [node registry cache]
   (case (:type node)
-    (:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid)
+    (:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid
+          :time/instant :time/local-date-time :time/local-date :time/local-time :time/duration)
     (explain-scalar node)
 
     :enum
@@ -652,6 +773,32 @@
           []
           [(err path in form x :balli.core/invalid)])))
 
+    ;; predicate schema failure: :balli.core/invalid with the ORIGINAL form
+    ;; (fn, symbol, or [pred props] vector) as :schema — balli.error keys its
+    ;; pred message table off that form's head.
+    :balli/pred
+    (let [pred (:pred node)
+          form (:form node)]
+      (fn [x path in]
+        (if (try
+              (boolean (pred x))
+              (catch python/Exception _ false))
+          []
+          [(err path in form x :balli.core/invalid)])))
+
+    ;; comparator failure: same :balli.core/invalid type; :schema carries the
+    ;; original [:> 5] form so humanize can render comparator wording.
+    (:> :>= :< :<= :not=)
+    (let [v (first (:children node))
+          op (comparator-op (:type node))
+          form (:form node)]
+      (fn [x path in]
+        (if (try
+              (boolean (op x v))
+              (catch python/Exception _ false))
+          []
+          [(err path in form x :balli.core/invalid)])))
+
     :re
     (let [pattern (first (:children node))
           form (:form node)]
@@ -688,6 +835,11 @@
 
     (:cat :catn :alt :altn :? :* :+ :repeat)
     (rx/explainer (regex-explainer node registry cache []) (:form node))))
+
+(defn- explain-node
+  "Layer-aware entry, mirroring compile-node (see `layered`)."
+  [node registry cache]
+  (explain-node* node (layered node registry) cache))
 
 (defn compile-explainer
   "Compile AST node `ast` against `registry` into an explainer fn
@@ -731,27 +883,32 @@
   itself: :orn/:multi (Tag) and ALL seqex types (:catn -> Tags, :altn ->
   Tag, :cat/:alt/:?/:*/:+/:repeat -> reshaped vectors/values -- matching
   malli, which marks every seqex parser as transforming), recursing through
-  :and/:or/:maybe/:schema children and through refs via the registry.
-  `visited` is the set of ref keywords already under analysis -- a ref cycle
-  counts as NON-transforming (the analysis terminates instead of looping)."
+  :and/:or/:maybe/:schema children and through refs via the LAYERED registry
+  chain (same [kw layer-token] identity + lexical scoping as compile-ref).
+  `visited` is the set of [kw token] pairs already under analysis -- a ref
+  cycle counts as NON-transforming (the analysis terminates instead of
+  looping), and the token dimension keeps a shadowed kw's meanings from
+  poisoning each other's analysis."
   [node registry visited]
-  (case (:type node)
-    (:orn :multi :cat :catn :alt :altn :? :* :+ :repeat) true
+  (let [registry (layered node registry)]
+    (case (:type node)
+      (:orn :multi :cat :catn :alt :altn :? :* :+ :repeat) true
 
-    (:and :or :maybe :schema)
-    (boolean (some #(transforming-parser? % registry visited) (:children node)))
+      (:and :or :maybe :schema)
+      (boolean (some #(transforming-parser? % registry visited) (:children node)))
 
-    :ref
-    (let [k (:ref node)
-          target (reg/resolve-ref registry k)]
-      (cond
-        (contains? visited k) false
-        (nil? target) (throw (ex-info "Unresolved ref"
-                                      {:type :balli.core/unresolved-ref :ref k}))
-        :else (transforming-parser? (norm/normalize target {:registry registry})
-                                    registry (conj visited k))))
+      :ref
+      (let [k (:ref node)
+            r (reg/resolve-ref-layered registry k)]
+        (cond
+          (nil? r) (throw (ex-info "Unresolved ref"
+                                   {:type :balli.core/unresolved-ref :ref k}))
+          (contains? visited [k (:token r)]) false
+          :else (transforming-parser? (norm/normalize (:form r) {:registry (:registry r)})
+                                      (:registry r)
+                                      (conj visited [k (:token r)]))))
 
-    false))
+      false)))
 
 (defn- coder-and
   "Parser/unparser for :and. Parse goes through the single TRANSFORMING child
@@ -819,18 +976,27 @@
 (defn- coder-multi
   "Parse: Tag(dispatch-value, branch-parse); no matching branch or invalid
   branch parse -> invalid. Unparse: the Tag :key IS the dispatch value --
-  unparse the :value via that branch."
+  unparse the :value via that branch. A :balli.core/default entry catches
+  dispatch misses on the WHOLE value: parse tags it
+  Tag(:balli.core/default, parsed); unparse routes that Tag key through the
+  default branch."
   [node registry cache mode]
-  (let [table (into {}
-                    (map (fn [c] [(:key c) (coder-node (:schema c) registry cache mode)]))
-                    (:children node))]
+  (let [default-f (when-some [de (:default-entry node)]
+                    (coder-node (:schema de) registry cache mode))
+        table (cond-> (into {}
+                            (map (fn [c] [(:key c) (coder-node (:schema c) registry cache mode)]))
+                            (:children node))
+                default-f (assoc :balli.core/default default-f))]
     (if (= :parse mode)
       (let [d (:dispatch (:properties node))
             dispatch-fn (if (keyword? d) (fn [x] (get x d)) d)]
         (fn [x]
           (let [dv (try
                      (dispatch-fn x)
-                     (catch python/Exception _ ::dispatch-threw))]
+                     (catch python/Exception _ ::dispatch-threw))
+                dv (if (or (contains? table dv) (nil? default-f))
+                     dv
+                     :balli.core/default)]
             (if-some [f (get table dv)]
               (let [r (f x)]
                 (if (-invalid? r)
@@ -849,7 +1015,10 @@
   through untouched). The guard excludes Tag/Tags records explicitly --
   records satisfy map? in Basilisp, so parsed :orn/:multi output could
   otherwise masquerade as plain map data. Validate semantics carry through:
-  missing required key or a closed map with extra keys -> invalid."
+  missing required key or a closed map with extra keys -> invalid. A
+  :balli.core/default entry codes the RESIDUAL map (value minus explicit
+  keys) once -- an invalid residual propagates, success merges the coded
+  entry values back over the coded residual; :closed is disabled."
   [node registry cache mode]
   (let [entries (mapv (fn [{:keys [key properties schema]}]
                         {:k key
@@ -857,7 +1026,9 @@
                          :f (coder-node schema registry cache mode)})
                       (:children node))
         n (count entries)
-        closed (boolean (:closed (:properties node)))
+        default-f (when-some [de (:default-entry node)]
+                    (coder-node (:schema de) registry cache mode))
+        closed (and (nil? default-f) (boolean (:closed (:properties node))))
         known (set (map :k entries))]
     (fn [x]
       (if (and (map? x)
@@ -865,19 +1036,24 @@
                (not (instance? Tags x))
                (or (not closed)
                    (every? #(contains? known %) (keys x))))
-        (loop [i 0
-               acc x]
-          (if (>= i n)
-            acc
-            (let [{:keys [k optional f]} (nth entries i)]
-              (if (contains? acc k)
-                (let [r (f (get acc k))]
-                  (if (-invalid? r)
-                    -invalid
-                    (recur (inc i) (assoc acc k r))))
-                (if optional
-                  (recur (inc i) acc)
-                  -invalid)))))
+        (let [base (if default-f
+                     (default-f (residual-map x known))
+                     x)]
+          (if (-invalid? base)
+            -invalid
+            (loop [i 0
+                   acc base]
+              (if (>= i n)
+                acc
+                (let [{:keys [k optional f]} (nth entries i)]
+                  (if (contains? x k)
+                    (let [r (f (get x k))]
+                      (if (-invalid? r)
+                        -invalid
+                        (recur (inc i) (assoc acc k r))))
+                    (if optional
+                      (recur (inc i) acc)
+                      -invalid)))))))
         -invalid))))
 
 (defn- coder-map-of
@@ -948,20 +1124,23 @@
         -invalid))))
 
 (defn- coder-ref
-  "Same eager-resolve + lazy fn-indirection pattern as compile-ref/explain-ref,
-  caching coders keyed by ref keyword (single-mode per compilation, so parse
-  and unparse entries never mix)."
+  "Same eager-resolve + lazy fn-indirection pattern as compile-ref/explain-ref
+  (see compile-ref's docstring for the [kw layer-token] cache-key +
+  lexical-scoping contract), caching coders (single-mode per compilation, so
+  parse and unparse entries never mix)."
   [node registry cache mode]
   (let [k (:ref node)
-        target (reg/resolve-ref registry k)]
-    (when (nil? target)
+        r (reg/resolve-ref-layered registry k)]
+    (when (nil? r)
       (throw (ex-info "Unresolved ref" {:type :balli.core/unresolved-ref :ref k})))
-    (when-not (contains? @cache k)
-      (swap! cache assoc k ::compiling)
-      (swap! cache assoc k
-             (coder-node (norm/normalize target {:registry registry})
-                         registry cache mode)))
-    (fn [x] ((get @cache k) x))))
+    (let [ck [k (:token r)]
+          tr (:registry r)]
+      (when-not (contains? @cache ck)
+        (swap! cache assoc ck ::compiling)
+        (swap! cache assoc ck
+               (coder-node (norm/normalize (:form r) {:registry tr})
+                           tr cache mode)))
+      (fn [x] ((get @cache ck) x)))))
 
 (defn- regex-parser
   "Parser combinator for seqex AST `node`. Parse shapes: :cat -> vector,
@@ -971,7 +1150,7 @@
   [node registry cache]
   (letfn [(child* [c]
             (cond
-              (regex-op? c) (regex-parser c registry cache)
+              (regex-op? c) (regex-parser c (layered c registry) cache)
               (= :ref (:type c)) (throw-recursive-seqex! c)
               :else (rx/item-parser (coder-node c registry cache :parse))))
           (tagged [entries]
@@ -995,7 +1174,7 @@
   [node registry cache]
   (letfn [(child* [c]
             (cond
-              (regex-op? c) (regex-unparser c registry cache)
+              (regex-op? c) (regex-unparser c (layered c registry) cache)
               (= :ref (:type c)) (throw-recursive-seqex! c)
               :else (rx/item-unparser (coder-node c registry cache :unparse))))
           (tagged [entries]
@@ -1011,14 +1190,17 @@
       :repeat (let [[mn mx] (repeat-bounds node)]
                 (rx/repeat-unparser mn mx (child* (first (:children node))))))))
 
-(defn- coder-node
+(defn- coder-node*
   [node registry cache mode]
   (case (:type node)
     ;; non-transforming leaves: parse == unparse == validate-then-value.
     ;; :=>/:function parse with the PLAIN callable check -- function checkers
-    ;; are a validate/explain concern only, never part of parse.
+    ;; are a validate/explain concern only, never part of parse. Predicate
+    ;; (:balli/pred) and comparator schemas are leaves too.
     (:any :nil :string :int :float :double :number :boolean :keyword :symbol
-          :uuid :enum := :fn :re :not :=> :function)
+          :uuid :time/instant :time/local-date-time :time/local-date :time/local-time :time/duration
+          :enum := :fn :re :not :=> :function
+          :balli/pred :> :>= :< :<= :not=)
     (let [valid? (compile-node node registry (atom {}))]
       (fn [x] (if (valid? x) x -invalid)))
 
@@ -1060,6 +1242,11 @@
     (if (= :parse mode)
       (rx/parser (regex-parser node registry cache))
       (regex-unparser node registry cache))))
+
+(defn- coder-node
+  "Layer-aware entry, mirroring compile-node (see `layered`)."
+  [node registry cache mode]
+  (coder-node* node (layered node registry) cache mode))
 
 (defn compile-parser
   "Compile AST node `ast` against `registry` into a 1-arg parser fn:

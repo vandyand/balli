@@ -1,6 +1,10 @@
 # Specifications
 
-*Auto-generated on 2026-07-04 06:17*
+*Auto-generated on 2026-07-04 13:24*
+
+## In Progress
+
+- [Balli Tier 3 — self-contained schemas, defaults, time, predicates, mutable registry](balli-tier3/README.md)
 
 ## Completed
 

@@ -4,4 +4,4 @@
             [balli.core :as b]))
 
 (deftest smoke
-  (is (= "0.2.0" b/version)))
+  (is (= "0.3.0" b/version)))

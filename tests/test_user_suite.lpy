@@ -1,0 +1,96 @@
+(ns tests.test-user-suite
+  "Small user-facing confidence suite for a fresh clone.
+
+  This intentionally samples the main public surfaces without replacing the
+  comprehensive developer test suite. Run with:
+
+    basilisp test tests/test_user_suite.lpy"
+  (:import datetime)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.error :as be]
+            [balli.generator :as bg]
+            [balli.json-schema :as js]
+            [balli.provider :as bp]
+            [balli.registry :as reg]
+            [balli.transform :as bt]
+            [balli.util :as u]))
+
+(deftest install-and-core-validation-smoke
+  (is (= "0.3.0" b/version))
+  (is (true? (b/validate [:map
+                          [:id :string]
+                          [:age {:optional true} [:int {:min 0}]]]
+                         {:id "abc" :age 3})))
+  (is (false? (b/validate [:vector :int] [1 "x"])))
+  (is (= {:x ["should be an integer"]}
+         (be/humanize (b/explain [:map [:x :int]] {:x "s"})))))
+
+(deftest registry-and-local-registry-smoke
+  (testing "explicit registry with recursive refs"
+    (let [r (reg/registry {:tree/node [:map
+                                       [:value :int]
+                                       [:children [:vector [:ref :tree/node]]]]})]
+      (is (true? (b/validate [:ref :tree/node]
+                             {:value 1 :children [{:value 2 :children []}]}
+                             {:registry r})))
+      (is (false? (b/validate [:ref :tree/node]
+                              {:value 1 :children [{:value "x" :children []}]}
+                              {:registry r})))))
+  (testing "self-contained local registry"
+    (let [s [:schema {:registry {:user/id :int
+                                 :user/user [:map [:id :user/id]]}}
+             :user/user]]
+      (is (true? (b/validate s {:id 1})))
+      (is (false? (b/validate s {:id "1"}))))))
+
+(deftest tier3-feature-smoke
+  (testing "default branch"
+    (let [s [:map {:closed true}
+             [:id :int]
+             [:balli.core/default [:map-of :keyword :string]]]]
+      (is (true? (b/validate s {:id 1 :extra "ok"})))
+      (is (= {:extra ["should be a string"]}
+             (be/humanize (b/explain s {:id 1 :extra 2}))))))
+  (testing "predicate and comparator schemas"
+    (is (true? (b/validate int? 1)))
+    (is (false? (b/validate 'int? "x")))
+    (is (true? (b/validate [:> 10] 11)))
+    (is (= ["should be at most 10"]
+           (be/humanize (b/explain [:<= 10] 11))))))
+
+(deftest time-and-transformer-smoke
+  (let [schema [:map [:created :time/instant] [:ttl :time/duration]]
+        decoded (b/decode schema
+                          {:created "2024-06-01T12:00:00+00:00" :ttl "PT15M"}
+                          (bt/transformer (bt/json-transformer)
+                                          (bt/time-transformer)))]
+    (is (true? (b/validate schema decoded)))
+    (is (= 900.0 (.total_seconds (:ttl decoded))))
+    (is (= "PT15M" (b/encode :time/duration (:ttl decoded) (bt/time-transformer)))))
+  (is (true? (b/validate :time/instant
+                         (datetime/datetime 2024 1 1 0 0 0 0
+                                            ** :tzinfo datetime.timezone/utc)))))
+
+(deftest parse-generate-json-schema-smoke
+  (testing "parse/unparse named branch"
+    (let [s [:orn [:n :int] [:s :string]]
+          parsed (b/parse s 42)]
+      (is (true? (b/tag? parsed)))
+      (is (= :n (:key parsed)))
+      (is (= 42 (b/unparse s parsed)))))
+  (testing "generation validates and is deterministic"
+    (let [s [:map [:id :uuid] [:n [:int {:min 0 :max 9}]]]]
+      (is (= (bg/generate s {:seed 1}) (bg/generate s {:seed 1})))
+      (is (true? (b/validate s (bg/generate s {:seed 1}))))))
+  (testing "json-schema export"
+    (is (= {"type" "string" "format" "date-time"}
+           (js/transform :time/instant)))))
+
+(deftest utilities-and-provider-smoke
+  (is (= [:map [:x :string] [:y :int]]
+         (u/merge [:map [:x :int]] [:map [:x :string] [:y :int]])))
+  (is (= :int (u/get-in [:map [:a [:map [:b :int]]]] [:a :b])))
+  (let [inferred (bp/provide [{:x 1} {:x 2 :y "a"}])]
+    (is (= [:map [:x :int] [:y {:optional true} :string]] inferred))
+    (is (true? (b/validate inferred {:x 3 :y "b"})))))

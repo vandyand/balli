@@ -1,0 +1,118 @@
+(ns tests.test-time
+  "Tier 3 Phase 5: balli.time schemas."
+  (:import datetime)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.error :as be]
+            [balli.generator :as bg]
+            [balli.json-schema :as js]
+            [balli.transform :as bt]))
+
+(def tt (bt/time-transformer))
+
+(def aware-a
+  (datetime/datetime 2024 1 1 0 0 0 0 ** :tzinfo datetime.timezone/utc))
+
+(def aware-b
+  (datetime/datetime 2024 1 2 0 0 0 0 ** :tzinfo datetime.timezone/utc))
+
+(def naive-a (datetime/datetime 2024 1 1 0 0 0))
+(def naive-b (datetime/datetime 2024 1 2 0 0 0))
+(def date-a (datetime/date 2024 1 1))
+(def date-b (datetime/date 2024 1 2))
+(def time-a (datetime/time 10 0 0))
+(def time-b (datetime/time 11 0 0))
+(def aware-time (datetime.time/fromisoformat "10:00:00+02:00"))
+(def dur-a (datetime/timedelta ** :seconds 900))
+(def dur-b (datetime/timedelta ** :seconds 1800))
+
+(defn- ex-type
+  [thunk]
+  (try
+    (thunk)
+    nil
+    (catch python/Exception e
+      (:type (ex-data e)))))
+
+(deftest time-types-validate
+  (testing "aware vs naive policies"
+    (is (true? (b/validate :time/instant aware-a)))
+    (is (false? (b/validate :time/instant naive-a)))
+    (is (true? (b/validate :time/local-date-time naive-a)))
+    (is (false? (b/validate :time/local-date-time aware-a))))
+  (testing "date excludes datetime, and local-time excludes offset-aware time"
+    (is (true? (b/validate :time/local-date date-a)))
+    (is (false? (b/validate :time/local-date naive-a)))
+    (is (true? (b/validate :time/local-time time-a)))
+    (is (false? (b/validate :time/local-time aware-time))))
+  (is (true? (b/validate :time/duration dur-a)))
+  (is (false? (b/validate :time/duration 900))))
+
+(deftest time-min-max-bounds
+  (is (true? (b/validate [:time/instant {:min aware-a :max aware-b}] aware-a)))
+  (is (false? (b/validate [:time/instant {:min aware-b}] aware-a)))
+  (is (= ["should be at least 2024-01-02T00:00:00+00:00"]
+         (be/humanize (b/explain [:time/instant {:min aware-b}] aware-a))))
+  (is (true? (b/validate [:time/local-date {:min date-a :max date-b}] date-b)))
+  (is (false? (b/validate [:time/local-date {:min date-b}] date-a)))
+  (is (true? (b/validate [:time/duration {:min dur-a :max dur-b}] dur-a)))
+  (is (false? (b/validate [:time/duration {:min dur-b}] dur-a))))
+
+(deftest time-bound-schema-validation
+  (is (= :balli.core/invalid-schema
+         (ex-type #(b/schema [:time/instant {:min naive-a}]))))
+  (is (= :balli.core/invalid-schema
+         (ex-type #(b/schema [:time/local-date {:min naive-a}]))))
+  (is (= :balli.core/invalid-schema
+         (ex-type #(b/schema [:time/duration {:min "PT1S"}])))))
+
+(deftest time-transformer-decodes-and-encodes
+  (let [inst (b/decode :time/instant "2024-06-01T12:00:00+00:00" tt)]
+    (is (true? (b/validate :time/instant inst)))
+    (is (= "2024-06-01T12:00:00+00:00" (b/encode :time/instant inst tt))))
+  (is (= naive-a (b/decode :time/local-date-time "2024-01-01T00:00:00" tt)))
+  (is (= date-a (b/decode :time/local-date "2024-01-01" tt)))
+  (is (= time-a (b/decode :time/local-time "10:00:00" tt)))
+  (is (= "10:00:00+02:00" (b/decode :time/local-time "10:00:00+02:00" tt)))
+  (is (= "garbage" (b/decode :time/instant "garbage" tt))))
+
+(deftest duration-transformer-matrix
+  (doseq [[s seconds] [["PT15M" 900.0]
+                       ["P1DT2H3M4.5S" 93784.5]
+                       ["P2W" 1209600.0]
+                       ["-PT5S" -5.0]
+                       ["P3D" 259200.0]]]
+    (let [td (b/decode :time/duration s tt)]
+      (is (true? (b/validate :time/duration td)))
+      (is (= seconds (.total_seconds td)))
+      (is (= td (b/decode :time/duration (b/encode :time/duration td tt) tt)))))
+  (is (= "XYZ" (b/decode :time/duration "XYZ" tt)))
+  (is (= "P" (b/decode :time/duration "P" tt)))
+  (is (= "P1Y" (b/decode :time/duration "P1Y" tt)))
+  (is (= "P14D" (b/encode :time/duration (b/decode :time/duration "P2W" tt) tt))))
+
+(deftest time-generator-valid-and-deterministic
+  (doseq [s [:time/instant :time/local-date-time :time/local-date
+             :time/local-time :time/duration]]
+    (is (true? (b/validate s (bg/generate s {:seed 1}))))
+    (is (= (bg/generate s {:seed 42})
+           (bg/generate s {:seed 42}))))
+  (let [schema [:time/local-date {:min date-a :max date-b}]
+        v (bg/generate schema {:seed 7})]
+    (is (true? (b/validate schema v)))))
+
+(deftest time-json-schema-formats
+  (is (= {"type" "string" "format" "date-time"} (js/transform :time/instant)))
+  (is (= {"type" "string" "format" "date-time"} (js/transform :time/local-date-time)))
+  (is (= {"type" "string" "format" "date"} (js/transform :time/local-date)))
+  (is (= {"type" "string" "format" "time"} (js/transform :time/local-time)))
+  (is (= {"type" "string" "format" "duration"} (js/transform :time/duration))))
+
+(deftest time-composition
+  (let [schema [:map [:created :time/instant] [:ttl :time/duration]]
+        value {:created "2024-06-01T12:00:00+00:00" :ttl "PT15M"}
+        decoded (b/decode schema value (bt/transformer (bt/json-transformer) tt))]
+    (is (true? (b/validate schema decoded)))
+    (is (= 900.0 (.total_seconds (:ttl decoded)))))
+  (let [so (b/schema [:map [:created :time/instant]])]
+    (is (true? (b/validate so (bg/generate so {:seed 3}))))))

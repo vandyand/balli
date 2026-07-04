@@ -35,7 +35,11 @@
   schema -- the branch schema itself must produce the dispatch value (e.g.
   contain a [:dispatch-key [:= tag]] entry); :re/:fn have NO default
   generator and throw :balli.core/no-generator unless a :gen/* hook is
-  supplied. :=> generates a constant-ish fn that ignores its arguments and
+  supplied. Predicate schemas (:balli/pred) generate through the
+  pred-gen-forms mapping (unmapped preds, incl. inst? until Phase 5, throw
+  no-generator); comparators generate ints relative to their child value
+  (non-numeric children throw no-generator; :not= filters the :any pool).
+  :=> generates a constant-ish fn that ignores its arguments and
   returns a freshly generated OUTPUT value per call, drawing from the Random
   threaded through the enclosing generate/sample call -- determinism holds at
   generator-CONSTRUCTION level (equal seeds give fns whose successive calls
@@ -60,13 +64,24 @@
   collection/seqex rep counts collapse to their minimum (0 unless :min/:+
   says otherwise) -- so recursion hidden behind optional keys or 0-min
   collections terminates by omission before the ref escape is ever needed."
-  (:import math random uuid)
+  (:import datetime math random uuid)
   (:require [balli.compile :as c]
             [balli.core :as b]
             [balli.normalize :as norm]
-            [balli.registry :as reg]))
+            [balli.registry :as reg]
+            [balli.time :as bt]))
 
 (declare gen)
+
+(defn- layered-registry
+  "Registry for descending into `ast`: its :local-registry (when present)
+  pushed as a fresh layer (balli.registry/push-layer) — mirroring the
+  compile-side `layered` helper so generation resolves shadowed local-
+  registry keywords exactly like validation does."
+  [ast registry]
+  (if-let [local (:local-registry ast)]
+    (reg/push-layer registry local)
+    registry))
 
 (def ^:private ref-cap
   "Max :ref expansions along one generation path before the escape/throw
@@ -153,6 +168,31 @@
     2 (rand-str rnd (.randint rnd 0 (quot size 3)) alnum-chars)
     3 (zero? (.randint rnd 0 1))))
 
+(defn- time-bounds
+  [ast]
+  (let [props (:properties ast)
+        [lo hi] (:gen-default (bt/type-spec (:type ast)))]
+    [(or (:min props) lo) (or (:max props) hi)]))
+
+(defn- gen-time
+  [ast rnd]
+  (let [[lo hi] (time-bounds ast)]
+    (case (:type ast)
+      (:time/instant :time/local-date-time)
+      (+ lo (datetime/timedelta ** :seconds (.uniform rnd 0.0 (.total_seconds (- hi lo)))))
+
+      :time/local-date
+      (datetime.date/fromordinal (.randint rnd (.toordinal lo) (.toordinal hi)))
+
+      :time/local-time
+      (let [start (datetime/datetime 2000 1 1 (.-hour lo) (.-minute lo) (.-second lo) (.-microsecond lo))
+            end (datetime/datetime 2000 1 1 (.-hour hi) (.-minute hi) (.-second hi) (.-microsecond hi))
+            v (+ start (datetime/timedelta ** :seconds (.uniform rnd 0.0 (.total_seconds (- end start)))))]
+        (.time v))
+
+      :time/duration
+      (datetime/timedelta ** :seconds (.uniform rnd (.total_seconds lo) (.total_seconds hi))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Composite strategies
 
@@ -221,19 +261,26 @@
 (defn- gen-ref
   "Expand the ref target with depth+1. At the cap (depth >= 5): target
   normalizing to :maybe -> nil; anything else -> unsatisfiable-schema. See
-  the ns docstring for the full cap contract."
+  the ns docstring for the full cap contract. Resolution goes through the
+  layered registry chain (innermost first) and the target normalizes +
+  generates against the resolving layer's chain prefix — the same lexical
+  scoping the compilers use, so shadowed local-registry keywords generate
+  their in-scope meaning. Depth stays a plain per-path expansion counter
+  (identity-free), which is strictly more conservative than per-[kw layer]
+  counting and terminates regardless of layering."
   [ast registry rnd size depth]
   (let [k (:ref ast)
-        target (reg/resolve-ref registry k)]
-    (when (nil? target)
+        r (reg/resolve-ref-layered registry k)]
+    (when (nil? r)
       (throw (ex-info "Unresolved ref"
                       {:type :balli.core/unresolved-ref :ref k})))
-    (let [tast (norm/normalize target {:registry registry})]
+    (let [tr (:registry r)
+          tast (norm/normalize (:form r) {:registry tr})]
       (if (>= depth ref-cap)
         (if (= :maybe (:type tast))
           nil
           (unsatisfiable! ast))
-        (gen tast registry rnd size (inc depth))))))
+        (gen tast tr rnd size (inc depth))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Sequence schemas: flat chunks via concat-splicing
@@ -252,7 +299,8 @@
   (let [reduced? (>= depth ref-cap)
         chunk (fn [c]
                 (cond
-                  (c/regex-op? c) (gen-seqex-chunk c registry rnd size depth)
+                  (c/regex-op? c) (gen-seqex-chunk c (layered-registry c registry)
+                                                   rnd size depth)
                   (= :ref (:type c)) (throw-recursive-seqex! c)
                   :else [(gen c registry rnd size depth)]))
         reps (fn [n f] (into [] (mapcat (fn [_] (f))) (range n)))]
@@ -273,6 +321,90 @@
                     mx (max mn (int-floor (or (:max props) (+ mn (quot size 3)))))
                     n (if reduced? mn (.randint rnd mn mx))]
                 (reps n #(chunk (first (:children node))))))))
+
+;; ---------------------------------------------------------------------------
+;; Predicate + comparator schemas
+
+(def ^:private pred-gen-forms
+  "pred-key symbol -> schema form generated in the predicate's place
+  (semantics section 4: map each predicate to an existing type generator
+  where obvious). seq?/list? post-convert the generated vector into a list
+  (vectors fail seq?/list?) — see gen-pred. Absent keys throw
+  :balli.core/no-generator unless a :gen/* hook is present: some? ident?
+  qualified-keyword? qualified-symbol? associative? fn? ifn? empty? — and
+  inst? maps to :time/instant once balli.time lands."
+  {'any? :any
+   'number? :number
+   'integer? :int
+   'int? :int
+   'pos-int? [:int {:min 1}]
+   'neg-int? [:int {:max -1}]
+   'nat-int? [:int {:min 0}]
+   'pos? [:int {:min 1}]
+   'neg? [:int {:max -1}]
+   'float? :double
+   'double? :double
+   'boolean? :boolean
+   'string? :string
+   'char? [:string {:min 1 :max 1}]
+   'keyword? :keyword
+   'simple-keyword? :keyword
+   'symbol? :symbol
+   'simple-symbol? :symbol
+   'uuid? :uuid
+   'inst? :time/instant
+   'nil? :nil
+   'false? [:= false]
+   'true? [:= true]
+   'zero? [:= 0]
+   'coll? [:vector :any]
+   'vector? [:vector :any]
+   'sequential? [:vector :any]
+   'seqable? [:vector :any]
+   'indexed? [:vector :any]
+   'seq? [:vector :any]
+   'list? [:vector :any]
+   'map? [:map-of :keyword :any]
+   'set? [:set :any]})
+
+(def ^:private listify-preds
+  "Predicates whose generated vector is converted to a list so the pred
+  itself holds on the result."
+  #{'seq? 'list?})
+
+(defn- gen-pred
+  [ast registry rnd size depth]
+  (let [k (:pred-key ast)]
+    (if-some [form (get pred-gen-forms k)]
+      (let [v (gen (norm/normalize form {:registry registry})
+                   registry rnd size depth)]
+        (if (contains? listify-preds k) (apply list v) v))
+      (no-generator! ast))))
+
+(defn- gen-comparator
+  "Int generator relative to the comparator's child value v (span size^2):
+  :> in [floor(v)+1, +span], :>= in [ceil(v), +span], :< in [-span,
+  ceil(v)-1], :<= in [-span, floor(v)] — every draw satisfies the comparator
+  for int AND float children. Non-numeric children throw
+  :balli.core/no-generator (:gen/* hooks are checked upstream). :not= draws
+  from the :any pool and filters, retry-capped."
+  [ast rnd size]
+  (let [v (first (:children ast))
+        t (:type ast)]
+    (if (= :not= t)
+      (loop [i 0]
+        (when (>= i retry-cap)
+          (unsatisfiable! ast))
+        (let [x (gen-any rnd size)]
+          (if (= x v) (recur (inc i)) x)))
+      (if (or (int? v) (float? v))
+        (let [span (* size size)]
+          (case t
+            :> (let [lo (inc (int-floor v))] (.randint rnd lo (+ lo span)))
+            :>= (let [lo (int-ceil v)] (.randint rnd lo (+ lo span)))
+            :< (let [hi (dec (int-ceil v))] (.randint rnd (- hi span) hi))
+            :<= (let [hi (int-floor v)] (.randint rnd (- hi span) hi))))
+        (no-generator! ast)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Dispatch
@@ -298,6 +430,8 @@
       ;; seeded determinism: random-uuid ignores our Random, so build the
       ;; uuid from 32 rnd-drawn hex digits instead.
       :uuid (uuid/UUID (rand-str rnd 32 hex-chars))
+      (:time/instant :time/local-date-time :time/local-date :time/local-time :time/duration)
+      (gen-time ast rnd)
       :enum (.choice rnd (:children ast))
       := (first (:children ast))
       :maybe (if (or reduced? (< (.random rnd) 0.2))
@@ -317,6 +451,10 @@
       ;; no default strategy -- only :gen/* hooks (checked before this
       ;; dispatch) can generate these.
       (:re :fn) (no-generator! ast)
+      ;; predicate schemas map to existing type generators where obvious;
+      ;; unmapped preds throw no-generator (see pred-gen-forms).
+      :balli/pred (gen-pred ast registry rnd size depth)
+      (:> :>= :< :<= :not=) (gen-comparator ast rnd size)
       ;; constant-ish fn: ignores args, generates a fresh output value per
       ;; call from the threaded rnd (see the ns docstring on determinism)
       :=> (let [out-ast (nth (:children ast) 1)]
@@ -329,9 +467,12 @@
 
 (defn- gen
   "Generate a value for AST `ast`: :gen/return -> :gen/elements ->
-  :gen/schema -> type default, then :gen/fmap post-maps the result."
+  :gen/schema -> type default, then :gen/fmap post-maps the result. Layer-
+  aware entry: a node carrying :local-registry extends the registry chain
+  for its whole subtree first (see `layered-registry`)."
   [ast registry rnd size depth]
-  (let [props (:properties ast)
+  (let [registry (layered-registry ast registry)
+        props (:properties ast)
         base (cond
                (contains? props :gen/return)
                (:gen/return props)
@@ -415,7 +556,8 @@
        (let [registry (or registry (reg/default-registry))
              ast (if (and (map? schema) (:type schema))
                    schema
-                   (norm/normalize schema {:registry registry}))]
+                   (norm/normalize schema {:registry registry}))
+             registry (layered-registry ast registry)]
          (if (= :function (:type ast))
            (some #(check % value registry) (:children ast))
            (let [input-ast (nth (:children ast) 0)
@@ -424,8 +566,9 @@
                  rnd (random/Random)]
              (loop [i 0]
                (when (< i iterations)
-                 (let [args (gen-seqex-chunk input-ast registry rnd
-                                             default-size 0)
+                 (let [args (gen-seqex-chunk input-ast
+                                             (layered-registry input-ast registry)
+                                             rnd default-size 0)
                        failure (try
                                  (let [ret (apply value args)
                                        errors (output-ef ret [] [])]

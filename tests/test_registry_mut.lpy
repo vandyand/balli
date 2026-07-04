@@ -1,0 +1,241 @@
+(ns tests.test-registry-mut
+  "Phase 2 (tier 3): mutable + composite default registry.
+
+  Covers: register! (kw+form and map arities) making raw-form calls work
+  with no opts threading, re-register! changing the meaning of already-
+  compiled raw forms (epoch-based cache invalidation), schema objects
+  keeping their construction-time snapshot, set-default-registry! full
+  swap + restore, mutation-epoch monotonicity, composite merge order
+  (first wins) + :types union, shape validation at the mutation boundary,
+  and feature-composition: explain/generate/decode + util merge through
+  mutably-registered schemas."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.error :as be]
+            [balli.generator :as bg]
+            [balli.registry :as reg]
+            [balli.transform :as bt]
+            [balli.util :as u]))
+
+;; ---------------------------------------------------------------------------
+;; Test hygiene: every default-registry mutation restores the prior default
+;; (the restore itself bumps the epoch, which also re-clears the raw cache).
+
+(defn- with-restored*
+  [f]
+  (let [saved (reg/default-registry)]
+    (try
+      (f)
+      (finally
+        (reg/set-default-registry! saved)))))
+
+(defmacro with-restored
+  [& body]
+  `(with-restored* (fn [] ~@body)))
+
+(defn- ex-type
+  [thunk]
+  (try
+    (thunk)
+    nil
+    (catch python/Exception e (:type (ex-data e)))))
+
+;; ---------------------------------------------------------------------------
+;; register! — raw forms see the live default, no opts threading
+
+(deftest register!-raw-form-no-opts
+  (with-restored
+    (reg/register! :t3/email [:re #"^[^@]+@[^@]+$"])
+    (is (true? (b/validate :t3/email "a@b.c")))
+    (is (false? (b/validate :t3/email "not-an-email")))
+    (testing "registered key nested inside a builtin composite"
+      (is (true? (b/validate [:map [:e :t3/email]] {:e "a@b.c"})))
+      (is (false? (b/validate [:map [:e :t3/email]] {:e "nope"}))))
+    (testing "[:ref kw] also resolves against the live default"
+      (is (true? (b/validate [:ref :t3/email] "a@b.c"))))))
+
+(deftest register!-map-arity
+  (with-restored
+    (reg/register! {:t3/a :int
+                    :t3/b [:vector :t3/a]})
+    (is (true? (b/validate :t3/b [1 2 3])))
+    (is (false? (b/validate :t3/b ["x"])))))
+
+;; ---------------------------------------------------------------------------
+;; re-register! — epoch-based raw-cache invalidation
+
+(deftest re-register!-changes-raw-form-meaning
+  (with-restored
+    (reg/register! :t3/thing [:string {:min 1}])
+    ;; fill the raw cache under the current epoch
+    (is (true? (b/validate :t3/thing "abc")))
+    (is (false? (b/validate :t3/thing 42)))
+    (let [v1 (b/validator :t3/thing)]
+      (reg/register! :t3/thing :int)
+      (testing "new meaning served (cache invalidated)"
+        (is (false? (b/validate :t3/thing "abc")))
+        (is (true? (b/validate :t3/thing 42))))
+      (testing "compiled fn is a fresh compilation, not the stale entry"
+        (is (not (identical? v1 (b/validator :t3/thing))))))))
+
+(deftest mutation-epoch-monotonic
+  (with-restored
+    (let [e0 @reg/mutation-epoch]
+      (reg/register! :t3/tmp :int)
+      (let [e1 @reg/mutation-epoch]
+        (is (< e0 e1))
+        (reg/set-default-registry! (reg/default-registry))
+        (is (< e1 @reg/mutation-epoch))))))
+
+;; ---------------------------------------------------------------------------
+;; Snapshot semantics — schema objects bake their registry at construction
+
+(deftest baked-schema-object-keeps-old-meaning
+  (with-restored
+    (reg/register! :t3/email [:re #"^[^@]+@[^@]+$"])
+    (let [compiled (b/schema [:map [:e :t3/email]])
+          uncompiled (b/schema :t3/email)]
+      ;; compile `compiled` before the mutation
+      (is (true? (b/validate compiled {:e "a@b.c"})))
+      (reg/register! :t3/email :int)
+      (testing "object compiled before mutation keeps the old meaning"
+        (is (true? (b/validate compiled {:e "a@b.c"})))
+        (is (false? (b/validate compiled {:e 5}))))
+      (testing "object BAKED before but compiled after mutation also keeps it"
+        (is (true? (b/validate uncompiled "a@b.c")))
+        (is (false? (b/validate uncompiled 5))))
+      (testing "raw form sees the new meaning"
+        (is (false? (b/validate [:map [:e :t3/email]] {:e "a@b.c"})))
+        (is (true? (b/validate [:map [:e :t3/email]] {:e 5})))))))
+
+;; ---------------------------------------------------------------------------
+;; set-default-registry! — full swap and restore
+
+(deftest set-default-registry!-full-swap-and-restore
+  (let [saved (reg/default-registry)]
+    (try
+      (reg/set-default-registry! {:types reg/builtin-types
+                                  :schemas {:t3/id [:string {:min 2}]}})
+      (is (true? (b/validate :t3/id "ab")))
+      (is (false? (b/validate :t3/id "a")))
+      (finally
+        (reg/set-default-registry! saved)))
+    (testing "after restore, the swapped-in key is unknown again"
+      (is (= :balli.core/invalid-schema
+             (ex-type #(b/validate :t3/id "ab")))))))
+
+(deftest mutation-boundary-shape-validation
+  (testing "set-default-registry! rejects non-registry shapes untouched"
+    (doseq [bad [nil 42 [:map]
+                 {:schemas {}}
+                 {:types [:not-a-set] :schemas {}}
+                 {:types #{} :schemas [:not-a-map]}]]
+      (is (= :balli.core/invalid-registry
+             (ex-type #(reg/set-default-registry! bad))))))
+  (testing "register! rejects non-keyword keys and non-map single args"
+    (is (= :balli.core/invalid-registry
+           (ex-type #(reg/register! "not-a-kw" :int))))
+    (is (= :balli.core/invalid-registry
+           (ex-type #(reg/register! [:not-a-map]))))
+    (is (= :balli.core/invalid-registry
+           (ex-type #(reg/register! {"str-key" :int})))))
+  (testing "a rejected mutation does not bump the epoch"
+    (let [e0 @reg/mutation-epoch]
+      (ex-type #(reg/set-default-registry! nil))
+      (ex-type #(reg/register! "not-a-kw" :int))
+      (is (= e0 @reg/mutation-epoch)))))
+
+;; ---------------------------------------------------------------------------
+;; composite — first wins on :schemas, :types unioned
+
+(deftest composite-merge-order-and-types-union
+  (let [r1 {:types #{:int} :schemas {:c/x :int :c/only1 :string}}
+        r2 {:types #{:string} :schemas {:c/x :string :c/only2 :keyword}}
+        c (reg/composite r1 r2)]
+    (testing "first registry wins on key conflicts"
+      (is (= :int (reg/resolve-ref c :c/x))))
+    (testing "non-conflicting keys from every member"
+      (is (= :string (reg/resolve-ref c :c/only1)))
+      (is (= :keyword (reg/resolve-ref c :c/only2))))
+    (testing ":types unioned"
+      (is (= #{:int :string} (:types c)))))
+  (testing "composite members must be registry-shaped"
+    (is (= :balli.core/invalid-registry
+           (ex-type #(reg/composite {:bad true}))))))
+
+(deftest composite-as-default-registry
+  (with-restored
+    (let [extra {:types #{} :schemas {:c/x :string}}
+          c (reg/composite (reg/default-registry)
+                           {:types #{} :schemas {:c/x :int}}
+                           extra)]
+      (reg/set-default-registry! c)
+      (testing "earlier member's :c/x wins (default has none)"
+        (is (true? (b/validate :c/x 5)))
+        (is (false? (b/validate :c/x "s"))))
+      (testing "builtins still resolve through the composite"
+        (is (true? (b/validate [:vector :c/x] [1 2])))))))
+
+;; ---------------------------------------------------------------------------
+;; registry (custom layering) reads the LIVE default at call time
+
+(deftest registry-fn-layers-over-live-default
+  (with-restored
+    (reg/register! :t3/base :int)
+    (let [r (reg/registry {:t3/extra :string})]
+      (is (true? (b/validate :t3/base 1 {:registry r})))
+      (is (true? (b/validate :t3/extra "s" {:registry r}))))))
+
+;; ---------------------------------------------------------------------------
+;; Composition: registered schema refing another registered key (recursive)
+
+(deftest registered-schema-refs-registered-key
+  (with-restored
+    (reg/register! :t3/id [:string {:min 1}])
+    (reg/register! :t3/user [:map
+                             [:id :t3/id]
+                             [:friends [:vector [:ref :t3/user]]]])
+    (is (true? (b/validate :t3/user {:id "u" :friends [{:id "v" :friends []}]})))
+    (is (false? (b/validate :t3/user {:id "" :friends []})))
+    (is (false? (b/validate :t3/user {:id "u" :friends [{:id "v" :friends [7]}]})))))
+
+;; ---------------------------------------------------------------------------
+;; Feature x feature: explain/humanize, generate, predicates, decode
+
+(deftest explain-generate-through-registered-schema
+  (with-restored
+    (reg/register! :t3/age [:int {:min 0 :max 130}])
+    (testing "explain + humanize through the live default"
+      (let [ex (b/explain [:map [:age :t3/age]] {:age -1})]
+        (is (some? ex))
+        (is (= [[:age]] (mapv :in (:errors ex))))
+        (is (= {:age ["should be between 0 and 130"]} (be/humanize ex)))))
+    (testing "generate through the live default validates"
+      (let [v (bg/generate [:map [:age :t3/age]] {:seed 7})]
+        (is (true? (b/validate [:map [:age :t3/age]] v)))))))
+
+(deftest registered-predicate-schema-composition
+  (with-restored
+    ;; tier-3 Phase 1 predicates/comparators inside a registered form
+    (reg/register! :t3/pos [:and int? [:> 0]])
+    (is (true? (b/validate :t3/pos 3)))
+    (is (false? (b/validate :t3/pos 0)))
+    (is (false? (b/validate :t3/pos "x")))))
+
+;; ---------------------------------------------------------------------------
+;; Schema-object composition: util merge + decode through registered keys
+
+(deftest schema-object-composition
+  (with-restored
+    (reg/register! :t3/id [:string {:min 1}])
+    (reg/register! :t3/nat [:int {:min 0}])
+    (testing "u/merge of schema objects whose entries use registered keys"
+      (let [s1 (b/schema [:map [:id :t3/id]])
+            s2 (b/schema [:map [:n :t3/nat]])
+            merged (u/merge s1 s2)]
+        (is (true? (b/validate merged {:id "x" :n 1})))
+        (is (false? (b/validate merged {:id "" :n 1})))
+        (is (false? (b/validate merged {:id "x" :n -1})))))
+    (testing "decode through a schema object baked over a registered key"
+      (let [s (b/schema [:map [:n :t3/nat]])]
+        (is (= {:n 5} (b/decode s {:n "5"} (bt/string-transformer))))))))

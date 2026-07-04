@@ -1,0 +1,145 @@
+(ns tests.test-fuzz-stress
+  "Deterministic broad stress coverage over Balli's public surfaces.
+
+  This is intentionally not Hypothesis: it uses Python random.Random with fixed
+  seeds so failures are reproducible in ordinary `basilisp test` output."
+  (:import datetime random)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.error :as be]
+            [balli.generator :as bg]
+            [balli.json-schema :as js]
+            [balli.registry :as reg]
+            [balli.transform :as bt]))
+
+(def ^:private leaf-schemas
+  [:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid
+   :time/instant :time/local-date-time :time/local-date :time/local-time :time/duration
+   int? string? boolean? keyword? uuid? pos-int? nat-int? neg-int? number? inst?
+   [:> -10] [:>= 0] [:< 10] [:<= 5] [:not= :forbidden]
+   [:enum :red :green :blue]
+   [:= :fixed]])
+
+(def ^:private invalid-values
+  [nil true false 0 1 -1 1.5 "" "x" :kw 'sym [] [1 "x"] {} {:x "x"} #{} #{1}])
+
+(defn- choice
+  [rnd xs]
+  (nth xs (.randint rnd 0 (dec (count xs)))))
+
+(defn- maybe-props
+  [rnd]
+  (if (zero? (.randint rnd 0 3))
+    {:title (str "fuzz-" (.randint rnd 0 999))}
+    {}))
+
+(declare gen-schema)
+
+(defn- gen-entry
+  [rnd depth k]
+  (let [s (gen-schema rnd depth)]
+    (if (zero? (.randint rnd 0 4))
+      [k {:optional true} s]
+      [k s])))
+
+(defn- gen-map-schema
+  [rnd depth]
+  (let [n (.randint rnd 1 4)
+        entries (mapv #(gen-entry rnd depth (keyword (str "k" %))) (range n))
+        props (cond-> (maybe-props rnd)
+                (zero? (.randint rnd 0 2)) (assoc :closed true))
+        with-props (if (seq props) (into [:map props] entries) (into [:map] entries))]
+    (if (zero? (.randint rnd 0 3))
+      (conj with-props [:balli.core/default [:map-of :keyword :any]])
+      with-props)))
+
+(defn- gen-seqex
+  [rnd depth]
+  (case (.randint rnd 0 5)
+    0 [:cat :int [:* :string]]
+    1 [:catn [:n :int] [:s :string]]
+    2 [:alt :int :string]
+    3 [:altn [:n :int] [:s :string]]
+    4 [:repeat {:min 0 :max 3} :int]
+    5 [:schema (gen-schema rnd depth)]))
+
+(defn- gen-local-registry-schema
+  [rnd depth]
+  (let [inner (gen-schema rnd depth)
+        local {:fuzz/id :int
+               :fuzz/name :string
+               :fuzz/node [:maybe [:map
+                                   [:id :fuzz/id]
+                                   [:children [:vector [:ref :fuzz/node]]]]]}]
+    [:schema {:registry local}
+     (choice rnd [[:map [:id :fuzz/id] [:name :fuzz/name]]
+                  [:ref :fuzz/node]
+                  [:vector inner]])]))
+
+(defn- gen-schema
+  [rnd depth]
+  (if (<= depth 0)
+    (choice rnd leaf-schemas)
+    (case (.randint rnd 0 13)
+      0 (choice rnd leaf-schemas)
+      1 [:maybe (gen-schema rnd (dec depth))]
+      2 [:vector (gen-schema rnd (dec depth))]
+      3 [:set {:max 1} (gen-schema rnd (dec depth))]
+      4 [:tuple (gen-schema rnd (dec depth)) (gen-schema rnd (dec depth))]
+      5 [:or (gen-schema rnd (dec depth)) (gen-schema rnd (dec depth))]
+      6 [:and (gen-schema rnd (dec depth))]
+      7 [:map-of :keyword (gen-schema rnd (dec depth))]
+      8 (gen-map-schema rnd (dec depth))
+      9 [:multi {:dispatch :kind}
+         [:a [:map [:kind [:= :a]] [:v (gen-schema rnd (dec depth))]]]
+         [:b [:map [:kind [:= :b]] [:v (gen-schema rnd (dec depth))]]]
+         [:balli.core/default [:map [:kind :keyword]]]]
+      10 (gen-seqex rnd (dec depth))
+      11 (gen-local-registry-schema rnd (dec depth))
+      12 [:schema (gen-schema rnd (dec depth))]
+      13 [:map [:created :time/instant] [:ttl :time/duration]])))
+
+(defn- stress-one!
+  [s seed]
+  (let [so (b/schema s)
+        t (bt/transformer (bt/json-transformer)
+                          (bt/time-transformer)
+                          (bt/string-transformer))
+        v (bg/generate so {:seed seed})
+        parsed (b/parse so v)
+        unparsed (when-not (b/invalid? parsed) (b/unparse so parsed))]
+    (is (= (b/form so) (b/walk so (b/schema-walker identity))))
+    (is (map? (js/transform so)))
+    (is (= v (bg/generate so {:seed seed})))
+    (is (true? (b/validate so v)) (str "generated value validates for " (pr-str s)))
+    (is (nil? (b/explain so v)))
+    (is (nil? (be/humanize (b/explain so v))))
+    (is (false? (b/invalid? parsed)))
+    (is (true? (b/validate so unparsed)))
+    ;; Transformers are lenient; this checks broad traversal/coder safety.
+    (b/decode so v t)
+    (b/encode so v t)
+    (doseq [bad invalid-values]
+      (let [valid? (b/validate so bad)
+            explained (b/explain so bad)]
+        (is (boolean? valid?))
+        (when explained
+          (is (some? (be/humanize explained))))))))
+
+(deftest generated-schema-fuzz-stress
+  (doseq [seed (range 80)]
+    (testing (str "schema-seed " seed)
+      (let [rnd (random/Random seed)
+            s (gen-schema rnd 3)]
+        (stress-one! s seed)))))
+
+(deftest mutable-default-registry-stress
+  (let [old (reg/default-registry)]
+    (try
+      (doseq [i (range 20)]
+        (let [k (keyword "stress" (str "s" i))
+              form (if (even? i) :int :string)]
+          (reg/register! k form)
+          (is (true? (b/validate k (bg/generate form {:seed i}))))))
+      (finally
+        (reg/set-default-registry! old)))))

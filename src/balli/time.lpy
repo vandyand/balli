@@ -1,0 +1,164 @@
+(ns balli.time
+  "Pure Python datetime helpers for Balli time schemas.
+
+  This namespace is deliberately a leaf: no balli.* requires. Higher-level
+  namespaces consume the `types` table for validation, transformation,
+  generation, and JSON Schema wiring."
+  (:import datetime math re))
+
+(def ^:private duration-pattern
+  (re/compile "^(-)?P(?:(\\d+(?:\\.\\d+)?)W)?(?:(\\d+(?:\\.\\d+)?)D)?(?:T(?:(\\d+(?:\\.\\d+)?)H)?(?:(\\d+(?:\\.\\d+)?)M)?(?:(\\d+(?:\\.\\d+)?)S)?)?$"))
+
+(defn aware-datetime?
+  [x]
+  (and (isinstance x datetime/datetime)
+       (some? (.-tzinfo x))))
+
+(defn local-date-time?
+  [x]
+  (and (isinstance x datetime/datetime)
+       (nil? (.-tzinfo x))))
+
+(defn local-date?
+  [x]
+  (and (isinstance x datetime/date)
+       (not (isinstance x datetime/datetime))))
+
+(defn local-time?
+  [x]
+  (and (isinstance x datetime/time)
+       (nil? (.-tzinfo x))))
+
+(defn duration?
+  [x]
+  (isinstance x datetime/timedelta))
+
+(defn- parse-float
+  [s]
+  (when (some? s) (python/float s)))
+
+(defn parse-duration
+  "Parse the supported ISO-8601 duration subset into datetime.timedelta.
+  Supports PnW, PnD, TnHnMnS, optional sign, and fractional components.
+  Returns nil for unsupported/invalid strings."
+  [s]
+  (when (string? s)
+    (when-let [m (.match duration-pattern s)]
+      (let [neg? (some? (.group m 1))
+            weeks (parse-float (.group m 2))
+            days (parse-float (.group m 3))
+            hours (parse-float (.group m 4))
+            minutes (parse-float (.group m 5))
+            seconds (parse-float (.group m 6))]
+        (when (some some? [weeks days hours minutes seconds])
+          (let [total (+ (* (or weeks 0.0) 7.0 24.0 3600.0)
+                         (* (or days 0.0) 24.0 3600.0)
+                         (* (or hours 0.0) 3600.0)
+                         (* (or minutes 0.0) 60.0)
+                         (or seconds 0.0))
+                total (if neg? (- total) total)]
+            (datetime/timedelta ** :seconds total)))))))
+
+(defn- trim-float
+  [x]
+  (let [s (str x)]
+    (if (.endswith s ".0")
+      (subs s 0 (- (count s) 2))
+      s)))
+
+(defn format-duration
+  "Format datetime.timedelta as a canonical ISO-8601 duration string.
+  Weeks are canonicalized to days; zero renders PT0S."
+  [td]
+  (let [total (.total_seconds td)
+        neg? (< total 0)
+        rem (math/fabs total)
+        days (python/int (math/floor (/ rem 86400.0)))
+        rem (- rem (* days 86400.0))
+        hours (python/int (math/floor (/ rem 3600.0)))
+        rem (- rem (* hours 3600.0))
+        minutes (python/int (math/floor (/ rem 60.0)))
+        seconds (- rem (* minutes 60.0))
+        parts []
+        parts (if (pos? days) (conj parts (str days "D")) parts)
+        tparts []
+        tparts (if (pos? hours) (conj tparts (str hours "H")) tparts)
+        tparts (if (pos? minutes) (conj tparts (str minutes "M")) tparts)
+        tparts (if (pos? seconds) (conj tparts (str (trim-float seconds) "S")) tparts)]
+    (str (when neg? "-")
+         "P"
+         (apply str parts)
+         (when (seq tparts) (str "T" (apply str tparts)))
+         (when (and (empty? parts) (empty? tparts)) "T0S"))))
+
+(defn- decode-datetime
+  [s pred]
+  (try
+    (let [v (datetime.datetime/fromisoformat s)]
+      (when (pred v) v))
+    (catch python/Exception _ nil)))
+
+(defn- decode-date
+  [s]
+  (try
+    (datetime.date/fromisoformat s)
+    (catch python/Exception _ nil)))
+
+(defn- decode-time
+  [s]
+  (try
+    (let [v (datetime.time/fromisoformat s)]
+      (when (local-time? v) v))
+    (catch python/Exception _ nil)))
+
+(defn decode
+  "Decode a string for time schema `type`, returning nil on parse/type miss."
+  [type s]
+  (when (string? s)
+    (case type
+      :time/instant (decode-datetime s aware-datetime?)
+      :time/local-date-time (decode-datetime s local-date-time?)
+      :time/local-date (decode-date s)
+      :time/local-time (decode-time s)
+      :time/duration (parse-duration s))))
+
+(defn encode
+  [type v]
+  (if (= :time/duration type)
+    (format-duration v)
+    (.isoformat v)))
+
+(def types
+  {:time/instant {:check aware-datetime?
+                  :decode #(decode :time/instant %)
+                  :encode #(encode :time/instant %)
+                  :gen-default [(datetime/datetime 2000 1 1 0 0 0 0 ** :tzinfo datetime.timezone/utc)
+                                (datetime/datetime 2030 1 1 0 0 0 0 ** :tzinfo datetime.timezone/utc)]}
+   :time/local-date-time {:check local-date-time?
+                          :decode #(decode :time/local-date-time %)
+                          :encode #(encode :time/local-date-time %)
+                          :gen-default [(datetime/datetime 2000 1 1)
+                                        (datetime/datetime 2030 1 1)]}
+   :time/local-date {:check local-date?
+                     :decode #(decode :time/local-date %)
+                     :encode #(encode :time/local-date %)
+                     :gen-default [(datetime/date 2000 1 1)
+                                   (datetime/date 2030 1 1)]}
+   :time/local-time {:check local-time?
+                     :decode #(decode :time/local-time %)
+                     :encode #(encode :time/local-time %)
+                     :gen-default [(datetime/time 0 0 0)
+                                   (datetime/time 23 59 59)]}
+   :time/duration {:check duration?
+                   :decode #(decode :time/duration %)
+                   :encode #(encode :time/duration %)
+                   :gen-default [(datetime/timedelta)
+                                 (datetime/timedelta ** :seconds 1000000)]}})
+
+(defn time-type?
+  [t]
+  (contains? types t))
+
+(defn type-spec
+  [t]
+  (get types t))

@@ -26,7 +26,8 @@
   (:import uuid)
   (:require [balli.compile :as c]
             [balli.normalize :as norm]
-            [balli.registry :as reg]))
+            [balli.registry :as reg]
+            [balli.time :as time]))
 
 ;; ---------------------------------------------------------------------------
 ;; Transformer construction
@@ -136,8 +137,10 @@
   `chain` in order. Per link, resolution priority:
     1. schema prop under the method map, e.g. {:decode {:string f}}
     2. schema prop under the qualified name, e.g. :decode/string
-    3. the link's per-type table (:decoders/:encoders) keyed by node type
-    4. the link's :default-decoder/:default-encoder
+    3. for :balli/pred nodes, the link's per-type table keyed by the node's
+       :pred-key SYMBOL (coder tables mix type keywords and pred-key symbols)
+    4. the link's per-type table (:decoders/:encoders) keyed by node type
+    5. the link's :default-decoder/:default-encoder
   Returns {:enter f :leave g} or nil."
   [chain ast method opts]
   (reduce
@@ -150,6 +153,8 @@
            default (if (= :decode method) (:default-decoder link) (:default-encoder link))
            spec (or (when nm (get (get props method) nm))
                     (when qname (get props qname))
+                    (when (= :balli/pred (:type ast))
+                      (get table (:pred-key ast)))
                     (get table (:type ast))
                     default)
            i (when (some? spec) (-interceptor spec ast opts))]
@@ -219,41 +224,61 @@
 
 (defn- transform-multi
   "Dispatch on the (post-enter) value; matching branch's transformer, no
-  matching branch -> pass-through."
+  matching branch -> the :balli.core/default branch's transformer when the
+  node has one, else pass-through. The MATCHED-BRANCH set is all declared
+  branch keys (a branch whose subtree happens not to transform still blocks
+  the default fallback -- dispatch matched it)."
   [node registry chain method opts cache]
   (let [d (:dispatch (:properties node))
         dispatch-fn (if (keyword? d) (fn [x] (get x d)) d)
+        branch-keys (set (map :key (:children node)))
         table (reduce (fn [acc {:keys [key schema]}]
                         (if-some [t (transform-node schema registry chain method opts cache)]
                           (assoc acc key t)
                           acc))
                       {}
-                      (:children node))]
-    (when (seq table)
+                      (:children node))
+        dt (when-some [de (:default-entry node)]
+             (transform-node (:schema de) registry chain method opts cache))]
+    (when (or (seq table) dt)
       (fn [x]
         (let [dv (try
                    (dispatch-fn x)
                    (catch python/Exception _ ::dispatch-threw))]
-          (if-some [t (get table dv)]
-            (t x)
-            x))))))
+          (if (contains? branch-keys dv)
+            (if-some [t (get table dv)]
+              (t x)
+              x)
+            (if dt (dt x) x)))))))
 
 (defn- transform-map
   "Transform only PRESENT declared keys; missing keys untouched; guarded by
-  map? (non-maps pass through)."
+  map? (non-maps pass through). A :balli.core/default entry's transformer
+  runs once on the RESIDUAL map (value minus declared keys), its result
+  merged UNDER the untouched declared-key values (declared entries then
+  transform via the normal per-key descent and win)."
   [node registry chain method opts cache]
   (let [kts (into [] (keep (fn [{:keys [key schema]}]
                              (when-some [t (transform-node schema registry chain method opts cache)]
                                [key t])))
-                  (:children node))]
-    (when (seq kts)
+                  (:children node))
+        dt (when-some [de (:default-entry node)]
+             (transform-node (:schema de) registry chain method opts cache))
+        known (set (map :key (:children node)))]
+    (when (or (seq kts) dt)
       (guard map?
              (fn [x]
-               (reduce (fn [m [k t]]
-                         (if (contains? m k)
-                           (assoc m k (t (get m k)))
-                           m))
-                       x kts))))))
+               (let [x (if dt
+                         (let [residual (reduce dissoc x known)
+                               r* (dt residual)]
+                           (merge (if (map? r*) r* residual)
+                                  (select-keys x known)))
+                         x)]
+                 (reduce (fn [m [k t]]
+                           (if (contains? m k)
+                             (assoc m k (t (get m k)))
+                             m))
+                         x kts)))))))
 
 (defn- transform-map-of
   [node registry chain method opts cache]
@@ -297,34 +322,51 @@
   "Lazy memoized target transformer: the ref resolves (and throws on an
   unresolved target) at compile time, but the target's transformer compiles
   on first use through the per-compilation `cache` atom -- recursion-safe,
-  since nested refs only force after the outer entry is already cached."
+  since nested refs only force after the outer entry is already cached.
+  Resolution goes through the layered registry chain and the cache is keyed
+  [kw layer-token] (see balli.compile/compile-ref for the token + lexical-
+  scoping contract), so shadowed keywords never share a cached transformer;
+  the target compiles against the resolving layer's chain prefix, which also
+  replaces :registry in the opts handed to {:compile ...} interceptors."
   [node registry chain method opts cache]
   (let [k (:ref node)
-        target (reg/resolve-ref registry k)]
-    (when (nil? target)
+        r (reg/resolve-ref-layered registry k)]
+    (when (nil? r)
       (throw (ex-info "Unresolved ref" {:type :balli.core/unresolved-ref :ref k})))
-    (fn [x]
-      (let [t (or (get @cache k)
-                  (let [t* (or (transform-node (norm/normalize target {:registry registry})
-                                               registry chain method opts cache)
-                               ::identity)]
-                    (swap! cache assoc k t*)
-                    t*))]
-        (if (identical? ::identity t) x (t x))))))
+    (let [ck [k (:token r)]
+          tr (:registry r)
+          opts (assoc opts :registry tr)]
+      (fn [x]
+        (let [t (or (get @cache ck)
+                    (let [t* (or (transform-node (norm/normalize (:form r) {:registry tr})
+                                                 tr chain method opts cache)
+                                 ::identity)]
+                      (swap! cache assoc ck t*)
+                      t*))]
+          (if (identical? ::identity t) x (t x)))))))
 
 (defn- transform-children
   "Per-type descent: the child part of a node's transformer, or nil when the
   subtree has no transformations."
   [node registry chain method opts cache]
   (case (:type node)
+    ;; predicate + comparator schemas are leaves too (a comparator's child is
+    ;; a plain value, never descended into)
     (:any :nil :string :int :float :double :number :boolean :keyword :symbol
-          :uuid :enum := :fn :re)
+          :uuid :time/instant :time/local-date-time :time/local-date :time/local-time :time/duration
+          :enum := :fn :re :balli/pred :> :>= :< :<= :not=)
     nil
 
-    ;; seqex types + :schema: pass-through (no per-element descent -- a seqex
-    ;; element's schema depends on the match, which transformers do not run)
-    (:cat :catn :alt :altn :? :* :+ :repeat :schema)
+    ;; seqex types: pass-through (no per-element descent -- a seqex element's
+    ;; schema depends on the match, which transformers do not run)
+    (:cat :catn :alt :altn :? :* :+ :repeat)
     nil
+
+    ;; :schema wrapper: transparent -- descend into the single child. This is
+    ;; the canonical [:schema {:registry ...} ...] self-contained idiom, so
+    ;; decode/encode must reach the wrapped schema (matches :maybe descent).
+    :schema
+    (children-in-order node registry chain method opts cache)
 
     ;; function schemas: leaf pass-through (fns are not transformed)
     (:=> :function)
@@ -342,7 +384,7 @@
     :tuple (transform-tuple node registry chain method opts cache)
     :ref (transform-ref node registry chain method opts cache)))
 
-(defn- transform-node
+(defn- transform-node*
   "Node combinator: leave(children(enter(x))), absent parts elided; whole
   subtree nil => nil (identity pass-through)."
   [node registry chain method opts cache]
@@ -351,6 +393,20 @@
     (if this-t
       (-intercepting this-t child-t)
       child-t)))
+
+(defn- transform-node
+  "Layer-aware entry: a node carrying :local-registry extends the registry
+  chain (balli.registry/push-layer) for its whole subtree AND replaces
+  :registry in the opts handed to {:compile ...} interceptors, so
+  interceptor-compiled validators (strip-extra-keys, map-of key decoding,
+  default-value ref lookups) see the same layered registry the node's own
+  compilation does."
+  [node registry chain method opts cache]
+  (if-let [local (:local-registry node)]
+    (let [registry (reg/push-layer registry local)]
+      (transform-node* node registry chain method
+                       (assoc opts :registry registry) cache))
+    (transform-node* node registry chain method opts cache)))
 
 (defn compile-transformer
   "Compile `ast` + `registry` + transformer `t` + `method` (:decode/:encode)
@@ -483,6 +539,12 @@
 
 ;; ---------------------------------------------------------------------------
 ;; Built-in coder tables
+;;
+;; Tables mix TYPE KEYWORDS and PRED-KEY SYMBOLS: :balli/pred nodes resolve
+;; through the same tables via the -value-transformer pred-key fallthrough
+;; (e.g. `pos-int?` decodes from strings exactly like :int). Coercions reuse
+;; the scalar fns above and stay LENIENT — e.g. `pos-int?` string-decodes
+;; "0" to 0, which then fails validation, matching malli.
 
 (defn- base-json-decoders []
   {:keyword -string->keyword
@@ -491,7 +553,17 @@
    :float -number->float
    :double -number->double
    :int -number->long
-   :set -sequential->set})
+   :set -sequential->set
+   'keyword? -string->keyword
+   'symbol? -string->symbol
+   'uuid? -string->uuid
+   'float? -number->float
+   'double? -number->double
+   'int? -number->long
+   'integer? -number->long
+   'pos-int? -number->long
+   'neg-int? -number->long
+   'nat-int? -number->long})
 
 (defn -string-decoders []
   (add-child-compilers
@@ -501,6 +573,15 @@
            :double -string->double
            :number -string->double
            :boolean -string->boolean
+           'int? -string->long
+           'integer? -string->long
+           'pos-int? -string->long
+           'neg-int? -string->long
+           'nat-int? -string->long
+           'float? -string->float
+           'double? -string->double
+           'number? -string->double
+           'boolean? -string->boolean
            ;; :map-of key decoding under the string transformer happens via
            ;; ordinary key-schema descent (string decoders parse strings);
            ;; this enter interceptor only stringifies keyword keys, matching
@@ -512,7 +593,20 @@
 (defn- base-json-encoders []
   {:keyword -keyword->string
    :symbol -any->string
-   :uuid -any->string})
+   :uuid -any->string
+   'keyword? -keyword->string
+   'symbol? -any->string
+   'uuid? -any->string})
+
+(defn- time-decoders []
+  (into {} (map (fn [[t spec]]
+                  [t (fn [x] (or ((:decode spec) x) x))])
+                time/types)))
+
+(defn- time-encoders []
+  (into {} (map (fn [[t spec]]
+                  [t (fn [x] ((:encode spec) x))])
+                time/types)))
 
 (defn -json-encoders []
   (add-child-compilers (base-json-encoders)))
@@ -524,7 +618,16 @@
            :float -any->string
            :double -any->string
            :number -any->string
-           ;; booleans intentionally NOT stringified (malli parity)
+           'int? -any->string
+           'integer? -any->string
+           'pos-int? -any->string
+           'neg-int? -any->string
+           'nat-int? -any->string
+           'float? -any->string
+           'double? -any->string
+           'number? -any->string
+           ;; booleans (incl. boolean?) intentionally NOT stringified
+           ;; (malli parity)
            })))
 
 (defn- transform-if-valid
@@ -546,7 +649,9 @@
    (fn [ast opts]
      (let [registry (or (:registry opts) (reg/default-registry))
            key-ast (first (:children ast))
-           f (some-> (get map-of-key-decoders (:type key-ast))
+           f (some-> (or (when (= :balli/pred (:type key-ast))
+                           (get map-of-key-decoders (:pred-key key-ast)))
+                         (get map-of-key-decoders (:type key-ast)))
                      (-interceptor key-ast opts)
                      (-intercepting))]
        (if f
@@ -586,16 +691,29 @@
      :decoders (-json-decoders map-of-key-decoders)
      :encoders (-json-encoders)})))
 
+(defn time-transformer
+  "Decode/encode :time/* schemas. Decoders are lenient: parse or type-policy
+  misses return the original value unchanged. Compose explicitly with
+  string/json transformers when desired."
+  []
+  (transformer
+   {:name :time
+    :decoders (time-decoders)
+    :encoders (time-encoders)}))
+
 (defn strip-extra-keys-transformer
   "On :map -- dissoc keys not among the declared entry keys; applies when the
-  :closed property is nil or true (NOT when explicitly {:closed false}).
+  :closed property is nil or true (NOT when explicitly {:closed false}), and
+  NEVER when the map has a :balli.core/default entry (the default entry
+  claims every undeclared key, so nothing is extra -- strip nothing).
   On :map-of -- keep only entries valid per the key AND value schemas
   (leave phase for decode, enter phase for encode, matching malli)."
   ([] (strip-extra-keys-transformer nil))
   ([{:keys [accept]
      :or {accept (fn [ast]
-                   (let [closed (:closed (:properties ast))]
-                     (or (nil? closed) (true? closed))))}}]
+                   (and (nil? (:default-entry ast))
+                        (let [closed (:closed (:properties ast))]
+                          (or (nil? closed) (true? closed)))))}}]
    (let [strip-map {:compile (fn [ast _opts]
                                (when (accept ast)
                                  (let [ks (set (map :key (:children ast)))]
