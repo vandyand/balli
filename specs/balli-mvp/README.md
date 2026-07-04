@@ -1,6 +1,6 @@
 ---
 title: "Balli MVP — Malli-inspired schemas for Basilisp"
-status: planned
+status: in-progress
 date: 2026-07-04
 priority: 10
 ---
