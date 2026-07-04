@@ -1,0 +1,255 @@
+(ns tests.test-normalize
+  "Phase 1: schema form -> AST normalization coverage for every MVP type,
+  property placement, and invalid-schema errors on garbage."
+  (:import re)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.normalize :refer [normalize]]
+            [balli.registry :as reg]))
+
+(defn- invalid-schema?
+  "True when calling `thunk` throws ex-info with :type :balli.core/invalid-schema."
+  [thunk]
+  (try
+    (thunk)
+    false
+    (catch python/Exception e
+      (= :balli.core/invalid-schema (:type (ex-data e))))))
+
+;; ---------------------------------------------------------------------------
+;; Scalars
+
+(deftest scalar-types
+  (testing "bare keyword scalars"
+    (doseq [t [:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid]]
+      (is (= {:type t :properties {} :children [] :form t}
+             (normalize t {})))))
+  (testing "scalar with properties"
+    (is (= {:type :string :properties {:min 1 :max 10} :children [] :form [:string {:min 1 :max 10}]}
+           (normalize [:string {:min 1 :max 10}] {})))
+    (is (= {:type :int :properties {:min 0} :children [] :form [:int {:min 0}]}
+           (normalize [:int {:min 0}] {}))))
+  (testing "scalar garbage"
+    (is (invalid-schema? #(normalize [:string 5] {})))
+    (is (invalid-schema? #(normalize [:string {:min 1} :junk] {})))
+    (is (invalid-schema? #(normalize [:int {:min 0} {:max 1}] {})))))
+
+;; ---------------------------------------------------------------------------
+;; :enum / :=
+
+(deftest enum-schemas
+  (is (= {:type :enum :properties {} :children ["A" "B"] :form [:enum "A" "B"]}
+         (normalize [:enum "A" "B"] {})))
+  (is (= {:type :enum :properties {:doc "d"} :children [:a :b] :form [:enum {:doc "d"} :a :b]}
+         (normalize [:enum {:doc "d"} :a :b] {})))
+  (testing "a lone map is a literal child, not props"
+    (let [ast (normalize [:enum {:a 1}] {})]
+      (is (= [{:a 1}] (:children ast)))
+      (is (= {} (:properties ast)))))
+  (testing "leading map with further children is props"
+    (let [ast (normalize [:enum {:doc "d"} {:a 1}] {})]
+      (is (= {:doc "d"} (:properties ast)))
+      (is (= [{:a 1}] (:children ast)))))
+  (is (invalid-schema? #(normalize [:enum] {})))
+  (is (invalid-schema? #(normalize :enum {}))))
+
+(deftest eq-schemas
+  (is (= {:type := :properties {} :children [5] :form [:= 5]}
+         (normalize [:= 5] {})))
+  (is (= {:type := :properties {:doc "d"} :children [:dm] :form [:= {:doc "d"} :dm]}
+         (normalize [:= {:doc "d"} :dm] {})))
+  (testing "a lone map is the literal value, not props"
+    (is (= [{:a 1}] (:children (normalize [:= {:a 1}] {})))))
+  (is (invalid-schema? #(normalize [:=] {})))
+  (is (invalid-schema? #(normalize [:= 1 2] {})))
+  (is (invalid-schema? #(normalize := {}))))
+
+;; ---------------------------------------------------------------------------
+;; Single-child: :maybe :not :vector :sequential :set
+
+(deftest single-child-types
+  (doseq [t [:maybe :not :vector :sequential :set]]
+    (testing (str t)
+      (is (= {:type t :properties {}
+              :children [{:type :int :properties {} :children [] :form :int}]
+              :form [t :int]}
+             (normalize [t :int] {})))
+      (is (= {:min 1} (:properties (normalize [t {:min 1} :int] {}))))
+      (is (invalid-schema? #(normalize [t] {})))
+      (is (invalid-schema? #(normalize [t :int :string] {})))
+      (is (invalid-schema? #(normalize t {}))))))
+
+;; ---------------------------------------------------------------------------
+;; N-child: :and :or :tuple
+
+(deftest n-child-types
+  (is (= {:type :or :properties {}
+          :children [{:type :int :properties {} :children [] :form :int}
+                     {:type :string :properties {} :children [] :form :string}]
+          :form [:or :int :string]}
+         (normalize [:or :int :string] {})))
+  (is (= 3 (count (:children (normalize [:and :int :int :int] {})))))
+  (is (= {:doc "d"} (:properties (normalize [:or {:doc "d"} :int :string] {}))))
+  (is (= [:string :int] (mapv :type (:children (normalize [:tuple :string :int] {})))))
+  (testing "empty tuple allowed, empty :and/:or not"
+    (is (= [] (:children (normalize [:tuple] {}))))
+    (is (invalid-schema? #(normalize [:and] {})))
+    (is (invalid-schema? #(normalize [:or] {}))))
+  (is (invalid-schema? #(normalize :and {})))
+  (is (invalid-schema? #(normalize :or {}))))
+
+;; ---------------------------------------------------------------------------
+;; :map
+
+(deftest map-schemas
+  (is (= {:type :map :properties {}
+          :children [{:key :id :properties {}
+                      :schema {:type :string :properties {} :children [] :form :string}}
+                     {:key :age :properties {:optional true}
+                      :schema {:type :int :properties {} :children [] :form :int}}]
+          :form [:map [:id :string] [:age {:optional true} :int]]}
+         (normalize [:map [:id :string] [:age {:optional true} :int]] {})))
+  (testing "map-level properties"
+    (let [ast (normalize [:map {:closed true} [:id :string]] {})]
+      (is (= {:closed true} (:properties ast)))
+      (is (= [:id] (mapv :key (:children ast))))))
+  (testing "bare :map and props-only :map"
+    (is (= {:type :map :properties {} :children [] :form :map}
+           (normalize :map {})))
+    (let [ast (normalize [:map {:closed true}] {})]
+      (is (= {:closed true} (:properties ast)))
+      (is (= [] (:children ast)))))
+  (testing "nested map entry schemas"
+    (let [ast (normalize [:map [:addr [:map [:zip :string]]]] {})]
+      (is (= :map (:type (:schema (first (:children ast))))))))
+  (testing "garbage entries"
+    (is (invalid-schema? #(normalize [:map :not-an-entry] {})))
+    (is (invalid-schema? #(normalize [:map [:id 5 :string]] {})))
+    (is (invalid-schema? #(normalize [:map [:only-key]] {})))
+    (is (invalid-schema? #(normalize [:map [:k {:optional true} :int :extra]] {})))))
+
+;; ---------------------------------------------------------------------------
+;; :map-of
+
+(deftest map-of-schemas
+  (let [ast (normalize [:map-of :keyword :int] {})]
+    (is (= :map-of (:type ast)))
+    (is (= {} (:properties ast)))
+    (is (= [:keyword :int] (mapv :type (:children ast)))))
+  (is (= {:min 1} (:properties (normalize [:map-of {:min 1} :keyword :int] {}))))
+  (is (invalid-schema? #(normalize [:map-of :int] {})))
+  (is (invalid-schema? #(normalize [:map-of :keyword :int :string] {})))
+  (is (invalid-schema? #(normalize :map-of {}))))
+
+;; ---------------------------------------------------------------------------
+;; :fn
+
+(deftest fn-schemas
+  (let [ast (normalize [:fn pos?] {})]
+    (is (= :fn (:type ast)))
+    (is (= {} (:properties ast)))
+    (is (identical? pos? (first (:children ast)))))
+  (let [ast (normalize [:fn {:error/message "must be even"} even?] {})]
+    (is (= {:error/message "must be even"} (:properties ast)))
+    (is (identical? even? (first (:children ast)))))
+  (is (invalid-schema? #(normalize [:fn "not-callable"] {})))
+  (is (invalid-schema? #(normalize [:fn] {})))
+  (is (invalid-schema? #(normalize [:fn pos? even?] {})))
+  (is (invalid-schema? #(normalize :fn {}))))
+
+;; ---------------------------------------------------------------------------
+;; :re
+
+(deftest re-schemas
+  (testing "regex pattern literal child"
+    (let [ast (normalize [:re #"a+"] {})]
+      (is (= :re (:type ast)))
+      (is (instance? re/Pattern (first (:children ast))))
+      (is (= "a+" (.-pattern (first (:children ast)))))))
+  (testing "string child compiled via re-pattern"
+    (let [ast (normalize [:re "b+"] {})]
+      (is (instance? re/Pattern (first (:children ast))))
+      (is (= "b+" (.-pattern (first (:children ast)))))))
+  (testing "props map with pattern"
+    (let [ast (normalize [:re {:error/message "bad"} "x"] {})]
+      (is (= {:error/message "bad"} (:properties ast)))
+      (is (instance? re/Pattern (first (:children ast))))))
+  (is (invalid-schema? #(normalize [:re 5] {})))
+  (is (invalid-schema? #(normalize [:re] {})))
+  (is (invalid-schema? #(normalize [:re "a" "b"] {})))
+  (is (invalid-schema? #(normalize :re {}))))
+
+;; ---------------------------------------------------------------------------
+;; :multi
+
+(deftest multi-schemas
+  (let [ast (normalize [:multi {:dispatch :kind}
+                        [:dm [:map [:kind [:= :dm]] [:text :string]]]
+                        [:ping :map]]
+                       {})]
+    (is (= :multi (:type ast)))
+    (is (= {:dispatch :kind} (:properties ast)))
+    (is (= [:dm :ping] (mapv :key (:children ast))))
+    (is (= :map (:type (:schema (first (:children ast))))))
+    (is (= :map (:type (:schema (second (:children ast)))))))
+  (testing "entry props supported like map entries"
+    (let [ast (normalize [:multi {:dispatch :kind} [:a {:doc "d"} :string]] {})]
+      (is (= {:doc "d"} (:properties (first (:children ast)))))))
+  (testing "fn dispatch allowed"
+    (is (= :multi (:type (normalize [:multi {:dispatch first} [:a :string]] {})))))
+  (is (invalid-schema? #(normalize [:multi [:a :string]] {})))
+  (is (invalid-schema? #(normalize [:multi {:no-dispatch 1} [:a :string]] {})))
+  (is (invalid-schema? #(normalize :multi {}))))
+
+;; ---------------------------------------------------------------------------
+;; :ref + registered keywords
+
+(deftest ref-schemas
+  (is (= {:type :ref :ref :user/id :properties {} :children [] :form [:ref :user/id]}
+         (normalize [:ref :user/id] {})))
+  (testing "[:ref kw] does NOT require the kw to resolve at normalize time"
+    (is (= :nope/nothing (:ref (normalize [:ref :nope/nothing] {})))))
+  (is (invalid-schema? #(normalize [:ref] {})))
+  (is (invalid-schema? #(normalize [:ref "not-a-kw"] {})))
+  (is (invalid-schema? #(normalize [:ref :a :b] {})))
+  (is (invalid-schema? #(normalize :ref {}))))
+
+(deftest registered-keywords
+  (let [r (reg/registry {:user/id [:string {:min 1}]})]
+    (testing "registered keyword normalizes to a ref"
+      (is (= {:type :ref :ref :user/id :properties {} :children [] :form :user/id}
+             (normalize :user/id {:registry r}))))
+    (testing "registered keywords work nested inside other schemas"
+      (let [ast (normalize [:map [:id :user/id]] {:registry r})]
+        (is (= :ref (:type (:schema (first (:children ast))))))
+        (is (= :user/id (:ref (:schema (first (:children ast))))))))
+    (testing "unregistered bare keyword throws"
+      (is (invalid-schema? #(normalize :user/nope {:registry r})))
+      (is (invalid-schema? #(normalize :user/id {}))))))
+
+;; ---------------------------------------------------------------------------
+;; Registry basics
+
+(deftest registry-basics
+  (is (contains? reg/builtin-types :map))
+  (is (contains? reg/builtin-types :=))
+  (is (= 27 (count reg/builtin-types)))
+  (is (= {} (:schemas (reg/default-registry))))
+  (is (= reg/builtin-types (:types (reg/default-registry))))
+  (let [r (reg/registry {:user/id :string} {:user/age :int})]
+    (is (= :string (reg/resolve-ref r :user/id)))
+    (is (= :int (reg/resolve-ref r :user/age)))
+    (is (nil? (reg/resolve-ref r :user/nope)))
+    (is (= reg/builtin-types (:types r)))))
+
+;; ---------------------------------------------------------------------------
+;; Garbage forms
+
+(deftest garbage-forms
+  (doseq [g [42 "x" nil [] [1 2] {:a 1} :unknown-type [:unknown-type 1] (quote sym)]]
+    (testing (pr-str g)
+      (is (invalid-schema? #(normalize g {})))))
+  (testing "ex-info carries the offending form"
+    (let [data (try (normalize [:unknown-type 1] {})
+                    (catch python/Exception e (ex-data e)))]
+      (is (= :balli.core/invalid-schema (:type data)))
+      (is (= [:unknown-type 1] (:form data))))))

@@ -1,0 +1,28 @@
+(ns balli.registry
+  "Builtin type table, custom registries, and ref resolution for balli.
+
+  A registry is a plain map {:types #{...builtin type keywords...}
+                             :schemas {qualified-kw schema-form}}.")
+
+(def builtin-types
+  "The set of schema type keywords balli supports natively."
+  #{:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid
+    :map :map-of :vector :sequential :set :tuple :enum := :maybe :and :or :not
+    :fn :multi :re :ref})
+
+(defn default-registry
+  "Returns the default registry: builtin types, no custom schemas."
+  []
+  {:types builtin-types :schemas {}})
+
+(defn registry
+  "Layer custom {keyword schema-form} maps over the default registry's
+  :schemas. With no args, returns the default registry."
+  [& schema-maps]
+  (update (default-registry) :schemas #(apply merge % schema-maps)))
+
+(defn resolve-ref
+  "Look up a registered schema form by keyword in registry `reg`.
+  Returns nil when the keyword is not registered."
+  [reg k]
+  (get (:schemas reg) k))
