@@ -41,7 +41,7 @@ See [research.md](research.md) and the [implementation plan](implementation-plan
 ## Implementation Status
 
 - [x] Phase 0: Substrate spike (defrecord, random, driver-loop viability)
-- [ ] Phase 1: Transformers (balli.transform + core decode/encode/coerce)
+- [x] Phase 1: Transformers (balli.transform + core decode/encode/coerce)
 - [ ] Phase 2: Walk + util + per-branch :or explain
 - [ ] Phase 3: JSON Schema export
 - [ ] Phase 4: Key spell-checking
