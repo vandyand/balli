@@ -453,7 +453,8 @@
   plain values, refs are not entered). f receives the node's original form
   fragment."
   #{:any :nil :string :int :float :double :number :boolean :keyword :symbol
-    :uuid :enum := :fn :re :ref :balli/pred :> :>= :< :<= :not=})
+    :uuid :time/instant :time/local-date-time :time/local-date :time/local-time :time/duration
+    :enum := :fn :re :ref :balli/pred :> :>= :< :<= :not=})
 
 (defn- walk-ast
   "Postwalk AST `node` at `path`, rebuilding the form bottom-up and calling

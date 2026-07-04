@@ -21,7 +21,8 @@
   Entry point: (normalize form opts) where opts may carry {:registry r}.
   Unknown/invalid forms throw ex-info with {:type :balli.core/invalid-schema}."
   (:import re)
-  (:require [balli.registry :as reg]))
+  (:require [balli.registry :as reg]
+            [balli.time :as bt]))
 
 (defn- invalid!
   [msg form]
@@ -137,6 +138,9 @@
   validate time (string length, numeric value, collection count)."
   #{:string :int :float :double :number :vector :sequential :set :map-of})
 
+(def ^:private time-types
+  (set (keys bt/types)))
+
 (defn- check-bounds!
   "Reject non-numeric :min/:max at the schema boundary so validators never
   raise host comparison errors on garbage bounds."
@@ -147,9 +151,25 @@
         (when (and (some? v) (not (or (int? v) (float? v))))
           (invalid! (str type " " k " must be a number") form))))))
 
+(defn- check-time-bounds!
+  [type props form]
+  (when (contains? time-types type)
+    (let [check (:check (bt/type-spec type))]
+      (doseq [k [:min :max]]
+        (let [v (get props k)]
+          (when (and (some? v) (not (check v)))
+            (invalid! (str type " " k " must be a matching time value") form))))
+      (when (and (some? (:min props)) (some? (:max props)))
+        (try
+          (when (> (:min props) (:max props))
+            (invalid! (str type " :min must be <= :max") form))
+          (catch python/Exception _
+            (invalid! (str type " :min/:max are not comparable") form)))))))
+
 (defn- node
   [type props children form]
   (check-bounds! type (or props {}) form)
+  (check-time-bounds! type (or props {}) form)
   {:type type :properties (or props {}) :children (vec children) :form form})
 
 (defn- split-props
@@ -216,6 +236,11 @@
 (defmethod normalize* :keyword [form opts] (normalize-scalar form opts))
 (defmethod normalize* :symbol [form opts] (normalize-scalar form opts))
 (defmethod normalize* :uuid [form opts] (normalize-scalar form opts))
+(defmethod normalize* :time/instant [form opts] (normalize-scalar form opts))
+(defmethod normalize* :time/local-date-time [form opts] (normalize-scalar form opts))
+(defmethod normalize* :time/local-date [form opts] (normalize-scalar form opts))
+(defmethod normalize* :time/local-time [form opts] (normalize-scalar form opts))
+(defmethod normalize* :time/duration [form opts] (normalize-scalar form opts))
 
 ;; ---------------------------------------------------------------------------
 ;; Literal-value schemas: :enum / :=
@@ -642,7 +667,8 @@
 
 (def ^:private scalar-types
   "Types whose vector form is [t] or [t props] (the normalize-scalar users)."
-  #{:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid})
+  #{:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid
+    :time/instant :time/local-date-time :time/local-date :time/local-time :time/duration})
 
 (defn- form-props
   "The properties map of vector-form `form`, or nil — replicating the

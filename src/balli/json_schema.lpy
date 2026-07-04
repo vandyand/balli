@@ -92,8 +92,7 @@
 (def ^:private pred-json-schemas
   "pred-key symbol -> JSON Schema fragment for :balli/pred nodes. Anything
   absent exports as the lossy {} (any? some? pos? neg? zero? associative?
-  fn? ifn? empty? — and inst?, which Phase 5 upgrades alongside the time
-  types)."
+  fn? ifn? empty?)."
   {'int? {"type" "integer"}
    'integer? {"type" "integer"}
    'pos-int? {"type" "integer" "minimum" 1}
@@ -113,6 +112,7 @@
    'qualified-symbol? {"type" "string"}
    'ident? {"type" "string"}
    'uuid? {"type" "string" "format" "uuid"}
+   'inst? {"type" "string" "format" "date-time"}
    'nil? {"type" "null"}
    'false? {"const" false}
    'true? {"const" true}
@@ -242,6 +242,10 @@
       :boolean {"type" "boolean"}
       (:keyword :symbol) {"type" "string"}
       :uuid {"type" "string" "format" "uuid"}
+      (:time/instant :time/local-date-time) {"type" "string" "format" "date-time"}
+      :time/local-date {"type" "string" "format" "date"}
+      :time/local-time {"type" "string" "format" "time"}
+      :time/duration {"type" "string" "format" "duration"}
       := {"const" (render-value (first children))}
       :enum (let [t (infer-enum-type children)]
               (cond-> {"enum" (mapv render-value children)}

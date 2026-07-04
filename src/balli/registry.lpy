@@ -34,6 +34,7 @@
   FORMS a predicate schema is the fn/symbol itself (see balli.normalize's
   pred table)."
   #{:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid
+    :time/instant :time/local-date-time :time/local-date :time/local-time :time/duration
     :map :map-of :vector :sequential :set :tuple :enum := :maybe :and :or :orn
     :not :fn :multi :re :ref
     :> :>= :< :<= :not=

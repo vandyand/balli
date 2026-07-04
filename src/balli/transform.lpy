@@ -26,7 +26,8 @@
   (:import uuid)
   (:require [balli.compile :as c]
             [balli.normalize :as norm]
-            [balli.registry :as reg]))
+            [balli.registry :as reg]
+            [balli.time :as time]))
 
 ;; ---------------------------------------------------------------------------
 ;; Transformer construction
@@ -352,7 +353,8 @@
     ;; predicate + comparator schemas are leaves too (a comparator's child is
     ;; a plain value, never descended into)
     (:any :nil :string :int :float :double :number :boolean :keyword :symbol
-          :uuid :enum := :fn :re :balli/pred :> :>= :< :<= :not=)
+          :uuid :time/instant :time/local-date-time :time/local-date :time/local-time :time/duration
+          :enum := :fn :re :balli/pred :> :>= :< :<= :not=)
     nil
 
     ;; seqex types: pass-through (no per-element descent -- a seqex element's
@@ -596,6 +598,16 @@
    'symbol? -any->string
    'uuid? -any->string})
 
+(defn- time-decoders []
+  (into {} (map (fn [[t spec]]
+                  [t (fn [x] (or ((:decode spec) x) x))])
+                time/types)))
+
+(defn- time-encoders []
+  (into {} (map (fn [[t spec]]
+                  [t (fn [x] ((:encode spec) x))])
+                time/types)))
+
 (defn -json-encoders []
   (add-child-compilers (base-json-encoders)))
 
@@ -678,6 +690,16 @@
     {:name :json
      :decoders (-json-decoders map-of-key-decoders)
      :encoders (-json-encoders)})))
+
+(defn time-transformer
+  "Decode/encode :time/* schemas. Decoders are lenient: parse or type-policy
+  misses return the original value unchanged. Compose explicitly with
+  string/json transformers when desired."
+  []
+  (transformer
+   {:name :time
+    :decoders (time-decoders)
+    :encoders (time-encoders)}))
 
 (defn strip-extra-keys-transformer
   "On :map -- dissoc keys not among the declared entry keys; applies when the

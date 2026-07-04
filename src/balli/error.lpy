@@ -20,6 +20,7 @@
   (levenshtein distance vs the declared keys) and drops the missing-key
   errors those typos explain."
   (:require [balli.normalize :as norm]
+            [balli.time :as bt]
             [basilisp.string :as str]))
 
 ;; ---------------------------------------------------------------------------
@@ -59,6 +60,11 @@
    :keyword "should be a keyword"
    :symbol "should be a symbol"
    :uuid "should be a uuid"
+   :time/instant "should be an instant"
+   :time/local-date-time "should be a date-time"
+   :time/local-date "should be a date"
+   :time/local-time "should be a time"
+   :time/duration "should be a duration"
    :map "should be a map"
    :map-of "should be a map"
    :vector "should be a vector"
@@ -72,6 +78,7 @@
 
 (def ^:private numeric-types #{:int :float :double :number})
 (def ^:private counted-types #{:vector :sequential :set :map-of})
+(def ^:private time-types (set (keys bt/types)))
 
 (def ^:private comparator-message-prefixes
   "Humanize wording for comparator schema failures; the comparator's child
@@ -147,6 +154,14 @@
         mn (str "should have at least " mn " elements")
         mx (str "should have at most " mx " elements")
         :else "invalid value")
+
+      (contains? time-types t)
+      (let [fmt (:encode (bt/type-spec t))]
+        (cond
+          (and mn mx) (str "should be between " (fmt mn) " and " (fmt mx))
+          mn (str "should be at least " (fmt mn))
+          mx (str "should be at most " (fmt mx))
+          :else "invalid value"))
 
       :else "invalid value")))
 

@@ -64,11 +64,12 @@
   collection/seqex rep counts collapse to their minimum (0 unless :min/:+
   says otherwise) -- so recursion hidden behind optional keys or 0-min
   collections terminates by omission before the ref escape is ever needed."
-  (:import math random uuid)
+  (:import datetime math random uuid)
   (:require [balli.compile :as c]
             [balli.core :as b]
             [balli.normalize :as norm]
-            [balli.registry :as reg]))
+            [balli.registry :as reg]
+            [balli.time :as bt]))
 
 (declare gen)
 
@@ -166,6 +167,31 @@
     1 (gen-int {} rnd size)
     2 (rand-str rnd (.randint rnd 0 (quot size 3)) alnum-chars)
     3 (zero? (.randint rnd 0 1))))
+
+(defn- time-bounds
+  [ast]
+  (let [props (:properties ast)
+        [lo hi] (:gen-default (bt/type-spec (:type ast)))]
+    [(or (:min props) lo) (or (:max props) hi)]))
+
+(defn- gen-time
+  [ast rnd]
+  (let [[lo hi] (time-bounds ast)]
+    (case (:type ast)
+      (:time/instant :time/local-date-time)
+      (+ lo (datetime/timedelta ** :seconds (.uniform rnd 0.0 (.total_seconds (- hi lo)))))
+
+      :time/local-date
+      (datetime.date/fromordinal (.randint rnd (.toordinal lo) (.toordinal hi)))
+
+      :time/local-time
+      (let [start (datetime/datetime 2000 1 1 (.-hour lo) (.-minute lo) (.-second lo) (.-microsecond lo))
+            end (datetime/datetime 2000 1 1 (.-hour hi) (.-minute hi) (.-second hi) (.-microsecond hi))
+            v (+ start (datetime/timedelta ** :seconds (.uniform rnd 0.0 (.total_seconds (- end start)))))]
+        (.time v))
+
+      :time/duration
+      (datetime/timedelta ** :seconds (.uniform rnd (.total_seconds lo) (.total_seconds hi))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Composite strategies
@@ -306,8 +332,7 @@
   (vectors fail seq?/list?) — see gen-pred. Absent keys throw
   :balli.core/no-generator unless a :gen/* hook is present: some? ident?
   qualified-keyword? qualified-symbol? associative? fn? ifn? empty? — and
-  inst?, which is intentionally UNMAPPABLE this phase (Phase 5 upgrade hook:
-  point 'inst? at :time/instant once balli.time lands)."
+  inst? maps to :time/instant once balli.time lands."
   {'any? :any
    'number? :number
    'integer? :int
@@ -327,6 +352,7 @@
    'symbol? :symbol
    'simple-symbol? :symbol
    'uuid? :uuid
+   'inst? :time/instant
    'nil? :nil
    'false? [:= false]
    'true? [:= true]
@@ -404,6 +430,8 @@
       ;; seeded determinism: random-uuid ignores our Random, so build the
       ;; uuid from 32 rnd-drawn hex digits instead.
       :uuid (uuid/UUID (rand-str rnd 32 hex-chars))
+      (:time/instant :time/local-date-time :time/local-date :time/local-time :time/duration)
+      (gen-time ast rnd)
       :enum (.choice rnd (:children ast))
       := (first (:children ast))
       :maybe (if (or reduced? (< (.random rnd) 0.2))

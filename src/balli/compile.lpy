@@ -20,7 +20,8 @@
   compile-ref)."
   (:require [balli.normalize :as norm]
             [balli.regex :as rx]
-            [balli.registry :as reg]))
+            [balli.registry :as reg]
+            [balli.time :as bt]))
 
 (declare compile-node explain-node)
 
@@ -58,6 +59,13 @@
 (defn- number-value?
   [x]
   (or (int? x) (float? x)))
+
+(defn- bounds-valid?
+  [x props]
+  (try
+    (and (or (nil? (:min props)) (<= (:min props) x))
+         (or (nil? (:max props)) (<= x (:max props))))
+    (catch python/Exception _ false)))
 
 (defn- layered
   "Registry for descending into `node`: its :local-registry (when present)
@@ -99,7 +107,10 @@
     :boolean boolean?
     :keyword keyword?
     :symbol symbol?
-    :uuid uuid?))
+    :uuid uuid?
+    (:time/instant :time/local-date-time :time/local-date :time/local-time :time/duration)
+    (let [check (:check (bt/type-spec type))]
+      (fn [x] (and (check x) (bounds-valid? x properties))))))
 
 (defn- compile-coll
   "Validator for a homogeneous collection: `coll-pred` on the whole value,
@@ -304,7 +315,8 @@
 (defn- compile-node*
   [node registry cache]
   (case (:type node)
-    (:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid)
+    (:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid
+          :time/instant :time/local-date-time :time/local-date :time/local-time :time/duration)
     (compile-scalar node)
 
     :enum
@@ -464,7 +476,9 @@
             :boolean [boolean? nil]
             :keyword [keyword? nil]
             :symbol [symbol? nil]
-            :uuid [uuid? nil])
+            :uuid [uuid? nil]
+            (:time/instant :time/local-date-time :time/local-date :time/local-time :time/duration)
+            [(:check (bt/type-spec type)) identity])
           mn (:min properties)
           mx (:max properties)]
       (fn [x path in]
@@ -473,8 +487,7 @@
           [(err path in form x :balli.core/invalid-type)]
 
           (and measure
-               (or (and mn (< (measure x) mn))
-                   (and mx (> (measure x) mx))))
+               (not (bounds-valid? (measure x) properties)))
           [(err path in form x :balli.core/limits)]
 
           :else [])))))
@@ -664,7 +677,8 @@
 (defn- explain-node*
   [node registry cache]
   (case (:type node)
-    (:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid)
+    (:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid
+          :time/instant :time/local-date-time :time/local-date :time/local-time :time/duration)
     (explain-scalar node)
 
     :enum
@@ -1184,7 +1198,8 @@
     ;; are a validate/explain concern only, never part of parse. Predicate
     ;; (:balli/pred) and comparator schemas are leaves too.
     (:any :nil :string :int :float :double :number :boolean :keyword :symbol
-          :uuid :enum := :fn :re :not :=> :function
+          :uuid :time/instant :time/local-date-time :time/local-date :time/local-time :time/duration
+          :enum := :fn :re :not :=> :function
           :balli/pred :> :>= :< :<= :not=)
     (let [valid? (compile-node node registry (atom {}))]
       (fn [x] (if (valid? x) x -invalid)))

@@ -92,13 +92,13 @@ Seven phases: spike → predicates/comparators → mutable registry → local re
 
 ## Phase 5: balli.time (§3)
 
-- [ ] `src/balli/time.lpy` is a LEAF namespace (adversary P1 — no requires on balli.transform/compile/core, avoiding the cycle compile→time→transform→compile): pure type table `{:time/instant {:check <fn> :decode <fn> :encode <fn> :gen-default [lo hi]} ...}` for the 5 types + ISO-duration regex parser/formatter (per spike findings, incl. negative + fractional). `time-transformer` (name `:time`) lives in **balli.transform** (which may require balli.time; transform→time is acyclic), re-exported or documented as `(bt/time-transformer)`
-- [ ] normalize/registry: `:time/*` as builtin scalar-style types (bare kw or `[kw props]`; `:min`/`:max` must be instances of the type — boundary-checked, overriding the numeric-bounds check for these types)
-- [ ] compile: validate via `:check` + inclusive min/max via native comparison; explain `:balli.core/invalid-type` / `:balli.core/limits`
-- [ ] error: humanize messages ("should be an instant"/"a date"/"a time"/"a date-time"/"a duration"; limits with ISO-rendered bounds)
-- [ ] generator: uniform between min/max or table defaults, seeded
-- [ ] json-schema: string + format per §3
-- [ ] `tests/test_time.lpy`: each type validate happy/sad (incl. aware-vs-naive both directions, date-vs-datetime exclusion), min/max bounds, decode/encode round-trips (string→value→string), duration parser matrix (`PT15M`, `P1DT2H3M4.5S`, `P2W`, `-PT5S`, garbage → unchanged), garbage `:min` → invalid-schema, generator validity + determinism, json-schema formats, **composition: `[:map [:created :time/instant] [:ttl :time/duration]]` json-decode from strings via `(bt/transformer (bt/json-transformer) (bt/time-transformer))` then validate; schema object through generate**
+- [x] `src/balli/time.lpy` is a LEAF namespace (adversary P1 — no requires on balli.transform/compile/core, avoiding the cycle compile→time→transform→compile): pure type table `{:time/instant {:check <fn> :decode <fn> :encode <fn> :gen-default [lo hi]} ...}` for the 5 types + ISO-duration regex parser/formatter (per spike findings, incl. negative + fractional). `time-transformer` (name `:time`) lives in **balli.transform** (which may require balli.time; transform→time is acyclic), re-exported or documented as `(bt/time-transformer)`
+- [x] normalize/registry: `:time/*` as builtin scalar-style types (bare kw or `[kw props]`; `:min`/`:max` must be instances of the type — boundary-checked, overriding the numeric-bounds check for these types)
+- [x] compile: validate via `:check` + inclusive min/max via native comparison; explain `:balli.core/invalid-type` / `:balli.core/limits`
+- [x] error: humanize messages ("should be an instant"/"a date"/"a time"/"a date-time"/"a duration"; limits with ISO-rendered bounds)
+- [x] generator: uniform between min/max or table defaults, seeded
+- [x] json-schema: string + format per §3
+- [x] `tests/test_time.lpy`: each type validate happy/sad (incl. aware-vs-naive both directions, date-vs-datetime exclusion), min/max bounds, decode/encode round-trips (string→value→string), duration parser matrix (`PT15M`, `P1DT2H3M4.5S`, `P2W`, `-PT5S`, garbage → unchanged), garbage `:min` → invalid-schema, generator validity + determinism, json-schema formats, **composition: `[:map [:created :time/instant] [:ttl :time/duration]]` json-decode from strings via `(bt/transformer (bt/json-transformer) (bt/time-transformer))` then validate; schema object through generate**
 
 **Checkpoints:**
 - `(b/validate :time/instant (datetime/datetime 2024 1 1 ** :tzinfo datetime/timezone.utc))`-style → `true`; naive datetime → `false`

@@ -327,7 +327,7 @@
 (def mapped-gen-preds
   ['any? 'number? 'integer? 'int? 'pos-int? 'neg-int? 'nat-int? 'pos? 'neg?
    'float? 'double? 'boolean? 'string? 'char? 'keyword? 'simple-keyword?
-   'symbol? 'simple-symbol? 'uuid? 'nil? 'false? 'true? 'zero? 'coll?
+   'symbol? 'simple-symbol? 'uuid? 'inst? 'nil? 'false? 'true? 'zero? 'coll?
    'vector? 'sequential? 'seqable? 'indexed? 'seq? 'list? 'map? 'set?])
 
 (deftest generator-mapped-preds-validity
@@ -338,11 +338,11 @@
         (is (true? (b/validate sym v)))))))
 
 (deftest generator-unmappable-preds
-  (doseq [sym ['some? 'ident? 'qualified-keyword? 'qualified-symbol? 'inst?
+  (doseq [sym ['some? 'ident? 'qualified-keyword? 'qualified-symbol?
                'associative? 'fn? 'ifn? 'empty?]]
     (testing (str sym)
       (is (= :balli.core/no-generator (ex-type #(bg/generate sym {:seed 1}))))))
-  (testing "inst? is no-generator THIS phase; :gen/return unblocks it"
+  (testing ":gen/return still overrides mapped inst?"
     (is (= aware-dt (bg/generate [inst? {:gen/return aware-dt}] {:seed 1})))))
 
 (deftest generator-comparators
@@ -382,8 +382,9 @@
   (is (= {"type" "object"} (js/transform map?)))
   (testing "unmapped preds export lossy {}"
     (is (= {} (js/transform some?)))
-    (is (= {} (js/transform fn?)))
-    (is (= {} (js/transform 'inst?))))
+    (is (= {} (js/transform fn?))))
+  (testing "inst? upgrades to date-time once balli.time lands"
+    (is (= {"type" "string" "format" "date-time"} (js/transform 'inst?))))
   (testing "props still merge"
     (is (= {"type" "integer" "title" "n"} (js/transform [int? {:title "n"}])))))
 
