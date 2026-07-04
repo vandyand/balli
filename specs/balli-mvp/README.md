@@ -55,6 +55,6 @@ See [research.md](research.md) for codebase context and REPL findings, and the [
 - [x] Phase 1: Normalize + builtin registry (form → AST)
 - [x] Phase 2: Validator compiler + public core API
 - [x] Phase 3: Explainer + explain data + assert-valid
-- [ ] Phase 4: Humanize
+- [x] Phase 4: Humanize
 - [ ] Phase 5: Custom registries, :ref, recursion, caching
 - [ ] Phase 6: Docs, compile-check, packaging polish

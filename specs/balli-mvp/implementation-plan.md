@@ -114,10 +114,10 @@ Goal: Malli-shaped explain data with correct `:path`/`:in` for every type.
 
 Goal: `balli.error/humanize` turns explain maps into human-readable structures mirroring the value shape.
 
-- [ ] `src/balli/error.lpy`: default message table keyed by error `:type` (with min/max interpolation, e.g. "should be at least 3 characters" for string `:limits`, "should be at least 1" for int); `:error/message` property on the failing schema overrides; unknown type → "invalid value"
-- [ ] `humanize [explain-map]`: nil → nil; assemble nested output following each error's `:in` — map keys → nested maps, indices → sparse vectors (Malli semantics: `{:a ["error"]}`, `[nil ["error"]]`); root-level errors → flat vector of messages
-- [ ] Multiple errors at same `:in` accumulate into one vector
-- [ ] `tests/test_error.lpy`: root scalar failure, nested map, vector index, `:error/message` override, missing-key message "missing required key"
+- [x] `src/balli/error.lpy`: default message table keyed by error `:type` (with min/max interpolation, e.g. "should be at least 3 characters" for string `:limits`, "should be at least 1" for int); `:error/message` property on the failing schema overrides; unknown type → "invalid value" (commit: 166c52a)
+- [x] `humanize [explain-map]`: nil → nil; assemble nested output following each error's `:in` — map keys → nested maps, indices → sparse vectors (Malli semantics: `{:a ["error"]}`, `[nil ["error"]]`); root-level errors → flat vector of messages (commit: 166c52a)
+- [x] Multiple errors at same `:in` accumulate into one vector (commit: 166c52a)
+- [x] `tests/test_error.lpy`: root scalar failure, nested map, vector index, `:error/message` override, missing-key message "missing required key" (commit: 166c52a)
 
 **Checkpoints:**
 - `(be/humanize (b/explain [:string {:min 3}] "ab"))` → `["should be at least 3 characters"]`
