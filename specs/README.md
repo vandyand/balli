@@ -1,8 +1,8 @@
 # Specifications
 
-*Auto-generated on 2026-07-04 03:06*
+*Auto-generated on 2026-07-04 03:14*
 
-## Planned
+## In Progress
 
 - [Balli Post-MVP — close the Malli feature gap](balli-post-mvp/README.md)
 

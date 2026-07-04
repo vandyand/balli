@@ -1,6 +1,6 @@
 ---
 title: "Balli Post-MVP — close the Malli feature gap"
-status: planned
+status: in-progress
 date: 2026-07-04
 priority: 10
 ---
