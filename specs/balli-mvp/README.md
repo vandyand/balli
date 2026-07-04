@@ -1,6 +1,6 @@
 ---
 title: "Balli MVP — Malli-inspired schemas for Basilisp"
-status: in-progress
+status: completed
 date: 2026-07-04
 priority: 10
 ---
@@ -57,4 +57,4 @@ See [research.md](research.md) for codebase context and REPL findings, and the [
 - [x] Phase 3: Explainer + explain data + assert-valid
 - [x] Phase 4: Humanize
 - [x] Phase 5: Custom registries, :ref, recursion, caching
-- [ ] Phase 6: Docs, compile-check, packaging polish
+- [x] Phase 6: Docs, compile-check, packaging polish

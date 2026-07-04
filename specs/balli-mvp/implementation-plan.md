@@ -147,11 +147,11 @@ Goal: registered schemas resolve by keyword, recursive schemas terminate, compil
 
 Goal: usable open-source-shaped library.
 
-- [ ] Root `README.md`: positioning ("Data-driven schemas for Basilisp — Malli-inspired"), install, quick start (validate/explain/humanize/registry examples, all copy-paste runnable), supported schema reference table, differences-from-Malli section (out-of-scope list, `:or` explain simplification, Basilisp-data-only), development section (test/lint commands)
-- [ ] `scripts/compile_check.lpy`: import every ns under `src/` via importlib (reference-repo pattern); `scripts/test.sh` wrapper (`exec basilisp test "$@"`)
-- [ ] Verify `pip install -e . --break-system-packages` from clean state ships `.lpy` files (import from a different cwd works)
-- [ ] `LICENSE` (MIT, Andrew VanDyke)
-- [ ] Full sweep: `basilisp test` all green; `basilisp run scripts/compile_check.lpy` exits 0
+- [x] Root `README.md`: positioning ("Data-driven schemas for Basilisp — Malli-inspired"), install, quick start (validate/explain/humanize/registry examples, all copy-paste runnable), supported schema reference table, differences-from-Malli section (out-of-scope list, `:or` explain simplification, Basilisp-data-only), development section (test/lint commands)
+- [x] `scripts/compile_check.lpy`: import every ns under `src/` via importlib (reference-repo pattern); `scripts/test.sh` wrapper (`exec basilisp test "$@"`)
+- [x] Verify `pip install -e . --break-system-packages` from clean state ships `.lpy` files (import from a different cwd works; non-editable `pip wheel` also verified to ship all 5 `.lpy` files)
+- [x] `LICENSE` (MIT, Andrew VanDyke)
+- [x] Full sweep: `basilisp test` all green (87 passed); `basilisp run scripts/compile_check.lpy` exits 0 (5 namespaces OK)
 
 **Checkpoints:**
 - `cd /tmp && basilisp run -c '(require (quote [balli.core :as b])) (println (b/validate [:map [:x :int]] {:x 1}))'` → `true` (proves install works outside repo cwd)
