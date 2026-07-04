@@ -39,7 +39,7 @@ Carried from prior phases: records are `map?`; keyword `identical?` unreliable; 
 
 Per [malli-semantics.md](malli-semantics.md) §1–§5, in full. Public API additions:
 - `balli.registry`: `set-default-registry!`, `register!`, `composite` (internal ok), live `default-registry`.
-- `balli.time`: type table + `time-transformer`; types `:time/instant :time/local-date :time/local-time :time/local-date-time :time/duration`.
+- `balli.time`: LEAF ns — type table + ISO parsers only (transformer construction lives in `balli.transform` as `bt/time-transformer`); types `:time/instant :time/local-date :time/local-time :time/local-date-time :time/duration`.
 - Everything else lands inside existing namespaces (normalize/compile/transform/generator/json-schema/error/util).
 
 ### Non-Functional

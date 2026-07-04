@@ -16,7 +16,7 @@ Five user-approved features closing the remaining practical Malli gaps, pinned a
 (b/validate [:map [:x :int] [:balli.core/default [:map-of :keyword :string]]] {:x 1 :extra "ok"})
 (b/validate [:multi {:dispatch :kind} [:a [:map [:kind [:= :a]]]] [:balli.core/default :map]] {:kind :other})
 ;; 3. Time schemas
-(b/decode :time/instant "2024-06-01T12:00:00+00:00" (btime/time-transformer))
+(b/decode :time/instant "2024-06-01T12:00:00+00:00" (bt/time-transformer))
 ;; 4. Predicates + comparators
 (b/validate [:map [:n pos-int?] [:cap [:<= 100]]] {:n 5 :cap 42})
 ;; 5. Mutable default registry

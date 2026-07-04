@@ -64,7 +64,7 @@ Seven phases: spike → predicates/comparators → mutable registry → local re
 - [ ] **Every ref-identity surface uses `[kw layer-token]`, not bare kw (adversary P2):** validator/explainer/parser/unparser caches, the `transforming-parser?` visited-ref set, transformer lazy ref caches, the generator's ref-identity/depth tracking, AND json-schema's visited set + definitions naming (shadowed same-name refs from different layers must emit distinct definition keys — `<name>__<n>` suffix rule)
 - [ ] transform + generator: same layering (generator's ref depth-cap unchanged); json-schema: local-registry refs collected into `"definitions"`; shadowed names get a `__<n>` suffix on collision (documented rule); `[:schema {:registry ...} ::node]` produces `$ref` + definitions
 - [ ] core walk: `:registry` prop preserved through rebuild (walk does not enter ref targets, unchanged)
-- [ ] `tests/test_local_registry.lpy`: self-contained recursive tree (the README example) validate/explain/parse/generate; mutual recursion between two local keys; shadowing (outer `::x` = :int, inner `::x` = :string — both subtrees correct, incl. through validator AND explainer AND parser); local key seeing an OUTER global key; form round-trip preserves `:registry` prop; garbage prop (`{:registry [:not-a-map]}`) → invalid-schema; json-schema definitions from local registry; **schema-object composition: `(b/schema <local-reg form>)` then decode through it with a transformer**
+- [ ] `tests/test_local_registry.lpy`: self-contained recursive tree (the README example) validate/explain/parse/generate; mutual recursion between two local keys; **shadowing forced through EVERY surface** (outer `::x` = :int, inner `::x` = :string in ONE schema — assert both subtrees correct via validator, explainer, parser, DECODER (a string-transformer decode where outer-`::x` coerces "5"→5 and inner does not), GENERATOR (generated value validates), and JSON-SCHEMA (two distinct definition keys, `<name>__<n>` suffix present)); local key seeing an OUTER global key; form round-trip preserves `:registry` prop; garbage prop (`{:registry [:not-a-map]}`) → invalid-schema; **schema-object composition: `(b/schema <local-reg form>)` then decode through it with a transformer**
 
 **Checkpoints:**
 - `(b/validate [:schema {:registry {::node [:maybe [:map [:kids [:vector [:ref ::node]]]]]}} ::node] {:kids [{:kids []}]})` → `true` — NO opts registry
@@ -97,12 +97,12 @@ Seven phases: spike → predicates/comparators → mutable registry → local re
 - [ ] error: humanize messages ("should be an instant"/"a date"/"a time"/"a date-time"/"a duration"; limits with ISO-rendered bounds)
 - [ ] generator: uniform between min/max or table defaults, seeded
 - [ ] json-schema: string + format per §3
-- [ ] `tests/test_time.lpy`: each type validate happy/sad (incl. aware-vs-naive both directions, date-vs-datetime exclusion), min/max bounds, decode/encode round-trips (string→value→string), duration parser matrix (`PT15M`, `P1DT2H3M4.5S`, `P2W`, `-PT5S`, garbage → unchanged), garbage `:min` → invalid-schema, generator validity + determinism, json-schema formats, **composition: `[:map [:created :time/instant] [:ttl :time/duration]]` json-decode from strings via `(bt/transformer (bt/json-transformer) (btime/time-transformer))` then validate; schema object through generate**
+- [ ] `tests/test_time.lpy`: each type validate happy/sad (incl. aware-vs-naive both directions, date-vs-datetime exclusion), min/max bounds, decode/encode round-trips (string→value→string), duration parser matrix (`PT15M`, `P1DT2H3M4.5S`, `P2W`, `-PT5S`, garbage → unchanged), garbage `:min` → invalid-schema, generator validity + determinism, json-schema formats, **composition: `[:map [:created :time/instant] [:ttl :time/duration]]` json-decode from strings via `(bt/transformer (bt/json-transformer) (bt/time-transformer))` then validate; schema object through generate**
 
 **Checkpoints:**
 - `(b/validate :time/instant (datetime/datetime 2024 1 1 ** :tzinfo datetime/timezone.utc))`-style → `true`; naive datetime → `false`
-- `(b/decode :time/instant "2024-06-01T12:00:00+00:00" (btime/time-transformer))` → aware datetime; encode back → ISO string
-- `(b/decode :time/duration "PT15M" (btime/time-transformer))` → timedelta 900s
+- `(b/decode :time/instant "2024-06-01T12:00:00+00:00" (bt/time-transformer))` → aware datetime; encode back → ISO string
+- `(b/decode :time/duration "PT15M" (bt/time-transformer))` → timedelta 900s
 - Narrow: `basilisp test tests/test_time.lpy`
 
 ## Phase 6: Docs, 0.3.0, full sweep
