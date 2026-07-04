@@ -130,12 +130,12 @@ Goal: `balli.error/humanize` turns explain maps into human-readable structures m
 
 Goal: registered schemas resolve by keyword, recursive schemas terminate, compiled fns are cached.
 
-- [ ] `balli.registry/registry`: `(reg/registry {:user/id [:string {:min 1}] :user/address [:map ...]})` merged over defaults; passed via opts `{:registry r}` through `schema`/`validate`/`explain`
-- [ ] Normalize: qualified keyword forms resolve against registry `:schemas` → `{:type :ref :ref kw}`; `[:ref kw]` same
-- [ ] Compile: ref compilation is lazy (fn indirection through a compile-time cache atom keyed by ref kw) so self/mutually-recursive schemas (`:user/tree` referencing itself) compile and validate without stack overflow on finite data
-- [ ] Unresolved ref at compile time → `(throw (ex-info "Unresolved ref" {:type :balli.core/unresolved-ref :ref kw}))` (fail fast, not fail-at-validate)
-- [ ] Validator/explainer caching: schema objects cache compiled fns in their `:cache` atom; raw-form API calls compile through a bounded global cache atom in `balli.core` keyed by `[form registry-id]` (registry-id via `identical?`-based token; simplest correct thing — document)
-- [ ] `tests/test_registry.lpy`: custom scalar ref, nested ref, recursive `[:maybe [:map [:children [:vector [:ref :tree/node]]]]]` validates a 3-level tree, unresolved ref throws, explain through refs keeps `:in` correct
+- [x] `balli.registry/registry`: `(reg/registry {:user/id [:string {:min 1}] :user/address [:map ...]})` merged over defaults; passed via opts `{:registry r}` through `schema`/`validate`/`explain` (commit: efabe10)
+- [x] Normalize: qualified keyword forms resolve against registry `:schemas` → `{:type :ref :ref kw}`; `[:ref kw]` same (commit: efabe10)
+- [x] Compile: ref compilation is lazy (fn indirection through a compile-time cache atom keyed by ref kw) so self/mutually-recursive schemas (`:user/tree` referencing itself) compile and validate without stack overflow on finite data (commit: efabe10)
+- [x] Unresolved ref at compile time → `(throw (ex-info "Unresolved ref" {:type :balli.core/unresolved-ref :ref kw}))` (fail fast, not fail-at-validate)
+- [x] Validator/explainer caching: schema objects cache compiled fns in their `:cache` atom; raw-form API calls compile through a bounded global cache atom in `balli.core` keyed by `[form registry-id]` (registry-id via `identical?`-based monotonic token, default registry = token 0; cap 1024 entries, evict-all on overflow — documented in `balli.core`)
+- [x] `tests/test_registry.lpy`: custom scalar ref, nested ref, recursive `[:maybe [:map [:children [:vector [:ref :tree/node]]]]]` validates a 3-level tree, unresolved ref throws, explain through refs keeps `:in` correct (commit: efabe10)
 
 **Checkpoints:**
 - `(b/validate [:ref :user/id] "abc" {:registry (reg/registry {:user/id [:string {:min 1}]})})` → `true`

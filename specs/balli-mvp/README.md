@@ -56,5 +56,5 @@ See [research.md](research.md) for codebase context and REPL findings, and the [
 - [x] Phase 2: Validator compiler + public core API
 - [x] Phase 3: Explainer + explain data + assert-valid
 - [x] Phase 4: Humanize
-- [ ] Phase 5: Custom registries, :ref, recursion, caching
+- [x] Phase 5: Custom registries, :ref, recursion, caching
 - [ ] Phase 6: Docs, compile-check, packaging polish
