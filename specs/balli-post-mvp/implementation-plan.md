@@ -78,13 +78,13 @@ Goal: `balli.json-schema/transform` per §B.
 
 Goal: §D in `balli.error`.
 
-- [ ] `levenshtein` (full-matrix, iterative); threshold table per §D
-- [ ] `with-spell-checking [explain-map]`: rewrite `:extra-key` → `:balli.error/misspelled-key` (+ `:balli.error/likely-misspelling-of` paths) when within threshold of an absent declared key; `:invalid-dispatch-value` on keyword-dispatch `:multi` → `:balli.error/misspelled-value`; drop `:missing-key` errors whose path is a likely-misspelling target; needs schema-fragment entry-key introspection (reuse `split-form`) and value keys at `(butlast in)`
-- [ ] Humanize messages: `"should be spelled :x"` / `"should be spelled :x or :y"`
-- [ ] `tests/test_spell.lpy`: `{:closed true}` map with `:naem` → misspelled-key naming `:name`, missing-key for `:name` dropped; below-threshold typo stays extra-key; multi dispatch typo; humanize renders; **composition: spell-check explain from a `:multi` branch inside a closed map**
+- [x] `levenshtein` (full-matrix, iterative); threshold table per §D (commit: 02a6bb2)
+- [x] `with-spell-checking [explain-map]`: rewrite `:extra-key` → `:balli.error/misspelled-key` (+ `:balli.error/likely-misspelling-of` paths) when within threshold of an absent declared key; `:invalid-dispatch-value` on keyword-dispatch `:multi` → `:balli.error/misspelled-value`; drop `:missing-key` errors whose path is a likely-misspelling target; needs schema-fragment entry-key introspection (reuse `split-form`) and value keys at `(butlast in)` (commit: 02a6bb2)
+- [x] Humanize messages: `"should be spelled :x"` / `"should be spelled :x or :y"` (commit: 02a6bb2)
+- [x] `tests/test_spell.lpy`: `{:closed true}` map with `:naem` → misspelled-key naming `:name`, missing-key for `:name` dropped; below-threshold typo stays extra-key; multi dispatch typo; humanize renders; **composition: spell-check explain from a `:multi` branch inside a closed map** (commit: 02a6bb2)
 
 **Checkpoints:**
-- `(-> (b/explain [:map {:closed true} [:name :string]] {:naem "x"}) be/with-spell-checking be/humanize)` → `{:naem ["should be spelled :name"]}`
+- `(-> (b/explain [:map {:closed true} [:name :string]] {:nam "x"}) be/with-spell-checking be/humanize)` → `{:nam ["should be spelled :name"]}` (`:naem` is distance 2 — above threshold, stays extra-key; verified against real malli)
 - Same without spell-checking → extra-key + missing-key both present
 - Narrow: `basilisp test tests/test_spell.lpy`
 
