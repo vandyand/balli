@@ -1,0 +1,365 @@
+(ns tests.test-util
+  "Phase 2: balli.core/walk (form-level postwalk, path semantics, refs not
+  entered) + balli.util (merge/union/select-keys/dissoc/optional-keys/
+  required-keys/closed-schema/open-schema/get/get-in), plus the
+  closed-schema-over-merge composition case."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.registry :as reg]
+            [balli.util :as u]))
+
+;; ---------------------------------------------------------------------------
+;; walk: postwalk order + path correctness
+
+(deftest walk-postwalk-order-and-paths
+  (let [visits (atom [])
+        result (b/walk [:map [:x :int] [:y [:vector :string]]]
+                       (fn [form path]
+                         (swap! visits conj [form path])
+                         form))]
+    (testing "children visited before parents, map entries pathed by key,
+              indexed children by index"
+      (is (= [[:int [:x]]
+              [:string [:y 0]]
+              [[:vector :string] [:y]]
+              [[:map [:x :int] [:y [:vector :string]]] []]]
+             @visits)))
+    (testing "identity walk returns the original form"
+      (is (= [:map [:x :int] [:y [:vector :string]]] result)))))
+
+(deftest walk-indexed-paths
+  (testing ":or branches get indices"
+    (let [visits (atom [])]
+      (b/walk [:or :int :string]
+              (fn [form path] (swap! visits conj [form path]) form))
+      (is (= [[:int [0]] [:string [1]] [[:or :int :string] []]]
+             @visits))))
+  (testing ":map-of key schema at 0, value schema at 1"
+    (let [visits (atom [])]
+      (b/walk [:map-of :keyword :int]
+              (fn [form path] (swap! visits conj [form path]) form))
+      (is (= [[:keyword [0]] [:int [1]] [[:map-of :keyword :int] []]]
+             @visits))))
+  (testing ":tuple per-index; :maybe child at 0"
+    (let [visits (atom [])]
+      (b/walk [:tuple :string [:maybe :int]]
+              (fn [form path] (swap! visits conj [form path]) form))
+      (is (= [[:string [0]]
+              [:int [1 0]]
+              [[:maybe :int] [1]]
+              [[:tuple :string [:maybe :int]] []]]
+             @visits)))))
+
+(deftest walk-rebuilds-bottom-up
+  (testing "f's return value replaces the child form in the parent"
+    (is (= [:map [:a :string] [:b [:tuple :string :keyword]]]
+           (b/walk [:map [:a :int] [:b [:tuple :int :keyword]]]
+                   (fn [form _path] (if (= :int form) :string form))))))
+  (testing "root replacement wins"
+    (is (= {:form :int :path []}
+           (b/walk :int (fn [form path] {:form form :path path}))))))
+
+(deftest walk-preserves-properties
+  (testing "root props, entry props, scalar props all survive an identity walk"
+    (let [form [:map {:closed true}
+                [:x {:optional true} [:string {:min 1}]]
+                [:y :int]]]
+      (is (= form (b/walk form (fn [f _] f))))))
+  (testing "leaf forms pass through verbatim (:enum/:=/:fn/:re children are
+            values, not schemas)"
+    (is (= [:enum :a :b] (b/walk [:enum :a :b] (fn [f _] f))))
+    (is (= [:= 5] (b/walk [:= 5] (fn [f _] f))))
+    (is (= [:fn even?] (b/walk [:fn even?] (fn [f _] f))))))
+
+(deftest walk-does-not-enter-refs
+  (let [r (reg/registry {:user/id [:string {:min 1}]})]
+    (testing "bare registered keyword stays a leaf"
+      (let [visits (atom [])]
+        (b/walk [:map [:id :user/id]]
+                (fn [form path] (swap! visits conj [form path]) form)
+                {:registry r})
+        (is (= [[:user/id [:id]]
+                [[:map [:id :user/id]] []]]
+               @visits))))
+    (testing "[:ref k] stays a leaf form"
+      (let [visits (atom [])]
+        (b/walk [:vector [:ref :user/id]]
+                (fn [form path] (swap! visits conj [form path]) form)
+                {:registry r})
+        (is (= [[[:ref :user/id] [0]]
+                [[:vector [:ref :user/id]] []]]
+               @visits))))))
+
+(deftest walk-accepts-schema-objects
+  (is (= [:vector :string]
+         (b/walk (b/schema [:vector :int])
+                 (fn [form _] (if (= :int form) :string form))))))
+
+(deftest schema-walker-adapts-form-fns
+  (is (= [:map [:x :string]]
+         (b/walk [:map [:x :int]]
+                 (b/schema-walker (fn [form] (if (= :int form) :string form)))))))
+
+;; ---------------------------------------------------------------------------
+;; merge
+
+(deftest merge-basic
+  (testing "duplicate keys: later value schema wins, new entries append"
+    (is (= [:map [:x :string] [:y :int]]
+           (u/merge [:map [:x :int]] [:map [:x :string] [:y :int]]))))
+  (testing "entry order: s1's entries first, s2-only entries after in s2 order"
+    (is (= [:map [:a :int] [:b :int] [:c :int] [:d :int]]
+           (u/merge [:map [:a :int] [:b :int]]
+                    [:map [:c :int] [:b :int] [:d :int]])))))
+
+(deftest merge-props
+  (testing "root props shallow-merge, s2 wins conflicts"
+    (is (= [:map {:closed true :doc "s2"} [:x :int] [:y :string]]
+           (u/merge [:map {:closed true :doc "s1"} [:x :int]]
+                    [:map {:doc "s2"} [:y :string]]))))
+  (testing "duplicate-entry props merge, s2 wins conflicts"
+    (is (= [:map [:x {:doc "b" :label "l"} :string]]
+           (u/merge [:map [:x {:doc "a" :label "l"} :int]]
+                    [:map [:x {:doc "b"} :string]])))))
+
+(deftest merge-requiredness-later-wins
+  (testing "optional in s1, required in s2 -> required"
+    (is (= [:map [:x :string]]
+           (u/merge [:map [:x {:optional true} :int]]
+                    [:map [:x :string]]))))
+  (testing "required in s1, optional in s2 -> optional"
+    (is (= [:map [:x {:optional true} :string]]
+           (u/merge [:map [:x :int]]
+                    [:map [:x {:optional true} :string]]))))
+  (testing "optional in both -> optional"
+    (is (= [:map [:x {:optional true} :string]]
+           (u/merge [:map [:x {:optional true} :int]]
+                    [:map [:x {:optional true} :string]])))))
+
+(deftest merge-deep-nested-maps
+  (is (= [:map [:a [:map [:b :int] [:c :string]]]]
+         (u/merge [:map [:a [:map [:b :int]]]]
+                  [:map [:a [:map [:c :string]]]])))
+  (testing "nested duplicate keys follow the same later-wins rule"
+    (is (= [:map [:a [:map [:b :string]]]]
+           (u/merge [:map [:a [:map [:b :int]]]]
+                    [:map [:a [:map [:b :string]]]])))))
+
+(deftest merge-non-map-and-nil
+  (testing "not both :map -> s2's form wins"
+    (is (= :int (u/merge [:map [:x :int]] :int)))
+    (is (= [:map [:x :int]] (u/merge :int [:map [:x :int]])))
+    (is (= :string (u/merge :int :string))))
+  (testing "nil either side -> the other"
+    (is (= [:map [:x :int]] (u/merge nil [:map [:x :int]])))
+    (is (= [:map [:x :int]] (u/merge [:map [:x :int]] nil)))
+    (is (nil? (u/merge nil nil))))
+  (testing "duplicate-key non-map value schemas: s2 wins"
+    (is (= [:map [:x [:vector :int]]]
+           (u/merge [:map [:x :int]] [:map [:x [:vector :int]]])))))
+
+(deftest merge-accepts-schema-objects
+  (is (= [:map [:x :int] [:y :string]]
+         (u/merge (b/schema [:map [:x :int]])
+                  (b/schema [:map [:y :string]]))))
+  (is (= [:map [:x :int]] (u/merge nil (b/schema [:map [:x :int]])))))
+
+(deftest merge-with-registry
+  (let [r (reg/registry {:user/id [:string {:min 1}]})
+        merged (u/merge [:map [:id :user/id]]
+                        [:map [:name :string]]
+                        {:registry r})]
+    (is (= [:map [:id :user/id] [:name :string]] merged))
+    (is (true? (b/validate merged {:id "u1" :name "n"} {:registry r})))
+    (is (false? (b/validate merged {:id "" :name "n"} {:registry r})))))
+
+;; ---------------------------------------------------------------------------
+;; union
+
+(deftest union-basic
+  (testing "differing duplicate values -> [:or s1 s2]"
+    (is (= [:map [:x [:or :int :string]]]
+           (u/union [:map [:x :int]] [:map [:x :string]]))))
+  (testing "equal forms -> s1 (no :or wrapper)"
+    (is (= [:map [:x :int]]
+           (u/union [:map [:x :int]] [:map [:x :int]]))))
+  (testing "single-side entries kept as-is"
+    (is (= [:map [:x :int] [:y :string]]
+           (u/union [:map [:x :int]] [:map [:y :string]])))))
+
+(deftest union-optional-in-either
+  (testing "optional in s1 only -> optional"
+    (is (= [:map [:x {:optional true} :int]]
+           (u/union [:map [:x {:optional true} :int]] [:map [:x :int]]))))
+  (testing "optional in s2 only -> optional"
+    (is (= [:map [:x {:optional true} :int]]
+           (u/union [:map [:x :int]] [:map [:x {:optional true} :int]]))))
+  (testing "required in both -> required"
+    (is (= [:map [:x :int]]
+           (u/union [:map [:x :int]] [:map [:x :int]])))))
+
+(deftest union-nested-and-scalar
+  (testing "nested maps union recursively"
+    (is (= [:map [:a [:map [:b [:or :int :string]]]]]
+           (u/union [:map [:a [:map [:b :int]]]]
+                    [:map [:a [:map [:b :string]]]]))))
+  (testing "not both :map at the top level"
+    (is (= [:or :int :string] (u/union :int :string)))
+    (is (= :int (u/union :int :int)))))
+
+;; ---------------------------------------------------------------------------
+;; select-keys / dissoc
+
+(deftest select-keys-basic
+  (is (= [:map {:closed true} [:x :int]]
+         (u/select-keys [:map {:closed true} [:x :int] [:y :string]] [:x])))
+  (testing "unknown keys ignored; entry props preserved; order preserved"
+    (is (= [:map [:x {:optional true} :int] [:z :keyword]]
+           (u/select-keys [:map [:x {:optional true} :int]
+                           [:y :string] [:z :keyword]]
+                          [:z :x :nope]))))
+  (testing "empty selection keeps root props"
+    (is (= [:map {:closed true}]
+           (u/select-keys [:map {:closed true} [:x :int]] []))))
+  (testing "non-map schema throws at the boundary"
+    (is (= :balli.core/invalid-schema
+           (try
+             (u/select-keys [:vector :int] [:x])
+             nil
+             (catch python/Exception e (:type (ex-data e))))))))
+
+(deftest dissoc-basic
+  (is (= [:map [:y :string]]
+         (u/dissoc [:map [:x :int] [:y :string]] :x)))
+  (testing "unknown key is a no-op; props preserved"
+    (is (= [:map {:closed true} [:x :int]]
+           (u/dissoc [:map {:closed true} [:x :int]] :nope)))))
+
+;; ---------------------------------------------------------------------------
+;; optional-keys / required-keys
+
+(deftest optional-keys-basic
+  (testing "all entries when ks omitted"
+    (is (= [:map [:x {:optional true} :int] [:y {:optional true} :string]]
+           (u/optional-keys [:map [:x :int] [:y :string]]))))
+  (testing "subset only; other entry props preserved"
+    (is (= [:map [:x {:doc "d" :optional true} :int] [:y :string]]
+           (u/optional-keys [:map [:x {:doc "d"} :int] [:y :string]] [:x])))))
+
+(deftest required-keys-basic
+  (testing "all entries when ks omitted"
+    (is (= [:map [:x :int] [:y :string]]
+           (u/required-keys [:map [:x {:optional true} :int]
+                             [:y {:optional true} :string]]))))
+  (testing "subset only; empty entry props collapse away"
+    (is (= [:map [:x :int] [:y {:optional true} :string]]
+           (u/required-keys [:map [:x {:optional true} :int]
+                             [:y {:optional true} :string]]
+                            [:x]))))
+  (testing "other entry props survive"
+    (is (= [:map [:x {:doc "d"} :int]]
+           (u/required-keys [:map [:x {:doc "d" :optional true} :int]])))))
+
+;; ---------------------------------------------------------------------------
+;; closed-schema / open-schema
+
+(deftest closed-schema-recursive
+  (is (= [:map {:closed true} [:a [:map {:closed true} [:b :int]]]]
+         (u/closed-schema [:map [:a [:map [:b :int]]]])))
+  (testing "maps nested under other types close too"
+    (is (= [:vector [:map {:closed true} [:x :int]]]
+           (u/closed-schema [:vector [:map [:x :int]]])))
+    (is (= [:or :int [:map {:closed true} [:x :int]]]
+           (u/closed-schema [:or :int [:map [:x :int]]]))))
+  (testing "explicit {:closed false} is respected (children still close)"
+    (is (= [:map {:closed false} [:a [:map {:closed true} [:b :int]]]]
+           (u/closed-schema [:map {:closed false} [:a [:map [:b :int]]]]))))
+  (testing "bare :map closes"
+    (is (= [:map {:closed true}] (u/closed-schema :map))))
+  (testing "closing changes validation"
+    (is (true? (b/validate [:map [:x :int]] {:x 1 :junk 2})))
+    (is (false? (b/validate (u/closed-schema [:map [:x :int]])
+                            {:x 1 :junk 2})))))
+
+(deftest open-schema-recursive
+  (is (= [:map [:a [:map [:b :int]]]]
+         (u/open-schema [:map {:closed true}
+                         [:a [:map {:closed true} [:b :int]]]])))
+  (testing "round-trips closed-schema"
+    (let [form [:map [:a [:map [:b :int]]]]]
+      (is (= form (u/open-schema (u/closed-schema form))))))
+  (testing "explicit {:closed false} kept as-is"
+    (is (= [:map {:closed false} [:x :int]]
+           (u/open-schema [:map {:closed false} [:x :int]]))))
+  (testing "other props survive :closed removal"
+    (is (= [:map {:doc "d"} [:x :int]]
+           (u/open-schema [:map {:closed true :doc "d"} [:x :int]])))))
+
+;; ---------------------------------------------------------------------------
+;; get / get-in
+
+(deftest get-basic
+  (testing ":map entries by key"
+    (is (= :string (u/get [:map [:x :int] [:y :string]] :y)))
+    (is (= [:vector :int]
+           (u/get [:map [:x {:optional true} [:vector :int]]] :x)))
+    (is (nil? (u/get [:map [:x :int]] :z))))
+  (testing ":multi entries by dispatch key"
+    (is (= [:map [:kind [:= :dm]]]
+           (u/get [:multi {:dispatch :kind} [:dm [:map [:kind [:= :dm]]]]]
+                  :dm))))
+  (testing "indexed children"
+    (is (= :string (u/get [:or :int :string] 1)))
+    (is (= :string (u/get [:tuple :string :int] 0)))
+    (is (= :keyword (u/get [:map-of :keyword :int] 0)))
+    (is (= :int (u/get [:map-of :keyword :int] 1)))
+    (is (= :int (u/get [:maybe :int] 0)))
+    (is (= :int (u/get [:vector :int] 0))))
+  (testing "out-of-range / non-indexable -> nil"
+    (is (nil? (u/get [:or :int :string] 2)))
+    (is (nil? (u/get [:or :int :string] :x)))
+    (is (nil? (u/get :int 0))))
+  (testing "schema objects accepted"
+    (is (= :int (u/get (b/schema [:map [:x :int]]) :x)))))
+
+(deftest get-in-basic
+  (is (= :int (u/get-in [:map [:a [:map [:b :int]]]] [:a :b])))
+  (testing "mixed key/index paths"
+    (is (= :int (u/get-in [:map [:xs [:vector [:map [:n :int]]]]]
+                          [:xs 0 :n]))))
+  (testing "empty ks -> the form itself"
+    (is (= [:map [:x :int]] (u/get-in [:map [:x :int]] [])))
+    (is (= [:map [:x :int]] (u/get-in (b/schema [:map [:x :int]]) []))))
+  (testing "missing step -> nil (and stays nil)"
+    (is (nil? (u/get-in [:map [:a [:map [:b :int]]]] [:a :nope])))
+    (is (nil? (u/get-in [:map [:a :int]] [:zz :b])))))
+
+;; ---------------------------------------------------------------------------
+;; Composition: closed-schema over merge, then validate
+
+(deftest composition-merge-close-validate
+  (let [A [:map [:x :int] [:nested [:map [:a :string]]]]
+        B [:map [:y {:optional true} :string] [:nested [:map [:b :int]]]]
+        merged (u/merge A B)
+        closed (u/closed-schema merged)]
+    (is (= [:map
+            [:x :int]
+            [:nested [:map [:a :string] [:b :int]]]
+            [:y {:optional true} :string]]
+           merged))
+    (is (= [:map {:closed true}
+            [:x :int]
+            [:nested [:map {:closed true} [:a :string] [:b :int]]]
+            [:y {:optional true} :string]]
+           closed))
+    (testing "closed merged schema validates"
+      (is (true? (b/validate closed {:x 1 :nested {:a "s" :b 2}})))
+      (is (true? (b/validate closed {:x 1 :y "opt" :nested {:a "s" :b 2}}))))
+    (testing "extra keys rejected at both levels after closing"
+      (is (false? (b/validate closed {:x 1 :nested {:a "s" :b 2} :junk 0})))
+      (is (false? (b/validate closed {:x 1 :nested {:a "s" :b 2 :junk 0}}))))
+    (testing "merged requiredness enforced"
+      (is (false? (b/validate closed {:nested {:a "s" :b 2}})))
+      (is (= [{:path [:x] :in [:x] :schema :int :value nil
+               :type :balli.core/missing-key}]
+             (:errors (b/explain closed {:nested {:a "s" :b 2}})))))))

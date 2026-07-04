@@ -214,9 +214,10 @@
 ;;   - :and/:or branch       -> branch index to :path only
 ;;   - :maybe child          -> 0 to :path only (transparent in :in)
 ;;   - :multi child          -> dispatch key to :path only (transparent in :in)
-;;   - :or all-branches-fail -> single :balli.core/invalid error at the :or
-;;                              node (documented simplification vs Malli's
-;;                              per-branch errors)
+;;   - :or all-branches-fail -> every branch's errors concatenated in branch
+;;                              order, branch index appended to :path only
+;;                              (:in unchanged) — Malli semantics
+;;   - :balli.core/invalid   -> reserved for :fn / :not / :re-mismatch only
 ;;   - :re non-match on a string -> :balli.core/invalid (non-strings get
 ;;                              :balli.core/invalid-type)
 
@@ -442,12 +443,21 @@
                  (map-indexed vector fns)))))
 
     :or
+    ;; Per-branch errors (Malli semantics): a branch that validates makes the
+    ;; whole :or valid ([]); when ALL branches fail, every branch's errors are
+    ;; concatenated in branch order with the branch index appended to :path
+    ;; only (:in unchanged).
     (let [fns (mapv #(explain-node % registry cache) (:children node))
-          form (:form node)]
+          n (count fns)]
       (fn [x path in]
-        (if (some (fn [f] (empty? (f x path in))) fns)
-          []
-          [(err path in form x :balli.core/invalid)])))
+        (loop [i 0
+               acc (transient [])]
+          (if (>= i n)
+            (persistent! acc)
+            (let [errors ((nth fns i) x (conj path i) in)]
+              (if (empty? errors)
+                []
+                (recur (inc i) (into! acc errors))))))))
 
     :vector (explain-coll vector? node registry cache)
     :sequential (explain-coll sequential? node registry cache)

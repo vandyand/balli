@@ -177,7 +177,6 @@ Balli is an honest **subset** of Malli — the core validate/explain/humanize/re
 - **No generators** — no `mg/generate`, no test.check integration.
 - **No JSON Schema export** (or Swagger, or schema inference).
 - **No sequence schemas** (`:cat`/`:alt`/`:*`/`:+`/`:?`/`:repeat`) and **no function schemas** (`:=>`, instrumentation).
-- **`:or` explain is simplified** — a failing `:or` emits a single `:balli.core/invalid` error at the `:or` node, rather than Malli's per-branch errors.
 - **Basilisp data only** — validators check Basilisp data structures (maps, vectors, sets, ...). Python `dict`/`list` values are *not* accepted; convert at the interop boundary first.
 - **Set element `:in`** uses the element's seq-order ordinal (sets are unordered; the index identifies which element in seq order failed, not a stable position).
 - **Mixed-level humanize uses `:balli/error`** — when a value has errors of its own *and* nested child errors (e.g. `[:vector {:min 3} :int]` on `[1 "x"]`), `humanize` renders that level as a map with child entries plus the level's own messages under the reserved `:balli/error` key: `{1 ["should be an integer"] :balli/error ["should have at least 3 elements"]}`.

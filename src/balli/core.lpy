@@ -256,6 +256,86 @@
   ([s value t] ((coercer s t) value))
   ([s value t opts] ((coercer s t opts) value)))
 
+;; ---------------------------------------------------------------------------
+;; walk (Phase 2)
+;;
+;; FORM-level postwalk. Signature deviation from Malli: Malli's `m/walk` takes
+;; a 4-arg walker fn (schema, path, walked-children, options) — usually built
+;; with `(m/schema-walker f)` — and traverses/rebuilds schema OBJECTS. Balli
+;; keeps it simpler: `(walk s f)` where f is `(fn [rebuilt-form path] form')`
+;; — the form is already rebuilt bottom-up from the walked children before f
+;; sees it, and f's return value replaces the node's form in the parent.
+;; `schema-walker` adapts a 1-arg form fn into that shape so
+;; `(walk s (schema-walker f))` reads like Malli's
+;; `(m/walk s (m/schema-walker f))`. No separate walker protocol.
+;;
+;; Path semantics (mirrors explain :path): map/:multi entry value schemas get
+;; (conj path key); indexed children (single-child colls, :and/:or/:tuple,
+;; :map-of, :maybe, :not) get (conj path i); scalars/leaves keep the node's
+;; own path. Refs are NOT entered — the ref node is a leaf and its form
+;; (bare keyword or [:ref k]) is passed to f unchanged.
+
+(def ^:private walk-leaf-types
+  "AST node types walked as leaves: no schema children to descend into (:enum
+  and := children are literal values, :fn/:re children are host objects, refs
+  are not entered). f receives the node's original form fragment."
+  #{:any :nil :string :int :float :double :number :boolean :keyword :symbol
+    :uuid :enum := :fn :re :ref})
+
+(defn- walk-ast
+  "Postwalk AST `node` at `path`, rebuilding the form bottom-up and calling
+  (f rebuilt-form path) at every node. Returns f's result for this node."
+  [node path f]
+  (let [t (:type node)
+        props (:properties node)]
+    (cond
+      (contains? walk-leaf-types t)
+      (f (:form node) path)
+
+      (contains? #{:map :multi} t)
+      (let [entries (mapv (fn [{:keys [key properties schema]}]
+                            (let [v (walk-ast schema (conj path key) f)]
+                              (if (seq properties)
+                                [key properties v]
+                                [key v])))
+                          (:children node))
+            form (if (and (= :map t) (empty? props) (empty? entries))
+                   :map
+                   (into (if (seq props) [t props] [t]) entries))]
+        (f form path))
+
+      :else
+      ;; indexed children: :maybe :not :vector :sequential :set :and :or
+      ;; :tuple :map-of
+      (let [children (into []
+                           (map-indexed (fn [i c] (walk-ast c (conj path i) f))
+                                        (:children node)))
+            form (into (if (seq props) [t props] [t]) children)]
+        (f form path)))))
+
+(defn walk
+  "FORM-level postwalk over schema `s` (raw form or schema object). At every
+  node — children first — the form is rebuilt from the walked children and
+  `(f rebuilt-form path)` is called; f's return value replaces the node's
+  form in its parent. Returns f's result at the root. `opts` supports
+  {:registry r} for raw forms (ignored when `s` is a schema object). Map and
+  :multi entry value schemas are visited with (conj path key); indexed
+  children with (conj path i); refs are not entered (leaf, form unchanged)."
+  ([s f] (walk s f {}))
+  ([s f opts]
+   (let [ast (if (schema? s)
+               (:ast s)
+               (norm/normalize s {:registry (or (:registry opts)
+                                                (reg/default-registry))}))]
+     (walk-ast ast [] f))))
+
+(defn schema-walker
+  "Adapt a 1-arg form->form fn `f` into a walk fn, so
+  (walk s (schema-walker f)) mirrors Malli's (m/walk s (m/schema-walker f)).
+  See the walk section comment for the full signature deviation note."
+  [f]
+  (fn [form _path] (f form)))
+
 (defn assert-valid
   "Return `value` when it validates against `s`, else throw ex-info
   \"Validation failed\" carrying the explain map plus
