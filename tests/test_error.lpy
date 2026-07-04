@@ -144,3 +144,11 @@
            (be/humanize (b/explain [:map-of :int :string] {1 2}))))
     (is (= {0 ["should be an integer"]}
            (be/humanize (b/explain [:map [0 :int]] {0 "x"}))))))
+
+(deftest humanize-mixed-root-and-nested-errors
+  (testing ":and producing root + nested errors renders map with :balli/error"
+    (is (= {:x ["missing required key"] :balli/error ["should be an integer"]}
+           (be/humanize (b/explain [:and :int [:map [:x :int]]] {})))))
+  (testing "collection limits alongside element errors"
+    (is (= {1 ["should be an integer"] :balli/error ["should have at least 3 elements"]}
+           (be/humanize (b/explain [:vector {:min 3} :int] [1 "x"]))))))

@@ -143,28 +143,59 @@
     (and (int? k) (or (sequential? value) (set? value))) (nth (vec (seq value)) k nil)
     :else nil))
 
-(defn- add-message
-  "Place `msg` into accumulator `acc` at value-path `in`, walking `value`
-  alongside to mirror its shape. Empty `in` conjes onto a message vector;
-  index steps build sparse vectors with nil holes; map keys (including
-  integer map keys) build nested maps."
-  [acc value in msg]
+(defn- insert-message
+  "Insert `msg` into the intermediate error tree at value-path `in`, walking
+  `value` alongside. Tree nodes are {:msgs [...] :children {k node}}; each
+  child node records :idx? — whether its key was an index step — so render
+  can pick vector vs map output."
+  [tree value in msg]
   (if (empty? in)
-    (conj (or acc []) msg)
+    (update tree :msgs (fnil conj []) msg)
     (let [k (first in)
-          r (rest in)]
-      (if (index-step? k value)
-        (let [v (pad (or acc []) (inc k))]
-          (assoc v k (add-message (nth v k) (child-value value k) r msg)))
-        (let [m (or acc {})]
-          (assoc m k (add-message (get m k) (child-value value k) r msg)))))))
+          idx? (index-step? k value)
+          child (get-in tree [:children k] {:idx? idx? :msgs nil :children {}})]
+      (assoc-in tree [:children k]
+                (insert-message child (child-value value k) (rest in) msg)))))
+
+(defn- render-tree
+  "Render an error tree into humanize output:
+    - messages only              -> vector of messages
+    - children only, all indices -> sparse vector with nil holes
+    - children only, map keys    -> nested map
+    - messages AND children      -> map with children entries plus the
+                                    level's own messages under :balli/error
+                                    (reserved key; documented in README)"
+  [{:keys [msgs children]}]
+  (cond
+    (empty? children)
+    msgs
+
+    (nil? msgs)
+    (if (every? :idx? (vals children))
+      (reduce-kv (fn [v k child]
+                   (assoc (pad v (inc k)) k (render-tree child)))
+                 [] children)
+      (reduce-kv (fn [m k child]
+                   (assoc m k (render-tree child)))
+                 {} children))
+
+    :else
+    (-> (reduce-kv (fn [m k child]
+                     (assoc m k (render-tree child)))
+                   {} children)
+        (assoc :balli/error msgs))))
 
 (defn humanize
   "Turn an explain map (from balli.core/explain) into a human-readable
-  structure mirroring the value shape. nil in -> nil out."
+  structure mirroring the value shape. nil in -> nil out. When a level has
+  both its own errors and nested child errors (e.g. a collection :min
+  violation alongside a bad element), the level renders as a map and its
+  own messages live under the reserved :balli/error key."
   [explain-map]
   (when explain-map
-    (reduce (fn [acc error]
-              (add-message acc (:value explain-map) (:in error) (error-message error)))
-            nil
-            (:errors explain-map))))
+    (render-tree
+     (reduce (fn [tree error]
+               (insert-message tree (:value explain-map) (:in error)
+                               (error-message error)))
+             {:msgs nil :children {}}
+             (:errors explain-map)))))
