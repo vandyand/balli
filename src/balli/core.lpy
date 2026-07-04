@@ -1,0 +1,4 @@
+(ns balli.core
+  "Public API for balli - Malli-inspired data-driven schemas for Basilisp.")
+
+(def version "0.1.0")
