@@ -1,0 +1,175 @@
+(ns tests.test-provider
+  "Phase 9: balli.provider/provide -- scalar inference for every preference
+  type, mixed -> :or, nil-mixed -> :maybe, nested maps with optional keys,
+  :map-of detection vs record-shaped maps (threshold + distinctness gates),
+  collections (incl. empty) across set/vector/sequential, plus the
+  composition case: (b/validate (bp/provide samples) sample) for every
+  sample of a gnarly heterogeneous fixture."
+  (:import uuid)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.provider :as bp]))
+
+;; ---------------------------------------------------------------------------
+;; Scalars: every preference type
+
+(deftest scalar-types
+  (testing "each preference-ordered scalar type infers directly"
+    (is (= :int (bp/provide [1 2 3])))
+    (is (= :double (bp/provide [1.5 2.5])))
+    (is (= :keyword (bp/provide [:a :b])))
+    (is (= :symbol (bp/provide ['x 'y])))
+    (is (= :string (bp/provide ["a" "b"])))
+    (is (= :boolean (bp/provide [true false])))
+    (is (= :uuid (bp/provide [(uuid/uuid4) (uuid/uuid4)]))))
+  (testing "booleans are not ints -- (int? true) is false in Basilisp"
+    (is (= :boolean (bp/provide [true])))
+    (is (= [:or :int :boolean] (bp/provide [1 true]))))
+  (testing "scalar accepted by no preference type infers :any"
+    (is (= :any (bp/provide [(python/object)])))))
+
+(deftest no-samples
+  (is (= :any (bp/provide [])))
+  (is (= :any (bp/provide [] {:map-of-threshold 1}))))
+
+(deftest all-nil-samples
+  (is (= :nil (bp/provide [nil])))
+  (is (= :nil (bp/provide [nil nil nil]))))
+
+;; ---------------------------------------------------------------------------
+;; Mixed scalars -> :or (first-seen order); nil -> :maybe
+
+(deftest mixed-scalars-or
+  (testing "int + double split under :or (Balli deviation from malli:
+            float? rejects ints, so no single scalar accepts both)"
+    (is (= [:or :int :double] (bp/provide [1 1.5])))
+    (is (= [:or :double :int] (bp/provide [1.5 1]))))
+  (testing "several non-nil scalar types, stable first-seen order"
+    (is (= [:or :int :string :keyword] (bp/provide [1 "a" :k])))
+    (is (= [:or :string :int] (bp/provide ["a" 1 "b" 2])))))
+
+(deftest nil-mixed-maybe
+  (testing "nil + one other type -> [:maybe other]"
+    (is (= [:maybe :int] (bp/provide [1 2 nil])))
+    (is (= [:maybe :string] (bp/provide [nil "a"]))))
+  (testing "nil + several types -> [:maybe [:or ...]]"
+    (is (= [:maybe [:or :int :string]] (bp/provide [1 nil "a"])))
+    (is (= [:maybe [:or :keyword [:vector :int]]] (bp/provide [:k nil [1]])))))
+
+;; ---------------------------------------------------------------------------
+;; Collections
+
+(deftest collections
+  (testing "vectors"
+    (is (= [:vector :int] (bp/provide [[1 2] [3]])))
+    (is (= [:vector [:or :int :string]] (bp/provide [[1 "a"]]))))
+  (testing "empty collection -> [type :any]"
+    (is (= [:vector :any] (bp/provide [[]])))
+    (is (= [:set :any] (bp/provide [#{}])))
+    (is (= [:sequential :any] (bp/provide [(list)]))))
+  (testing "empty + non-empty samples union element stats"
+    (is (= [:vector :int] (bp/provide [[] [1] [2 3]]))))
+  (testing "sets"
+    (is (= [:set :keyword] (bp/provide [#{:a :b} #{:c}]))))
+  (testing "lists and lazy seqs -> :sequential"
+    (is (= [:sequential :int] (bp/provide [(list 1 2)])))
+    (is (= [:sequential :int] (bp/provide [(map inc [1 2])]))))
+  (testing "mixed collection kinds -> :or in first-seen order"
+    (is (= [:or [:set :int] [:sequential :int] [:vector :int]]
+           (bp/provide [#{1 2} (list 3) [4]]))))
+  (testing "equal-arity vectors are NOT tuple-ized (documented malli deviation)"
+    (is (= [:vector [:or :int :string]] (bp/provide [[1 "a"] [2 "b"] [3 "c"]]))))
+  (testing "nested collections"
+    (is (= [:vector [:vector :int]] (bp/provide [[[1] [2 3]] [[4]]])))))
+
+;; ---------------------------------------------------------------------------
+;; Maps: record-shaped + optional keys
+
+(deftest record-maps-optional-keys
+  (testing "key present in every sample is required, otherwise optional"
+    (is (= [:map [:x :int] [:y {:optional true} :string]]
+           (bp/provide [{:x 1} {:x 2 :y "a"}]))))
+  (testing "entry order is first-seen across samples"
+    (is (= [:map [:y :string] [:x {:optional true} :int]]
+           (bp/provide [{:y "a"} {:y "b" :x 1}]))))
+  (testing "nested maps recurse with their own optionality"
+    (is (= [:map [:a [:map [:b :int] [:c {:optional true} :string]]]]
+           (bp/provide [{:a {:b 1}} {:a {:b 2 :c "x"}}]))))
+  (testing "mixed value types inside a key merge"
+    (is (= [:map [:x [:maybe :int]]] (bp/provide [{:x 1} {:x nil}]))))
+  (testing "empty map samples"
+    (is (= [:map] (bp/provide [{} {} {}])))))
+
+;; ---------------------------------------------------------------------------
+;; :map-of heuristic
+
+(deftest map-of-detection
+  (testing "id->val dicts across samples -> :map-of"
+    (is (= [:map-of :string :int]
+           (bp/provide [{"a" 1 "b" 2} {"c" 3} {"d" 4 "e" 5}])))
+    (is (= [:map-of :keyword :string]
+           (bp/provide [{:a "x" :b "y"} {:c "z"} {:d "w"}]))))
+  (testing "record-shaped maps (same keys every sample) stay :map even above
+            threshold -- distinct-keys gate fails"
+    (is (= [:map [:x :int]] (bp/provide [{:x 1} {:x 2} {:x 3} {:x 4}]))))
+  (testing "unequal value schemas block :map-of"
+    (is (= [:map [:x :int] [:y :string]]
+           (bp/provide [{:x 1 :y "a"} {:x 2 :y "b"} {:x 3 :y "c"}]))))
+  (testing "unequal key schemas block :map-of"
+    (let [s (bp/provide [{"a" 1} {:b 2} {"c" 3} {"d" 4} {"e" 5}])]
+      (is (= :map (first s)))))
+  (testing "below threshold stays :map (all keys optional here)"
+    (let [s (bp/provide [{"a" 1 "b" 2} {"c" 3}])]
+      (is (= :map (first s)))
+      (is (every? (fn [[_ props _]] (= {:optional true} props)) (rest s)))))
+  (testing ":map-of-threshold opt lowers the sample-count gate"
+    (is (= [:map-of :string :int]
+           (bp/provide [{"a" 1 "b" 2} {"c" 3}] {:map-of-threshold 2}))))
+  (testing "nested :map-of under a record key"
+    (is (= [:map [:scores [:map-of :string :int]]]
+           (bp/provide [{:scores {"a" 1 "b" 2}}
+                        {:scores {"c" 3}}
+                        {:scores {"d" 4 "e" 5}}])))))
+
+;; ---------------------------------------------------------------------------
+;; Composition: gnarly fixture, provided schema validates EVERY sample
+
+(def ^:private gnarly-samples
+  [{:id 1
+    :name "alpha"
+    :tags #{:a :b}
+    :meta {:created nil :scores [1.0 2.5]}
+    :lookup {"k1" 1 "k2" 2}}
+   {:id 2
+    :tags #{:c}
+    :meta {:created "2020-01-01" :scores []}
+    :lookup {"k3" 3}}
+   {:id 3
+    :name "gamma"
+    :extra (list 1 :two "three")
+    :meta {:created "2021-06-30" :scores [3.5]}
+    :lookup {"k4" 4 "k5" 5}}
+   nil
+   {:id 4.5
+    :tags #{:d}
+    :meta {:created nil :scores [1.0]}
+    :lookup {"k6" 6}}])
+
+(deftest composition-gnarly-fixture
+  (let [schema (bp/provide gnarly-samples)]
+    (testing "shape sanity: top level is nilable (a sample is nil)"
+      (is (= :maybe (first schema))))
+    (testing "every sample validates against the provided schema"
+      (doseq [sample gnarly-samples]
+        (is (b/validate schema sample)
+            (str "sample failed: " (pr-str sample))))))
+  (testing "record maps with string keys validate too"
+    (let [samples [{"a" 1 "b" 2} {"c" 3}]
+          schema (bp/provide samples)]
+      (doseq [sample samples]
+        (is (b/validate schema sample)))))
+  (testing ":map-of result validates its samples"
+    (let [samples [{"a" 1 "b" 2} {"c" 3} {"d" 4 "e" 5}]
+          schema (bp/provide samples)]
+      (doseq [sample samples]
+        (is (b/validate schema sample))))))
