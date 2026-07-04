@@ -95,16 +95,21 @@
   (let [branch (-> (or branch {:count 0 :key-order [] :key-counts {}
                                :key-stats {} :total-keys 0 :distinct-keys #{}})
                    (update :count inc))]
-    (reduce-kv
-     (fn [acc k v]
-       (let [new-key? (not (contains? (:key-counts acc) k))]
+    ;; Iterate each sample's keys sorted by str: Basilisp map iteration order
+    ;; is hash-dependent, so unsorted folding makes the output entry order
+    ;; nondeterministic across processes. Cross-sample order stays first-seen.
+    (reduce
+     (fn [acc k]
+       (let [v (get m k)
+             new-key? (not (contains? (:key-counts acc) k))]
          (-> acc
              (update :key-order (if new-key? (fn [ks] (conj ks k)) identity))
              (update-in [:key-counts k] (fnil inc 0))
              (update-in [:key-stats k] (fn [s] (fold (or s (empty-stats)) v)))
              (update :total-keys inc)
              (update :distinct-keys conj k))))
-     branch m)))
+     branch
+     (sort-by str (keys m)))))
 
 (defn- fold-coll
   "Union element stats across every sample of this collection kind."
