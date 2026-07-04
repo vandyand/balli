@@ -32,22 +32,22 @@ Goal: an installable, testable, empty-but-real Basilisp library. Proves the tool
 
 Goal: every MVP schema form normalizes to a uniform AST map `{:type <kw> :properties <map> :children <vector>}`.
 
-- [ ] `src/balli/registry.lpy`: `(def builtin-types #{:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid :map :map-of :vector :sequential :set :tuple :enum := :maybe :and :or :not :fn :multi :re :ref})`; `default-registry` returns `{:types builtin-types :schemas {}}`; `registry` merges custom `{kw schema-form}` maps into `:schemas`; `resolve-ref` looks up `:schemas`
-- [ ] `src/balli/normalize.lpy`: `normalize` multimethod dispatching on `(cond (keyword? form) form (vector? form) (first form) :else ::unknown)`
-- [ ] Every AST node carries `:form` — the original schema-form fragment it was normalized from (Phase 3's explain errors report `:schema` as the original form, not the AST)
-- [ ] Scalars (`:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid`): bare keyword or `[kw props]` → `{:type kw :properties props-or-{} :children []}`
-- [ ] `:enum` / `:=`: children are the literal values (optional props map as 2nd element must be distinguished from a literal value that is a map — rule: props map only counts when ≥1 further child follows, matching Malli). Cardinality enforced at normalize time: `:enum` requires ≥1 child, `:=` requires **exactly 1** child — violations throw `ex-info` with `:type :balli.core/invalid-schema`
-- [ ] `:maybe :not :vector :sequential :set`: single child schema, optional props
-- [ ] `:and :or :tuple`: N child schemas, optional props
-- [ ] `:map`: entries `[k schema]` or `[k props schema]` → children `{:key k :properties props :schema <ast>}`; map-level props supported
-- [ ] `:map-of`: exactly 2 children (key-schema, value-schema), optional props
-- [ ] `:fn`: predicate fn stored as the single element of `:children`; props incl. `:error/message`. Both `[:fn pred]` and `[:fn {:error/message "..."} pred]` forms supported
-- [ ] `:re`: child is a regex pattern or string (compile strings via `re-pattern`)
-- [ ] `:multi`: props require `:dispatch`; children like map entries `[dispatch-value schema]` → `{:key v :schema <ast>}`
-- [ ] `:ref`: `[:ref <kw>]` → `{:type :ref :ref <kw> :properties {} :children []}`
-- [ ] Unknown form → `(throw (ex-info "Unknown schema" {:type :balli.core/invalid-schema :form form}))`
-- [ ] Keywords registered in a custom registry normalize as refs to their registered schema
-- [ ] `tests/test_normalize.lpy` covering every type + property placement + error on garbage
+- [x] `src/balli/registry.lpy`: `(def builtin-types #{:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid :map :map-of :vector :sequential :set :tuple :enum := :maybe :and :or :not :fn :multi :re :ref})`; `default-registry` returns `{:types builtin-types :schemas {}}`; `registry` merges custom `{kw schema-form}` maps into `:schemas`; `resolve-ref` looks up `:schemas` (commit: 4eb3d31)
+- [x] `src/balli/normalize.lpy`: `normalize` multimethod dispatching on `(cond (keyword? form) form (vector? form) (first form) :else ::unknown)` (commit: 4eb3d31)
+- [x] Every AST node carries `:form` — the original schema-form fragment it was normalized from (Phase 3's explain errors report `:schema` as the original form, not the AST) (commit: 4eb3d31)
+- [x] Scalars (`:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid`): bare keyword or `[kw props]` → `{:type kw :properties props-or-{} :children []}` (commit: 4eb3d31)
+- [x] `:enum` / `:=`: children are the literal values (optional props map as 2nd element must be distinguished from a literal value that is a map — rule: props map only counts when ≥1 further child follows, matching Malli). Cardinality enforced at normalize time: `:enum` requires ≥1 child, `:=` requires **exactly 1** child — violations throw `ex-info` with `:type :balli.core/invalid-schema` (commit: 4eb3d31)
+- [x] `:maybe :not :vector :sequential :set`: single child schema, optional props (commit: 4eb3d31)
+- [x] `:and :or :tuple`: N child schemas, optional props (commit: 4eb3d31)
+- [x] `:map`: entries `[k schema]` or `[k props schema]` → children `{:key k :properties props :schema <ast>}`; map-level props supported (commit: 4eb3d31)
+- [x] `:map-of`: exactly 2 children (key-schema, value-schema), optional props (commit: 4eb3d31)
+- [x] `:fn`: predicate fn stored as the single element of `:children`; props incl. `:error/message`. Both `[:fn pred]` and `[:fn {:error/message "..."} pred]` forms supported (commit: 4eb3d31)
+- [x] `:re`: child is a regex pattern or string (compile strings via `re-pattern`) (commit: 4eb3d31)
+- [x] `:multi`: props require `:dispatch`; children like map entries `[dispatch-value schema]` → `{:key v :schema <ast>}` (commit: 4eb3d31)
+- [x] `:ref`: `[:ref <kw>]` → `{:type :ref :ref <kw> :properties {} :children []}` (commit: 4eb3d31)
+- [x] Unknown form → `(throw (ex-info "Unknown schema" {:type :balli.core/invalid-schema :form form}))` (commit: 4eb3d31)
+- [x] Keywords registered in a custom registry normalize as refs to their registered schema (commit: 4eb3d31)
+- [x] `tests/test_normalize.lpy` covering every type + property placement + error on garbage (commit: 4eb3d31)
 
 **Checkpoints:**
 - `(normalize [:map [:id :string] [:age {:optional true} :int]] {})` → `{:type :map :properties {} :children [{:key :id :properties {} :schema {:type :string ...}} {:key :age :properties {:optional true} :schema {:type :int ...}}]}`

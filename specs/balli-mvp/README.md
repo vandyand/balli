@@ -52,7 +52,7 @@ See [research.md](research.md) for codebase context and REPL findings, and the [
 ## Implementation Status
 
 - [x] Phase 0: Project scaffold + toolchain spike
-- [ ] Phase 1: Normalize + builtin registry (form → AST)
+- [x] Phase 1: Normalize + builtin registry (form → AST)
 - [ ] Phase 2: Validator compiler + public core API
 - [ ] Phase 3: Explainer + explain data + assert-valid
 - [ ] Phase 4: Humanize
