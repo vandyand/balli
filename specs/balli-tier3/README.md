@@ -1,6 +1,6 @@
 ---
 title: "Balli Tier 3 — self-contained schemas, defaults, time, predicates, mutable registry"
-status: planned
+status: in-progress
 date: 2026-07-04
 priority: 10
 ---
