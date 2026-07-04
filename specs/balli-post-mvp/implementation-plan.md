@@ -47,10 +47,10 @@ Goal: `balli.transform` + core decode/encode/coerce per semantics §A.
 
 Goal: semantics §C.
 
-- [ ] `balli.core/walk`: form-level postwalk — `(walk s f)` / `(walk s f opts)`; f receives `[form path walked-children-form]`-rebuilt schema form; `schema-walker` helper. Walk map entries with key in path, indexed children with index; do NOT enter refs (ref child stays the keyword)
-- [ ] `src/balli/util.lpy`: `merge`, `union`, `select-keys`, `dissoc`, `optional-keys`, `required-keys`, `closed-schema`, `open-schema`, `get`, `get-in` — form→form fns per §C (accept forms or schema objects, return forms; normalize internally for entry introspection)
-- [ ] Per-branch `:or` explain in `compile.lpy`: all-branches-fail → concat each branch's errors with branch index appended to `:path` (`:in` unchanged); delete the single-generic-error simplification; update affected MVP tests (`tests/test_explain.lpy` :or cases) and the README difference bullet
-- [ ] `tests/test_util.lpy`: merge (props, duplicate keys, requiredness later-wins, deep nested-map merge, non-map s2-wins), union (equal forms, differing → `[:or]`, optional-in-either), select-keys/dissoc/optional-keys/required-keys/closed-schema (recursive, respects explicit `:closed false`)/open-schema/get/get-in; walk postwalk order + path correctness; **composition: `(closed-schema (u/merge A B))` then validate**
+- [x] `balli.core/walk`: form-level postwalk — `(walk s f)` / `(walk s f opts)`; f receives `[form path walked-children-form]`-rebuilt schema form; `schema-walker` helper. Walk map entries with key in path, indexed children with index; do NOT enter refs (ref child stays the keyword)
+- [x] `src/balli/util.lpy`: `merge`, `union`, `select-keys`, `dissoc`, `optional-keys`, `required-keys`, `closed-schema`, `open-schema`, `get`, `get-in` — form→form fns per §C (accept forms or schema objects, return forms; normalize internally for entry introspection)
+- [x] Per-branch `:or` explain in `compile.lpy`: all-branches-fail → concat each branch's errors with branch index appended to `:path` (`:in` unchanged); delete the single-generic-error simplification; update affected MVP tests (`tests/test_explain.lpy` :or cases) and the README difference bullet (commit: c82fed3)
+- [x] `tests/test_util.lpy`: merge (props, duplicate keys, requiredness later-wins, deep nested-map merge, non-map s2-wins), union (equal forms, differing → `[:or]`, optional-in-either), select-keys/dissoc/optional-keys/required-keys/closed-schema (recursive, respects explicit `:closed false`)/open-schema/get/get-in; walk postwalk order + path correctness; **composition: `(closed-schema (u/merge A B))` then validate** (commit: c82fed3)
 
 **Checkpoints:**
 - `(u/merge [:map [:x :int]] [:map [:x :string] [:y :int]])` → `[:map [:x :string] [:y :int]]`
