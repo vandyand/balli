@@ -815,6 +815,9 @@ Behavioral deviations:
 ## Development
 
 ```bash
+# quick confidence suite for fresh clones
+scripts/user_suite.sh   # or: basilisp test tests/test_user_suite.lpy
+
 # run the test suite (pytest via basilisp)
 basilisp test            # or: scripts/test.sh
 
@@ -822,7 +825,11 @@ basilisp test            # or: scripts/test.sh
 basilisp run scripts/compile_check.lpy
 ```
 
-There is no clj-kondo for Basilisp; the compile-check script (which imports every `src/**/*.lpy` namespace and fails on any compile error) is the lint step.
+`tests/test_user_suite.lpy` is a small public-surface smoke suite intended for
+users validating a clone quickly. `basilisp test` is the comprehensive developer
+suite. There is no clj-kondo for Basilisp; the compile-check script (which
+imports every `src/**/*.lpy` namespace and fails on any compile error) is the
+lint step.
 
 ## License
 
