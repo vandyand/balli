@@ -446,3 +446,9 @@
       (is (false? (b/validate s [1 1])))
       (is (= [1 ["a" "b"]] (b/parse s [1 "a" "b"])))
       (is (= [1 "a" "b"] (b/unparse s [1 ["a" "b"]]))))))
+
+(deftest repeat-negative-max-is-invalid-schema
+  (testing "negative :max rejected at the schema boundary"
+    (is (= :balli.core/invalid-schema
+           (try (b/validate [:repeat {:max -1} :int] [])
+                (catch python/Exception e (:type (ex-data e))))))))

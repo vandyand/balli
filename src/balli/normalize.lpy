@@ -286,6 +286,8 @@
           mx (:max props)]
       (when (and mn (neg? mn))
         (invalid! ":repeat :min must be non-negative" form))
+      (when (and mx (neg? mx))
+        (invalid! ":repeat :max must be non-negative" form))
       (when (and mn mx (> mn mx))
         (invalid! ":repeat :min must be <= :max" form)))
     (node :repeat props [(normalize (first elems) opts)] form)))
