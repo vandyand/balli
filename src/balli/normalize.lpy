@@ -16,8 +16,24 @@
   [msg form]
   (throw (ex-info msg {:type :balli.core/invalid-schema :form form})))
 
+(def ^:private bounded-types
+  "Types whose :min/:max properties participate in numeric comparisons at
+  validate time (string length, numeric value, collection count)."
+  #{:string :int :float :double :number :vector :sequential :set :map-of})
+
+(defn- check-bounds!
+  "Reject non-numeric :min/:max at the schema boundary so validators never
+  raise host comparison errors on garbage bounds."
+  [type props form]
+  (when (contains? bounded-types type)
+    (doseq [k [:min :max]]
+      (let [v (get props k)]
+        (when (and (some? v) (not (or (int? v) (float? v))))
+          (invalid! (str type " " k " must be a number") form))))))
+
 (defn- node
   [type props children form]
+  (check-bounds! type (or props {}) form)
   {:type type :properties (or props {}) :children (vec children) :form form})
 
 (defn- split-props

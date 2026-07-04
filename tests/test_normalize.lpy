@@ -265,3 +265,16 @@
     (is (= :balli.core/invalid-schema
            (try (normalize [:multi {:dispatch "kind"} [:x :int]] {})
                 (catch python/Exception e (:type (ex-data e))))))))
+
+(deftest non-numeric-bounds-are-invalid-schema
+  (testing "garbage :min/:max rejected at normalize time"
+    (doseq [form [[:int {:min :bad}]
+                  [:string {:max "10"}]
+                  [:vector {:min [1]} :int]
+                  [:map-of {:max :nope} :keyword :int]]]
+      (is (= :balli.core/invalid-schema
+             (try (normalize form {})
+                  (catch python/Exception e (:type (ex-data e)))))))
+    (testing "numeric bounds still accepted"
+      (is (= {:min 1 :max 5} (:properties (normalize [:int {:min 1 :max 5}] {}))))
+      (is (= {:min 0.5} (:properties (normalize [:float {:min 0.5}] {})))))))
