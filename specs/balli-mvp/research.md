@@ -53,7 +53,7 @@ Live probes against Basilisp 0.5.0 (`basilisp run -c ...`):
 
 ### Functional Requirements
 
-1. **Schema forms** (Malli vector syntax, canonical): `:any`, `:nil`, `:string`, `:int`, `:float`, `:number`, `:boolean`, `:keyword`, `:symbol`, `:uuid`, `:map`, `:map-of`, `:vector`, `:sequential`, `:set`, `:tuple`, `:enum`, `:=`, `:maybe`, `:and`, `:or`, `:not`, `:fn`, `:multi`, `:re`, `:ref`.
+1. **Schema forms** (Malli vector syntax, canonical): `:any`, `:nil`, `:string`, `:int`, `:float`, `:double`, `:number`, `:boolean`, `:keyword`, `:symbol`, `:uuid`, `:map`, `:map-of`, `:vector`, `:sequential`, `:set`, `:tuple`, `:enum`, `:=`, `:maybe`, `:and`, `:or`, `:not`, `:fn`, `:multi`, `:re`, `:ref`.
 2. **Properties**: optional second element map — `[:string {:min 1 :max 10}]`, `[:map {:closed true} ...]`, `[:int {:min 0}]`, map entries `[:age {:optional true} :int]`, `[:fn {:error/message "..."} pred]`, `[:multi {:dispatch :kind} ...]`.
 3. **Core API** (`balli.core`): `schema`, `schema?`, `form`, `properties`, `children`, `validate`, `validator`, `explain`, `explainer`, `assert-valid` (aka `coerce`-without-transform: returns value or throws ex-info with explain data).
 4. **Explain data** shaped like Malli: `{:schema <form> :value <input> :errors [{:path [...] :in [...] :schema <form> :value <failing> :type :balli.core/...}]}`; `explain` returns `nil` on success.

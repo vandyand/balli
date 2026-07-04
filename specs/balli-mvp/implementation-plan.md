@@ -36,7 +36,7 @@ Goal: every MVP schema form normalizes to a uniform AST map `{:type <kw> :proper
 - [ ] `src/balli/normalize.lpy`: `normalize` multimethod dispatching on `(cond (keyword? form) form (vector? form) (first form) :else ::unknown)`
 - [ ] Every AST node carries `:form` — the original schema-form fragment it was normalized from (Phase 3's explain errors report `:schema` as the original form, not the AST)
 - [ ] Scalars (`:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid`): bare keyword or `[kw props]` → `{:type kw :properties props-or-{} :children []}`
-- [ ] `:enum` / `:=`: children are the literal values (`:enum` optional props map as 2nd element must be distinguished from an enum value that is a map — rule: props map only counts when ≥1 further child follows, matching Malli)
+- [ ] `:enum` / `:=`: children are the literal values (optional props map as 2nd element must be distinguished from a literal value that is a map — rule: props map only counts when ≥1 further child follows, matching Malli). Cardinality enforced at normalize time: `:enum` requires ≥1 child, `:=` requires **exactly 1** child — violations throw `ex-info` with `:type :balli.core/invalid-schema`
 - [ ] `:maybe :not :vector :sequential :set`: single child schema, optional props
 - [ ] `:and :or :tuple`: N child schemas, optional props
 - [ ] `:map`: entries `[k schema]` or `[k props schema]` → children `{:key k :properties props :schema <ast>}`; map-level props supported
@@ -73,6 +73,12 @@ Goal: `balli.core/validate` works for every MVP type with properties enforced.
   - `:multi` → dispatch (keyword as fn or fn) → child schema by dispatch value; unknown dispatch → invalid
   - `:ref` → resolve at compile time, lazily wrap (delay/promise or fn indirection) so recursion doesn't loop
 - [ ] `src/balli/core.lpy`: `schema` (form+opts → schema map `{:balli/schema true :form ... :ast ... :registry ... :cache (atom {})}`), `schema?`, `form`, `properties`, `children`, `validator` (compiles + caches in schema's `:cache` atom), `validate` (accepts raw form or schema object)
+- [ ] **Public API signatures (canonical, all phases conform):**
+  - `(schema form)` / `(schema form opts)` — opts map supports `{:registry r}`; defaults to the builtin registry
+  - `(validator s)` / `(validator s opts)`, `(explainer s)` / `(explainer s opts)` — `s` is a raw form or schema object; opts ignored when `s` is already a schema object (its baked-in registry wins)
+  - `(validate s value)` / `(validate s value opts)`, `(explain s value)` / `(explain s value opts)`
+  - `(assert-valid s value)` / `(assert-valid s value opts)`
+  - `form`, `properties`, `children`, `schema?` — single arg
 - [ ] `tests/test_core.lpy`: validate happy/sad paths for every type, property bounds, closed maps, optional keys, nested structures, `:multi` with keyword dispatch
 
 **Checkpoints:**
@@ -89,7 +95,8 @@ Goal: Malli-shaped explain data with correct `:path`/`:in` for every type.
 
 - [ ] `compile-explainer [ast registry]` in `compile.lpy`: fn `[value path in]` → vector of error maps `{:path :in :schema <original-sub-form> :value :type}`. Error `:schema` carries the **original form fragment** (store original form on AST nodes during normalize as `:form`), not the AST
 - [ ] Error types: `:balli.core/invalid-type`, `:balli.core/missing-key`, `:balli.core/extra-key`, `:balli.core/invalid-dispatch-value`, `:balli.core/limits` (min/max violations), `:balli.core/enum-mismatch`, `:balli.core/not-eq`, `:balli.core/invalid` (generic, `:fn`/`:not`/`:or` failure)
-- [ ] Path semantics: map entry → key appended to both `:path` and `:in`; vector/set/sequential element → index appended to `:in`, `0` to `:path`; tuple element → index to both; `:map-of` → key into `:in`; `:and`/`:or` branch index into `:path` only; `:maybe`/`:multi` child transparent in `:in`
+- [ ] Path semantics: map entry → key appended to both `:path` and `:in`; vector/set/sequential element → index appended to `:in`, `0` to `:path`; tuple element → index to both; `:and`/`:or` branch index into `:path` only; `:maybe`/`:multi` child transparent in `:in`
+- [ ] `:map-of` explain semantics: **key**-schema failure → error `{:in [k] :path [0] :schema <key-form> :value k}`; **value**-schema failure → error `{:in [k] :path [1] :schema <value-form> :value v}` (child index 0 = key schema, 1 = value schema, mirroring the form)
 - [ ] `:or` failure emits one error at the `:or` node (Malli emits per-branch errors; MVP: single `:balli.core/invalid` error at the node — documented simplification)
 - [ ] Transients for error accumulation inside map/vector explainers (verified working at REPL)
 - [ ] `balli.core/explainer` and `explain` (nil on success; `{:schema form :value value :errors [...]}` on failure), cached like validator
