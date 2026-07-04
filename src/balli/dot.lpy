@@ -1,0 +1,62 @@
+(ns balli.dot
+  "Graphviz DOT export for Balli schemas."
+  (:require [balli.core :as b]
+            [balli.normalize :as norm]
+            [balli.registry :as reg]
+            [basilisp.string :as str]))
+
+(defn- esc
+  [x]
+  (-> (str x)
+      (.replace "\\" "\\\\")
+      (.replace "\"" "\\\"")
+      (.replace "\n" "\\n")))
+
+(defn- label
+  [node]
+  (if (= :ref (:type node))
+    (str ":ref " (:ref node))
+    (str (:type node))))
+
+(defn- child-entries
+  [node]
+  (case (:type node)
+    (:map :multi :orn :andn :catn :altn)
+    (mapv (fn [{:keys [key schema]}] [(str key) schema]) (:children node))
+
+    (mapv (fn [[i c]] [(str i) c]) (map-indexed vector (:children node)))))
+
+(defn- walk-dot
+  [node state]
+  (let [id (:next @state)]
+    (swap! state update :next inc)
+    (swap! state update :nodes conj (str "  n" id " [label=\"" (esc (label node)) "\"];"))
+    (doseq [[edge child] (child-entries node)]
+      (let [child-id (walk-dot child state)]
+        (swap! state update :edges conj
+               (str "  n" id " -> n" child-id " [label=\"" (esc edge) "\"];"))))
+    (when-some [de (:default-entry node)]
+      (let [child-id (walk-dot (:schema de) state)]
+        (swap! state update :edges conj
+               (str "  n" id " -> n" child-id " [label=\":balli.core/default\"];"))))
+    id))
+
+(defn transform
+  "Return a Graphviz DOT string for schema `s`. Refs are shown as ref nodes;
+  registry targets are not expanded, keeping recursive schemas finite."
+  ([s] (transform s {}))
+  ([s opts]
+   (let [registry (if (b/schema? s)
+                    (:registry s)
+                    (or (:registry opts) (reg/default-registry)))
+         ast (if (b/schema? s)
+               (:ast s)
+               (norm/normalize s {:registry registry}))
+         state (atom {:next 0 :nodes [] :edges []})]
+     (walk-dot ast state)
+     (str "digraph balli_schema {\n"
+          "  rankdir=LR;\n"
+          (str/join "\n" (:nodes @state))
+          "\n"
+          (str/join "\n" (:edges @state))
+          "\n}\n"))))

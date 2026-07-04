@@ -17,7 +17,7 @@
             [balli.util :as u]))
 
 (deftest install-and-core-validation-smoke
-  (is (= "0.3.0" b/version))
+  (is (= "0.4.0" b/version))
   (is (true? (b/validate [:map
                           [:id :string]
                           [:age {:optional true} [:int {:min 0}]]]

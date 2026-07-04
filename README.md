@@ -2,7 +2,7 @@
 
 Data-driven schemas for [Basilisp](https://github.com/basilisp-lang/basilisp), inspired by [Malli](https://github.com/metosin/malli).
 
-Schemas are plain data in Malli's vector syntax — no macros, no protocols to implement. Balli covers most of Malli's surface: validation and Malli-shaped explain data with `:path`/`:in`, humanized errors with key spell-checking, value transformation (decode/encode/coerce), parse/unparse with tagged branches, sequence (regex) schemas with an iterative backtracking engine, function schemas with generative checking and instrumentation, deterministic seeded generators, JSON Schema export, schema utilities (`merge`/`union`/`closed-schema`/...), form walking, schema inference from sample data, predicate/comparator schemas, time schemas, default branches, self-contained local registries, and mutable custom registries with recursive refs. Malli-inspired, not a strict port — see [Differences from Malli](#differences-from-malli). Pure Basilisp; no Python dependencies beyond the standard library.
+Schemas are plain data in Malli's vector syntax — no macros, no protocols to implement. Balli covers most of Malli's surface: validation and Malli-shaped explain data with `:path`/`:in`, humanized errors with key spell-checking, value transformation (decode/encode/coerce), parse/unparse with tagged branches, sequence (regex) schemas with an iterative backtracking engine, function schemas with generative checking and instrumentation, deterministic seeded generators, JSON Schema/OpenAPI/Swagger/DOT export, schema utilities (`merge`/`union`/`closed-schema`/...), form walking, schema inference from sample data, predicate/comparator schemas, time schemas, default branches, self-contained local registries, and mutable/lazy/dynamic custom registries with recursive refs. Malli-inspired, not a strict port — see [Differences from Malli](#differences-from-malli). Pure Basilisp; no Python dependencies beyond the standard library.
 
 ## Install
 
@@ -207,7 +207,7 @@ Infer a schema from sample data:
 
 ## Supported schemas
 
-All 49 builtin schema type keywords, each with a validating example. Predicate
+All 56 builtin schema type keywords, each with a validating example. Predicate
 schemas are supported too, but they are not builtin keywords: the schema is the
 predicate fn or quoted symbol itself, e.g. `int?` or `'int?`.
 
@@ -225,10 +225,16 @@ predicate fn or quoted symbol itself, e.g. `int?` or `'int?`.
 | `:symbol` | `(b/validate :symbol 'foo)` |
 | `:uuid` | `(b/validate :uuid (random-uuid))` |
 | `:time/instant` | `(b/validate :time/instant (datetime/datetime 2024 1 1 0 0 0 0 ** :tzinfo datetime.timezone/utc))` |
+| `:time/offset-date-time` | aware `datetime.datetime` |
+| `:time/zoned-date-time` | aware `datetime.datetime` whose `tzinfo` is `zoneinfo.ZoneInfo` |
 | `:time/local-date-time` | `(b/validate :time/local-date-time (datetime/datetime 2024 1 1))` |
 | `:time/local-date` | `(b/validate :time/local-date (datetime/date 2024 1 1))` |
 | `:time/local-time` | `(b/validate :time/local-time (datetime/time 10 0 0))` |
+| `:time/offset-time` | offset-aware `datetime.time` |
 | `:time/duration` | `(b/validate :time/duration (datetime/timedelta ** :seconds 900))` |
+| `:time/period` | map `{:years int :months int :days int}` |
+| `:time/zone-id` | IANA zone string accepted by `zoneinfo.ZoneInfo` |
+| `:time/zone-offset` | `datetime.timezone` |
 | `:map` | `(b/validate [:map [:x :int] [:y {:optional true} :string]] {:x 1})` |
 | `:map-of` | `(b/validate [:map-of :keyword :int] {:a 1 :b 2})` |
 | `:vector` | `(b/validate [:vector :int] [1 2 3])` |
@@ -239,6 +245,7 @@ predicate fn or quoted symbol itself, e.g. `int?` or `'int?`.
 | `:=` | `(b/validate [:= 42] 42)` |
 | `:maybe` | `(b/validate [:maybe :int] nil)` |
 | `:and` | `(b/validate [:and :int [:fn even?]] 4)` |
+| `:andn` | `(b/validate [:andn [:type :int] [:positive [:> 0]]] 7)` |
 | `:or` | `(b/validate [:or :int :string] "x")` |
 | `:orn` | `(b/validate [:orn [:num :int] [:str :string]] 42)` (named branches; parses to a `Tag`) |
 | `:not` | `(b/validate [:not :string] 1)` |
@@ -351,13 +358,19 @@ misses:
 | Schema | Python value |
 |---|---|
 | `:time/instant` | aware `datetime.datetime` (`tzinfo` not nil) |
+| `:time/offset-date-time` | aware `datetime.datetime` |
+| `:time/zoned-date-time` | aware `datetime.datetime` with `zoneinfo.ZoneInfo` |
 | `:time/local-date-time` | naive `datetime.datetime` |
 | `:time/local-date` | `datetime.date`, excluding `datetime.datetime` |
 | `:time/local-time` | naive `datetime.time` |
+| `:time/offset-time` | aware `datetime.time` |
 | `:time/duration` | `datetime.timedelta` |
+| `:time/period` | `{:years int :months int :days int}` |
+| `:time/zone-id` | IANA zone string accepted by `zoneinfo.ZoneInfo` |
+| `:time/zone-offset` | `datetime.timezone` |
 
-Time schemas support inclusive `:min`/`:max`, seeded generation, JSON Schema
-formats, and a separate transformer. The time transformer is intentionally
+Comparable time schemas support inclusive `:min`/`:max`, seeded generation,
+JSON Schema formats, and a separate transformer. The time transformer is intentionally
 not folded into `string-transformer` or `json-transformer`; compose it where
 you want string parsing or ISO encoding:
 
@@ -774,15 +787,20 @@ Maps with many distinct keys but uniform key/value shapes become `[:map-of k v]`
 | `balli.generator/generate` | `(generate s opts?)` — one value; `{:seed :size :registry}`. |
 | `balli.generator/sample` | `(sample s opts?)` — vector of values; `:size` is the count (default 10). |
 | `balli.generator/function-checker` | `(function-checker opts?)` — generative `:=>`/`:function` checker; `{:iterations n}` (default 100). |
-| `balli.provider/provide` | `(provide samples opts?)` — infer a schema form; `{:map-of-threshold n}`. |
+| `balli.openapi/schema` / `openapi` | Export an OpenAPI 3 schema object or minimal document. |
+| `balli.swagger/schema` / `swagger` | Export a Swagger 2 schema object or minimal document. |
+| `balli.dot/transform` | Export a Graphviz DOT string for a schema graph. |
+| `balli.provider/provide` | `(provide samples opts?)` — infer a schema form; `{:map-of-threshold n :infer-enums true :enum-threshold n :infer-tuples true}`. |
 | `balli.registry/registry` | `(registry & schema-maps)` — layer `{qualified-kw form}` maps over the default registry. |
+| `balli.registry/lazy-registry` | `(lazy-registry provider)` / `(lazy-registry base provider)` — provider-on-miss registry with memoized forms. |
+| `balli.registry/dynamic-registry` | `(dynamic-registry source)` — read an atom/fn source at raw-form lookup time. |
 | `balli.registry/default-registry` | `(default-registry)` — returns the current mutable default registry. |
 | `balli.registry/register!` | `(register! kw form)` / `(register! {kw form ...})` — merge schemas into the current default registry. |
 | `balli.registry/set-default-registry!` | `(set-default-registry! r)` — replace the mutable default registry. |
 | `balli.registry/composite` | `(composite r1 r2 ...)` — eager first-hit registry merge. |
 | `balli.registry/mutation-epoch` | atom — bumped by default-registry mutations; raw-form caches use it for invalidation. |
 | `balli.registry/resolve-ref` | `(resolve-ref reg k)` — registered form or nil. |
-| `balli.registry/builtin-types` | var — the set of 49 builtin type keywords. |
+| `balli.registry/builtin-types` | var — the set of 56 builtin type keywords. |
 
 Unknown or malformed schema forms throw `ex-info` with `:type :balli.core/invalid-schema`; a `:ref` to an unregistered keyword throws `:balli.core/unresolved-ref` at compile time (fail fast, not at validate).
 
@@ -791,12 +809,12 @@ Unknown or malformed schema forms throw `ex-info` with `:type :balli.core/invali
 Balli covers most of Malli's core surface but is Malli-**inspired**, not a port. Not implemented:
 
 - **No sexpr/serialized property code** — schema properties take real Basilisp fns (`:fn` children, `:dispatch`, `:gen/fmap`, `:decode/*` overrides, ...); there is no sci and no evaluation of quoted code.
-- **No `:andn`** and **no old (pre-0.18) parse format** shim.
-- **No var/dynamic/lazy registries** — Balli has plain registry maps, eager `composite`, local `:registry` properties, and a mutable default registry.
-- **Time schemas use Python's stdlib model** — `:time/instant`, `:time/local-date-time`, `:time/local-date`, `:time/local-time`, and `:time/duration` are implemented. Skipped: offset/zoned date-times as distinct types, offset-time, calendar periods, zone ids, and zone offsets.
+- **No old (pre-0.18) parse format** shim.
+- **No var registry** — Balli has plain registry maps, eager `composite`, local `:registry` properties, a mutable default registry, lazy registries, and explicit dynamic registries.
+- **Time schemas use Python's stdlib model** — offset/zoned distinctions follow Python `datetime`/`zoneinfo`, and `:time/period` is a map of calendar fields.
 - **No test.check shrinking** — generators produce single values; failures are not minimized.
 - **`:re`/`:fn` generation requires `:gen/*` props** — otherwise `:balli.core/no-generator` is thrown (Malli dynaloads test.chuck for regex generation).
-- **No `malli.dev`, `malli.experimental`, OpenAPI/Swagger, DOT, or clj-kondo modules.**
+- **No `malli.dev`, `malli.experimental`, or clj-kondo modules.**
 
 Behavioral deviations:
 
@@ -806,7 +824,7 @@ Behavioral deviations:
 - **`instrument` always arity-checks** — the argument-count check against the input seqex bounds runs on every call regardless of `:scope`.
 - **`:multi` keyword dispatch uses `get`** — a keyword `:dispatch` is looked up with `(get value k)` (nil on non-associative values → `:balli.core/invalid-dispatch-value`); it is not invoked as an arbitrary ifn. Fn dispatch must be Python-callable.
 - **`ifn?` uses `ifn-like?`** — real fns plus keywords, maps, and sets count as ifn-like; vectors and symbols are rejected even though Python/Basilisp callability is broader.
-- **Provider never tuple-izes** — same-arity vector samples infer `[:vector x]`, never `:tuple`; and mixed int/float samples infer `[:or :int :double]` (Basilisp `float?` rejects ints, so no single scalar type covers both). No `:enum` inference.
+- **Provider tuple/enum inference is opt-in** — pass `{:infer-tuples true}` or `{:infer-enums true}` for narrower hints. Mixed int/float samples infer `[:or :int :double]` (Basilisp `float?` rejects ints, so no single scalar type covers both).
 - **`:?` unparse is stricter** — the child unparser is tried first; only a nil the child rejects unparses to `[]`, and shape mismatches return `:balli.core/invalid` rather than best-effort output.
 - **JSON Schema ref names are JSON-Pointer-escaped** in `$ref` strings (`:tree/node` → `"#/definitions/tree~1node"`) with unescaped `"definitions"` keys; local-registry shadow collisions get `__2`, `__3`, ... suffixes; seqex types export as lossy `{"type" "array"}`.
 - **Set element `:in`** uses the element's seq-order ordinal (sets are unordered; the index identifies which element in seq order failed, not a stable position).

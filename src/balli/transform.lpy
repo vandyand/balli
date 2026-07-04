@@ -353,7 +353,9 @@
     ;; predicate + comparator schemas are leaves too (a comparator's child is
     ;; a plain value, never descended into)
     (:any :nil :string :int :float :double :number :boolean :keyword :symbol
-          :uuid :time/instant :time/local-date-time :time/local-date :time/local-time :time/duration
+          :uuid :time/instant :time/offset-date-time :time/zoned-date-time
+          :time/local-date-time :time/local-date :time/local-time :time/offset-time
+          :time/duration :time/period :time/zone-id :time/zone-offset
           :enum := :fn :re :balli/pred :> :>= :< :<= :not=)
     nil
 
@@ -374,6 +376,10 @@
 
     (:maybe :and :not)
     (children-in-order node registry chain method opts cache)
+
+    :andn
+    (let [node* (assoc node :children (mapv :schema (:children node)))]
+      (children-in-order node* registry chain method opts cache))
 
     :or (transform-or* (:children node) registry chain method opts cache)
     :orn (transform-or* (mapv :schema (:children node)) registry chain method opts cache)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "balli"
-version = "0.3.0"
+version = "0.4.0"
 description = "Data-driven schemas for Basilisp - Malli-inspired."
 requires-python = ">=3.10"
 dependencies = [

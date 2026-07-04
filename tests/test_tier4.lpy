@@ -1,0 +1,173 @@
+(ns tests.test-tier4
+  "Tier 4 feature tests: OpenAPI/Swagger, provider upgrades, :andn,
+  dynamic/lazy registries, richer time schemas, DOT, plus fuzz/stress."
+  (:import datetime random zoneinfo)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.dot :as dot]
+            [balli.error :as be]
+            [balli.generator :as bg]
+            [balli.json-schema :as js]
+            [balli.openapi :as openapi]
+            [balli.provider :as bp]
+            [balli.registry :as reg]
+            [balli.swagger :as swagger]
+            [balli.transform :as bt]))
+
+(defn- ex-type
+  [f]
+  (try
+    (f)
+    nil
+    (catch python/Exception e
+      (:type (ex-data e)))))
+
+(deftest andn-validates-explains-and-transforms
+  (let [s [:andn
+           [:type :int]
+           [:positive [:> 0]]
+           [:decoded [:int {:decode/string bt/-string->long}]]]]
+    (is (true? (b/validate s 7)))
+    (is (false? (b/validate s -1)))
+    (is (= [[:positive]]
+           (mapv :path (:errors (b/explain s -1)))))
+    (is (= ["should be larger than 0"]
+           (be/humanize (b/explain s -1))))
+    (is (= 42 (b/decode s "42" (bt/string-transformer))))
+    (is (= {"allOf" [{"type" "integer"} {"exclusiveMinimum" 0} {"type" "integer"}]}
+           (js/transform s)))))
+
+(deftest provider-enum-and-tuple-upgrades
+  (testing "defaults remain broad and stable"
+    (is (= :int (bp/provide [1 2 3])))
+    (is (= [:vector [:or :int :string]]
+           (bp/provide [[1 "a"] [2 "b"]]))))
+  (testing "enum inference is opt-in"
+    (is (= [:enum 1 2 3]
+           (bp/provide [1 2 1 3] {:infer-enums true})))
+    (is (= :int
+           (bp/provide [1 2 3 4] {:infer-enums true :enum-threshold 3}))))
+  (testing "tuple inference is opt-in and per-position"
+    (let [s (bp/provide [[1 "a"] [2 "b"]]
+                        {:infer-tuples true})]
+      (is (= [:tuple :int :string] s))
+      (is (true? (b/validate s [3 "c"])))
+      (is (false? (b/validate s ["c" 3]))))))
+
+(deftest lazy-and-dynamic-registries
+  (testing "lazy provider is called once per missing key and then memoized"
+    (let [calls (atom 0)
+          r (reg/lazy-registry
+             (fn [k]
+               (swap! calls inc)
+               (case k
+                 :lazy/id [:string {:min 1}]
+                 nil)))]
+      (is (true? (b/validate :lazy/id "abc" {:registry r})))
+      (is (false? (b/validate :lazy/id "" {:registry r})))
+      (is (= 1 @calls))))
+  (testing "dynamic registry reads its source at lookup time"
+    (let [source (atom {:dyn/id :int})
+          r (reg/dynamic-registry source)]
+      (is (true? (b/validate :dyn/id 1 {:registry r})))
+      (reset! source {:dyn/id :string})
+      (is (true? (b/validate :dyn/id "x" {:registry r}))
+          "raw-form cache keys include registry identity, but the dynamic resolver supplies the new target at compilation time"))))
+
+(deftest richer-time-schemas
+  (let [tt (bt/time-transformer)
+        offset-dt (datetime.datetime/fromisoformat "2024-01-01T12:00:00+02:00")
+        zoned-dt (datetime/datetime 2024 1 1 12 0 0 0
+                                    ** :tzinfo (zoneinfo/ZoneInfo "America/New_York"))
+        offset-time (datetime.time/fromisoformat "12:00:00+02:00")
+        period {:years 1 :months 2 :days 3}
+        zone-offset (datetime/timezone (datetime/timedelta ** :hours 2))]
+    (is (true? (b/validate :time/offset-date-time offset-dt)))
+    (is (true? (b/validate :time/zoned-date-time zoned-dt)))
+    (is (false? (b/validate :time/zoned-date-time offset-dt)))
+    (is (true? (b/validate :time/offset-time offset-time)))
+    (is (true? (b/validate :time/period period)))
+    (is (true? (b/validate :time/zone-id "UTC")))
+    (is (false? (b/validate :time/zone-id "Not/A_Zone")))
+    (is (true? (b/validate :time/zone-offset zone-offset)))
+    (is (= period (b/decode :time/period "P1Y2M3D" tt)))
+    (is (= "P1Y2M3D" (b/encode :time/period period tt)))
+    (is (= zone-offset (b/decode :time/zone-offset "+02:00" tt)))
+    (is (= "+02:00" (b/encode :time/zone-offset zone-offset tt)))
+    (is (true? (b/validate :time/zoned-date-time
+                           (b/decode :time/zoned-date-time
+                                     "2024-01-01T12:00:00-05:00[America/New_York]"
+                                     tt))))
+    (doseq [s [:time/offset-date-time :time/zoned-date-time :time/offset-time
+               :time/period :time/zone-id :time/zone-offset]]
+      (is (true? (b/validate s (bg/generate s {:seed 42})))
+          (str "generated value failed " s))
+      (is (= "string" (get (js/transform s) "type"))))
+    (is (= :balli.core/invalid-schema
+           (ex-type #(b/schema [:time/period {:min period}]))))))
+
+(deftest openapi-swagger-and-dot-export
+  (let [r (reg/registry {:user/id :int
+                         :user/user [:map [:id :user/id] [:name :string]]})
+        s [:ref :user/user]
+        open (openapi/schema s {:registry r})
+        doc (openapi/openapi s {:registry r
+                                :info {"title" "Users" "version" "1.2.3"}})
+        swag (swagger/swagger s {:registry r})
+        graph (dot/transform [:andn [:id :user/id] [:pos [:> 0]]] {:registry r})]
+    (is (= "#/components/schemas/user~1user" (get open "$ref")))
+    (is (contains? (get-in open ["components" "schemas"]) "user/user"))
+    (is (= "3.1.0" (get doc "openapi")))
+    (is (= "Users" (get-in doc ["info" "title"])))
+    (is (= "2.0" (get swag "swagger")))
+    (is (contains? (get swag "definitions") "user/user"))
+    (is (.startswith graph "digraph balli_schema"))
+    (is (some? (.find graph ":andn")))
+    (is (some? (.find graph ":pos")))))
+
+(def ^:private fuzz-schemas
+  [:time/offset-date-time
+   :time/zoned-date-time
+   :time/offset-time
+   :time/period
+   :time/zone-id
+   :time/zone-offset
+   [:andn [:intish :int] [:positive [:> -1000]]]
+   [:map [:created :time/zoned-date-time] [:period :time/period]]
+   [:vector :time/zone-id]])
+
+(defn- gen-fuzz-schema
+  [rnd]
+  (case (.randint rnd 0 5)
+    0 (.choice rnd fuzz-schemas)
+    1 [:maybe (.choice rnd fuzz-schemas)]
+    2 [:or (.choice rnd fuzz-schemas) (.choice rnd fuzz-schemas)]
+    3 [:vector {:min 0 :max 4} (.choice rnd fuzz-schemas)]
+    4 [:andn [:base (.choice rnd fuzz-schemas)]]
+    5 [:map [:x (.choice rnd fuzz-schemas)]]))
+
+(deftest tier4-fuzz-generation-export-roundtrips
+  (let [rnd (random/Random 20260704)]
+    (doseq [i (range 120)]
+      (let [s (gen-fuzz-schema rnd)
+            v (bg/generate s {:seed i :size 12})]
+        (is (true? (b/validate s v)) (str "generated invalid for " (pr-str s)))
+        (is (map? (js/transform s)))
+        (is (map? (openapi/schema s)))
+        (is (map? (swagger/schema s)))
+        (is (.startswith (dot/transform s) "digraph"))))))
+
+(deftest tier4-stress-lazy-registry-and-andn
+  (let [r (reg/lazy-registry
+           (fn [k]
+             (when (= :stress/node k)
+               [:andn
+                [:shape [:map
+                         [:id :int]
+                         [:kids {:optional true} [:vector [:ref :stress/node]]]]]
+                [:ok [:fn (fn [_] true)]]])))
+        v {:id 1 :kids [{:id 2 :kids [{:id 3}]}]}]
+    (doseq [_ (range 50)]
+      (is (true? (b/validate :stress/node v {:registry r})))
+      (is (nil? (b/explain :stress/node v {:registry r}))))
+    (is (false? (b/validate :stress/node {:id "bad"} {:registry r})))))

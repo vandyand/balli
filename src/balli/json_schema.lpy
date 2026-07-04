@@ -33,7 +33,8 @@
   it directly)."
   (:require [balli.core :as b]
             [balli.normalize :as norm]
-            [balli.registry :as reg]))
+            [balli.registry :as reg]
+            [balli.time :as bt]))
 
 (declare ^:private -transform)
 
@@ -242,16 +243,17 @@
       :boolean {"type" "boolean"}
       (:keyword :symbol) {"type" "string"}
       :uuid {"type" "string" "format" "uuid"}
-      (:time/instant :time/local-date-time) {"type" "string" "format" "date-time"}
-      :time/local-date {"type" "string" "format" "date"}
-      :time/local-time {"type" "string" "format" "time"}
-      :time/duration {"type" "string" "format" "duration"}
+      (:time/instant :time/offset-date-time :time/zoned-date-time
+       :time/local-date-time :time/local-date :time/local-time :time/offset-time
+       :time/duration :time/period :time/zone-id :time/zone-offset)
+      {"type" "string" "format" (:json-format (bt/type-spec (:type node)))}
       := {"const" (render-value (first children))}
       :enum (let [t (infer-enum-type children)]
               (cond-> {"enum" (mapv render-value children)}
                 t (assoc "type" t)))
       :not {"not" (child (first children))}
       :and {"allOf" (mapv child children)}
+      :andn {"allOf" (mapv #(child (:schema %)) children)}
       :or {"anyOf" (mapv child children)}
       ;; entry tags are a parse-time concern -- JSON Schema sees the branches
       :orn {"anyOf" (mapv #(child (:schema %)) children)}
