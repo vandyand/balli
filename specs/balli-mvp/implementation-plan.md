@@ -93,15 +93,15 @@ Goal: `balli.core/validate` works for every MVP type with properties enforced.
 
 Goal: Malli-shaped explain data with correct `:path`/`:in` for every type.
 
-- [ ] `compile-explainer [ast registry]` in `compile.lpy`: fn `[value path in]` → vector of error maps `{:path :in :schema <original-sub-form> :value :type}`. Error `:schema` carries the **original form fragment** (store original form on AST nodes during normalize as `:form`), not the AST
-- [ ] Error types: `:balli.core/invalid-type`, `:balli.core/missing-key`, `:balli.core/extra-key`, `:balli.core/invalid-dispatch-value`, `:balli.core/limits` (min/max violations), `:balli.core/enum-mismatch`, `:balli.core/not-eq`, `:balli.core/invalid` (generic, `:fn`/`:not`/`:or` failure)
-- [ ] Path semantics: map entry → key appended to both `:path` and `:in`; vector/set/sequential element → index appended to `:in`, `0` to `:path`; tuple element → index to both; `:and`/`:or` branch index into `:path` only; `:maybe`/`:multi` child transparent in `:in`
-- [ ] `:map-of` explain semantics: **key**-schema failure → error `{:in [k] :path [0] :schema <key-form> :value k}`; **value**-schema failure → error `{:in [k] :path [1] :schema <value-form> :value v}` (child index 0 = key schema, 1 = value schema, mirroring the form)
-- [ ] `:or` failure emits one error at the `:or` node (Malli emits per-branch errors; MVP: single `:balli.core/invalid` error at the node — documented simplification)
-- [ ] Transients for error accumulation inside map/vector explainers (verified working at REPL)
-- [ ] `balli.core/explainer` and `explain` (nil on success; `{:schema form :value value :errors [...]}` on failure), cached like validator
-- [ ] `balli.core/assert-valid`: returns value or `(throw (ex-info "Validation failed" <explain-map-plus :type :balli.core/invalid-input>))`
-- [ ] `tests/test_explain.lpy`: exact explain shapes for nested map/vector failures, missing/extra keys, multi dispatch miss, min/max, success → nil
+- [x] `compile-explainer [ast registry]` in `compile.lpy`: fn `[value path in]` → vector of error maps `{:path :in :schema <original-sub-form> :value :type}`. Error `:schema` carries the **original form fragment** (store original form on AST nodes during normalize as `:form`), not the AST (commit: 3cf05f5)
+- [x] Error types: `:balli.core/invalid-type`, `:balli.core/missing-key`, `:balli.core/extra-key`, `:balli.core/invalid-dispatch-value`, `:balli.core/limits` (min/max violations), `:balli.core/enum-mismatch`, `:balli.core/not-eq`, `:balli.core/invalid` (generic, `:fn`/`:not`/`:or` failure) (commit: 3cf05f5)
+- [x] Path semantics: map entry → key appended to both `:path` and `:in`; vector/set/sequential element → index appended to `:in`, `0` to `:path`; tuple element → index to both; `:and`/`:or` branch index into `:path` only; `:maybe`/`:multi` child transparent in `:in` (commit: 3cf05f5)
+- [x] `:map-of` explain semantics: **key**-schema failure → error `{:in [k] :path [0] :schema <key-form> :value k}`; **value**-schema failure → error `{:in [k] :path [1] :schema <value-form> :value v}` (child index 0 = key schema, 1 = value schema, mirroring the form) (commit: 3cf05f5)
+- [x] `:or` failure emits one error at the `:or` node (Malli emits per-branch errors; MVP: single `:balli.core/invalid` error at the node — documented simplification) (commit: 3cf05f5)
+- [x] Transients for error accumulation inside map/vector explainers (verified working at REPL) (commit: 3cf05f5)
+- [x] `balli.core/explainer` and `explain` (nil on success; `{:schema form :value value :errors [...]}` on failure), cached like validator (commit: 3cf05f5)
+- [x] `balli.core/assert-valid`: returns value or `(throw (ex-info "Validation failed" <explain-map-plus :type :balli.core/invalid-input>))` (commit: 3cf05f5)
+- [x] `tests/test_explain.lpy`: exact explain shapes for nested map/vector failures, missing/extra keys, multi dispatch miss, min/max, success → nil (commit: 3cf05f5)
 
 **Checkpoints:**
 - `(b/explain [:vector :int] [1 "x"])` → errors `[{:path [0] :in [1] :schema :int :value "x" :type :balli.core/invalid-type}]`
