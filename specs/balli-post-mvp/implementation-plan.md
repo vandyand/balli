@@ -15,12 +15,12 @@ Eleven phases closing the Malli feature gap, dependency-ordered: spike → trans
 
 Goal: prove the Basilisp facilities the hard phases depend on, before building on them.
 
-- [ ] `defrecord Tag [key value]` + `Tags [values]`: construction, field access (`:key`, `(.-key r)`), value equality, `instance?` checks, printing. If defrecord is unusable, decide fallback (marker maps `{:balli/tag true ...}`) and record it here + in research.md
-- [ ] Python `random` interop: `(random/Random 42)` seeded instance, `.randint`, `.uniform`, `.choice` on a Basilisp vector (may need `(vec ...)`→python list conversion — verify), determinism across two same-seed instances
-- [ ] Thunk-stack loop viability: a `loop/recur` driver popping closures from a Python list (or Basilisp vector in an atom/volatile) — run 100k thunk iterations, confirm no recursion error and <2s
-- [ ] `volatile!`/`vswap!` availability (else atoms)
-- [ ] `sequential?` on lists/vectors/lazy-seqs/ranges; NOT strings/sets/maps
-- [ ] Record findings in this file under "Phase 0 findings"; adjust later-phase notes if invalidated
+- [x] `defrecord Tag [key value]` + `Tags [values]`: construction, field access (`:key`, `(.-key r)`), value equality, `instance?` checks, printing. If defrecord is unusable, decide fallback (marker maps `{:balli/tag true ...}`) and record it here + in research.md
+- [x] Python `random` interop: `(random/Random 42)` seeded instance, `.randint`, `.uniform`, `.choice` on a Basilisp vector (may need `(vec ...)`→python list conversion — verify), determinism across two same-seed instances
+- [x] Thunk-stack loop viability: a `loop/recur` driver popping closures from a Python list (or Basilisp vector in an atom/volatile) — run 100k thunk iterations, confirm no recursion error and <2s
+- [x] `volatile!`/`vswap!` availability (else atoms)
+- [x] `sequential?` on lists/vectors/lazy-seqs/ranges; NOT strings/sets/maps
+- [x] Record findings in this file under "Phase 0 findings"; adjust later-phase notes if invalidated
 
 **Checkpoints:** each bullet is its own `basilisp run -c` probe; report exact outputs. No test file (spike only).
 
@@ -194,3 +194,79 @@ Completion gate: full `basilisp test` + compile_check + README examples spot-run
 ## Rollback
 
 Single branch `balli-post-mvp`; rollback = branch deletion. Main holds shipped MVP.
+
+## Phase 0 findings
+
+Probed 2026-07-04 on Basilisp 0.5.0 (WSL2, Python 3), via `basilisp run -c` / `/tmp` scripts. All probes ran clean; exact outputs below.
+
+### 1. defrecord — USABLE. Decision: Tag/Tags = defrecord (no fallback needed)
+
+`(defrecord Tag [key value])`, `(defrecord Tags [values])`:
+- Construction: `(->Tag :num 42)`, `(Tag. :num 42)`, `(map->Tag {...})` all work.
+- Access: `(:key r)` → `:num`; `(.-key r)` → `:num`. Both fine.
+- Value equality: `(= (->Tag :num 42) (->Tag :num 42))` → `true`; hashes equal; `(= r (->Tag :num 43))` → `false`; `(= r {:key :num :value 42})` → `false` (record ≠ plain map — good, the guard can't be fooled by equality).
+- `(instance? Tag r)` → `true`; cross-type → `false`. `record?` → `true`.
+- Printing: `#basilisp.user.Tag{:key :num, :value 42}`.
+- **`(map? r)` → `true` — records ARE map? in Basilisp (same as Clojure).** The Phase 5 `:map` parse guard MUST exclude records explicitly: `(and (map? x) (not (instance? Tag x)) (not (instance? Tags x)))` (or `(not (record? x))`).
+- `assoc` preserves record type; `keys`/`vals`/`seq` work.
+- **Basilisp record quirks (avoid these patterns on records):**
+  - `(get r :missing :default)` → `nil` (default IGNORED); same for `(:missing r :default)` → `nil`. Do not rely on get-with-default against a record.
+  - `(contains? r :key)` → `:key` (returns the key, truthy but not `true`); `(contains? r :missing)` → `false` correctly. Fine in boolean position only.
+
+### 2. Python random interop — WORKS, `.choice` takes Basilisp vectors directly
+
+- `(import random)` + `(random/Random 42)` fine. `(.randint r 1 10)` → `2`, `(.uniform r 0 1)` → `0.025010755222666936` (seed 42), `.gauss`/`.random` fine.
+- **`(.choice r [:a :b :c])` works on a Basilisp vector directly** — no python list conversion needed (vectors implement the Python sequence protocol). Also works on python lists and strings.
+- Determinism: two fresh `(random/Random 7)` instances produce identical 20-draw `.randint` sequences (`true`). Phase 7 seed threading is safe.
+
+### 3. Thunk-stack driver — VIABLE. Decision: raw Python list via interop
+
+100k thunk executions where each thunk pushes the next (self-replenishing chain), driver = top-level `loop/recur` popping until empty:
+- Python list (`.append`/`.pop`): **100,000 thunks in ~3.27 s, no RecursionError** (repeatable: 3.27/3.28 s).
+- `collections.deque`: 3.64 s — no better than list.
+- Atom + Basilisp vector (`swap! conj`/`peek`/`pop`): **30.9 s — 10x slower. Rejected.**
+- Baselines explaining the budget: empty `loop/recur` 100k ≈ 5.1–5.8 s (Basilisp per-iteration overhead ~50 µs; raw Python while-loop is 0.011 s); `vswap!` or `swap!` add ~70–90 µs/op (100k vswap! loop ≈ 12–14 s). Scaling is linear (10k ≈ 0.60 s).
+- **Plan edit: the Phase 0 "<2 s per 100k" target is not achievable on this substrate — revise expectation to "no RecursionError, linear scaling, ≲4 s per 100k thunks".** Realistic seqex inputs are orders of magnitude below 100k thunks; the Phase 6 pathological-memo test budget (`[:* [:* :int]]` on 30 elements < 2 s) remains comfortably safe.
+- **Hot-loop rule for Phase 6:** stack, memo set, and success box should be Python-native mutables (`python/list`, `python/set`) mutated via interop; avoid `vswap!`/`swap!` inside the driver loop.
+
+### 4. volatile! — EXISTS
+
+`volatile!`, `vswap!`, `vreset!`, `volatile?` all present and correct (`@v` after `(vswap! v inc)` `(vswap! v + 10)` → `11`). But per timing above, volatiles are no cheaper than atoms in Basilisp (~70+ µs/op) — prefer Python list/set mutation in hot paths; volatiles fine for cold-path cells.
+
+### 5. sequential? — Clojure-consistent, plus interop caveats
+
+| value | sequential? |
+|---|---|
+| `[1 2 3]` | true |
+| `(list 1 2 3)` | true |
+| `(map inc [1 2])` (lazy seq) | true |
+| `(range 3)` | true |
+| `"abc"` | false |
+| `#{1 2}` | false |
+| `{:a 1}` | false |
+| `nil` | false |
+| record instance | false |
+| `python/list`, `python/tuple` | **false** |
+
+Python lists/tuples are NOT `sequential?` — the Phase 6 top-level seqex guard will reject raw Python sequences (acceptable; matches the Basilisp data model; document if it ever surfaces).
+
+### 6. Bonus probes
+
+- `(str :ns/kw)` → `":ns/kw"` (leading colon, namespace included); `(name :ns/kw)` → `"kw"`, `(namespace :ns/kw)` → `"ns"`. JSON-schema `$ref` naming via `(subs (str kw) 1)` works as planned.
+- `(keyword "a" "b")` → `:a/b`; `(keyword "c")` → `:c`.
+- **`(python/callable :kw)` → `true`** — and also `true` for maps, sets, vectors, and symbols (they all implement `__call__`). **Plan edit for Phase 8:** bare `python/callable` is too broad for `:=>` validate (a keyword or map would validate as a function). `fn?` is too narrow (`false` for Python builtins like `operator/add` and bound methods, which are legitimate callables in Basilisp interop). `ifn?` is Clojure-like (`true` for keywords/maps). Use a combined predicate, e.g. `(or (fn? x) (and (python/callable x) (not (coll? x)) (not (keyword? x)) (not (symbol? x))))` — finalize exact shape in Phase 8; the existing checkpoints (`inc` → true, `5` → false) hold either way.
+- `sorted-by` does NOT exist (`resolve` → nil); `sort-by` does, including comparator arity (`(sort-by :k > ...)` works).
+- `format` works with Python-style `%s`/`%d` (`(format "x=%s n=%d" :kw 42)` → `"x=:kw n=42"`); plain `str` concatenation renders keywords with colons — good for humanize messages like `"should be spelled :name"`.
+- `update-in` (map and vector paths) and `reduce-kv` (maps AND vectors, index as key) both work.
+
+### Decisions summary
+
+| Question | Decision |
+|---|---|
+| Tag/Tags representation | `defrecord` in `balli.core` (Phase 5 as planned) |
+| `:map` parse guard | `map?` alone insufficient — add `(not (record? x))` / instance checks |
+| Mutable stack for regex driver | Raw `python/list` via interop; Python-native mutables for all driver-hot state |
+| volatile! availability | Available; use freely outside hot loops |
+| Thunk budget | Revise "<2 s/100k" → "≲4 s/100k, no RecursionError"; Phase 6 test budgets unaffected |
+| `:=>` callable check (Phase 8) | Not bare `python/callable`; combined `fn?`-or-filtered-callable predicate |
+| Generator RNG (Phase 7) | `random.Random` instance; `.choice` on Basilisp vectors directly, no conversion |
