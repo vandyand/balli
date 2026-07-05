@@ -1,0 +1,53 @@
+(ns tests.test-compatibility-corpus
+  "CI-backed evidence for the public Malli compatibility matrix."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.destructure :as destructure]
+            [balli.generator :as bg]
+            [balli.json-schema :as json-schema]
+            [balli.lite :as lite]
+            [balli.registry :as reg]
+            [balli.transform :as bt]))
+
+(def compatibility-cases
+  [{:area "vector syntax" :schema [:map [:id :int]] :valid {:id 1} :invalid {:id "1"}}
+   {:area "map AST syntax"
+    :schema {:type :map :children [{:key :id :schema {:type :int}}]}
+    :valid {:id 1}
+    :invalid {:id "1"}}
+   {:area "lite syntax" :schema (lite/form {:id :int :tags [:keyword]})
+    :valid {:id 1 :tags [:a]} :invalid {:id "1" :tags [:a]}}
+   {:area ":seqable" :schema [:seqable :int] :valid #{1 2} :invalid [1 "x"]}
+   {:area ":every" :schema [:every {:coll-check-limit 2} :int]
+    :valid [1 2 "unchecked"] :invalid [1 "checked"]}
+   {:area "function shorthand" :schema [:-> :int :int] :valid inc :invalid 1}
+   {:area "regex sequence" :schema [:cat :int [:* :string]]
+    :valid [1 "a" "b"] :invalid [1 "a" 2]}
+   {:area "default branch"
+    :schema [:map {:closed true} [:id :int] [:balli.core/default [:map-of :keyword :string]]]
+    :valid {:id 1 :extra "ok"} :invalid {:id 1 :extra 2}}])
+
+(deftest compatibility-corpus-validates
+  (doseq [{:keys [area schema valid invalid]} compatibility-cases]
+    (testing area
+      (is (true? (b/validate schema valid)))
+      (is (false? (b/validate schema invalid))))))
+
+(deftest compatibility-corpus-cross-surface
+  (testing "registries"
+    (let [r (reg/registry {:user/id :int
+                           :user/user [:map [:id :user/id]]})]
+      (is (true? (b/validate :user/user {:id 1} {:registry r})))))
+  (testing "transformers and exporters"
+    (let [schema [:map [:age :int] [:tags [:set :keyword]]]
+          decoded (b/decode schema {:age "42" :tags ["a"]}
+                            (bt/transformer (bt/string-transformer)
+                                            (bt/collection-transformer)))]
+      (is (= {:age 42 :tags #{:a}} decoded))
+      (is (map? (json-schema/transform schema)))))
+  (testing "generation and destructuring"
+    (let [schema [:map [:id :int] [:profile [:map [:name :string]]]]
+          value {:id 1 :profile {:name "Ada"}}
+          generated (bg/generate schema {:seed 10})]
+      (is (true? (b/validate schema generated)))
+      (is (= value (destructure/destructure schema value))))))

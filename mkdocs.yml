@@ -1,0 +1,31 @@
+site_name: Balli
+site_description: Data-driven schemas for Basilisp, inspired by Malli.
+site_url: https://vandyand.github.io/balli/
+repo_url: https://github.com/vandyand/balli
+repo_name: vandyand/balli
+theme:
+  name: readthedocs
+nav:
+  - Home: index.md
+  - Install: install.md
+  - Quick Start: quick-start.md
+  - Cookbook:
+      - Overview: cookbook/index.md
+      - Validation and Errors: cookbook/validation.md
+      - Coercion and Transforms: cookbook/coercion.md
+      - Registries: cookbook/registries.md
+      - OpenAPI and JSON Schema: cookbook/openapi.md
+      - Generation and Testing: cookbook/generation.md
+      - Function Instrumentation: cookbook/functions.md
+  - Examples: examples.md
+  - API Reference: api/index.md
+  - Compatibility:
+      - Malli Matrix: malli-compatibility.md
+      - CI Evidence: compatibility-evidence.md
+  - Benchmarks: benchmarks.md
+  - Contributing: contributing.md
+markdown_extensions:
+  - toc:
+      permalink: true
+  - tables
+  - fenced_code

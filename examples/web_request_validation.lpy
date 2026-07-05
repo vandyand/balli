@@ -1,0 +1,25 @@
+(ns examples.web-request-validation
+  (:require [balli.core :as b]
+            [balli.error :as be]
+            [balli.transform :as bt]))
+
+(def request-schema
+  [:map
+   [:user/id :uuid]
+   [:limit [:int {:min 1 :max 100}]]
+   [:tags {:optional true} [:set :keyword]]])
+
+(def raw-request
+  {:user/id "4283fefc-63f0-cd0e-873a-0000c6d07ef7"
+   :limit "25"
+   :tags ["new" "paid"]})
+
+(def decoded
+  (b/decode request-schema raw-request
+            (bt/transformer (bt/json-transformer)
+                            (bt/string-transformer)
+                            (bt/collection-transformer))))
+
+(if (b/validate request-schema decoded)
+  (println decoded)
+  (println (be/humanize (b/explain request-schema decoded))))

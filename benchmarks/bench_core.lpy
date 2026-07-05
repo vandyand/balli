@@ -1,0 +1,43 @@
+(ns benchmarks.bench-core
+  (:import time)
+  (:require [balli.core :as b]
+            [balli.generator :as bg]
+            [balli.transform :as bt]))
+
+(defn- now [] (time/perf_counter))
+
+(defn- bench
+  [label n f]
+  (let [start (now)]
+    (dotimes [_ n] (f))
+    (let [elapsed-ms (* 1000.0 (- (now) start))]
+      (println label ":" n "ops in" (format "%.2f" elapsed-ms) "ms"))))
+
+(def user-schema
+  [:map
+   [:id :uuid]
+   [:name [:string {:min 1}]]
+   [:age [:int {:min 0 :max 140}]]
+   [:tags [:vector :keyword]]])
+
+(def user-value
+  {:id #uuid "4283fefc-63f0-cd0e-873a-0000c6d07ef7"
+   :name "Ada"
+   :age 37
+   :tags [:admin :paid]})
+
+(def request-schema
+  [:map [:age :int] [:tags [:set :keyword]]])
+
+(def raw-request
+  {:age "42" :tags ["a" "b" "c"]})
+
+(def transformer
+  (bt/transformer (bt/string-transformer)
+                  (bt/collection-transformer)))
+
+(bench "validate map" 1000 #(b/validate user-schema user-value))
+(bench "validate vector" 1000 #(b/validate [:vector :int] [1 2 3 4 5]))
+(bench "parse orn" 1000 #(b/parse [:orn [:n :int] [:s :string]] 42))
+(bench "decode request" 250 #(b/decode request-schema raw-request transformer))
+(bench "generate user" 100 #(bg/generate user-schema {:seed 1}))

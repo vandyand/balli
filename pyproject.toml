@@ -6,14 +6,41 @@ build-backend = "setuptools.build_meta"
 name = "balli"
 version = "0.6.0"
 description = "Data-driven schemas for Basilisp - Malli-inspired."
+readme = "README.md"
+license = "MIT"
+authors = [
+  {name = "Andrew VanDyke"},
+]
 requires-python = ">=3.10"
 dependencies = [
-  "basilisp>=0.5.0",
+  "basilisp>=0.5.0,<0.5.1",
 ]
+keywords = ["basilisp", "schema", "validation", "malli", "clojure"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Libraries",
+  "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.urls]
+Homepage = "https://github.com/vandyand/balli"
+Documentation = "https://vandyand.github.io/balli/"
+Repository = "https://github.com/vandyand/balli"
+Issues = "https://github.com/vandyand/balli/issues"
+Changelog = "https://github.com/vandyand/balli/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
+  "build>=1.2",
   "pytest>=8.0",
+]
+docs = [
+  "mkdocs>=1.6",
 ]
 
 [tool.setuptools.packages.find]
