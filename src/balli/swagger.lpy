@@ -10,6 +10,11 @@
   ([s opts]
    (json-schema/transform s opts)))
 
+(defn- split-schema
+  [s opts]
+  (let [sch (schema s opts)]
+    [(dissoc sch "definitions") (get sch "definitions")]))
+
 (defn swagger
   "Build a minimal Swagger 2.0 document.
   opts:
@@ -28,3 +33,24 @@
        (:host opts) (assoc "host" (:host opts))
        (:basePath opts) (assoc "basePath" (:basePath opts))
        (:schemes opts) (assoc "schemes" (:schemes opts))))))
+
+(defn parameter
+  "Swagger 2 parameter object. For body parameters, puts schema under
+  \"schema\"; otherwise merges scalar schema keys into the parameter."
+  [name in s & [opts]]
+  (let [opts (or opts {})
+        [sch defs] (split-schema s opts)
+        base {"name" name "in" in "required" (not (false? (:required opts)))}]
+    (cond-> (if (= "body" in)
+              (assoc base "schema" sch)
+              (merge base sch))
+      defs (assoc "definitions" defs))))
+
+(defn response
+  "Swagger 2 response object for schema `s`."
+  ([s] (response s {}))
+  ([s opts]
+   (let [[sch defs] (split-schema s opts)]
+     (cond-> {"description" (or (:description opts) "OK")
+              "schema" sch}
+       defs (assoc "definitions" defs)))))

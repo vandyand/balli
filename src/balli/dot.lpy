@@ -16,7 +16,7 @@
   [node]
   (if (= :ref (:type node))
     (str ":ref " (:ref node))
-    (str (:type node))))
+    (str (if (= :balli/ext (:type node)) (:ext-type node) (:type node)))))
 
 (defn- child-entries
   [node]

@@ -181,8 +181,8 @@
 ;; Throws
 
 (deftest no-generator-throws
-  (is (= :balli.core/no-generator
-         (ex-type #(bg/generate [:re "a+"] {:seed 0}))))
+  (is (true? (b/validate [:re "a+"]
+                         (bg/generate [:re "a+"] {:seed 0 :size 8}))))
   (is (= :balli.core/no-generator
          (ex-type #(bg/generate [:fn int?] {:seed 0})))))
 

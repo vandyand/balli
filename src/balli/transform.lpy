@@ -25,6 +25,7 @@
   (nil collapses to identity at the API layer -- no identity-fn wrapping)."
   (:import uuid)
   (:require [balli.compile :as c]
+            [balli.extension :as ext]
             [balli.normalize :as norm]
             [balli.registry :as reg]
             [balli.time :as time]))
@@ -168,6 +169,15 @@
 ;; Per-node compilation (leave . children . enter, nil sub-trees collapse)
 
 (declare transform-node)
+
+(defn- extension-transformer
+  [node registry chain method opts cache]
+  (when-some [f (get (ext/type-spec (:ext-type node))
+                     (if (= :decode method) :decode :encode))]
+    (let [props (:properties node)
+          child-ts (mapv #(transform-node % registry chain method opts cache)
+                         (:children node))]
+      (-interceptor (fn [x] (f x props child-ts)) node opts))))
 
 (defn- guard
   "Apply `tf` only when `pred` holds, else pass through. nil tf stays nil."
@@ -359,6 +369,9 @@
           :enum := :fn :re :balli/pred :> :>= :< :<= :not=)
     nil
 
+    :balli/ext
+    nil
+
     ;; seqex types: pass-through (no per-element descent -- a seqex element's
     ;; schema depends on the match, which transformers do not run)
     (:cat :catn :alt :altn :? :* :+ :repeat)
@@ -394,7 +407,9 @@
   "Node combinator: leave(children(enter(x))), absent parts elided; whole
   subtree nil => nil (identity pass-through)."
   [node registry chain method opts cache]
-  (let [this-t (-value-transformer chain node method opts)
+  (let [this-t (or (-value-transformer chain node method opts)
+                   (when (= :balli/ext (:type node))
+                     (extension-transformer node registry chain method opts cache)))
         child-t (transform-children node registry chain method opts cache)]
     (if this-t
       (-intercepting this-t child-t)

@@ -19,7 +19,8 @@
   into :balli.error/misspelled-key / :balli.error/misspelled-value errors
   (levenshtein distance vs the declared keys) and drops the missing-key
   errors those typos explain."
-  (:require [balli.normalize :as norm]
+  (:require [balli.extension :as ext]
+            [balli.normalize :as norm]
             [balli.time :as bt]
             [basilisp.string :as str]))
 
@@ -115,6 +116,13 @@
    'fn? "should be a function"
    'zero? "should be zero"})
 
+(def ^:private locale-messages
+  {:en {}
+   :es {:balli.core/invalid-type "tipo invalido"
+        :balli.core/missing-key "falta una clave requerida"
+        :balli.core/extra-key "clave no permitida"
+        :balli.core/invalid "valor invalido"}})
+
 (defn- invalid-message
   "Message for a :balli.core/invalid error, dispatching on the failing form's
   HEAD (already split by split-form): comparator keywords render their bound
@@ -171,12 +179,25 @@
 
       :else "invalid value")))
 
+(defn- extension-message
+  [t]
+  (when (keyword? t)
+    (:message (ext/type-spec t))))
+
 (defn- error-message
   "Message for a single error map. :error/message on the failing schema
   fragment's properties overrides the default table."
-  [{:keys [type schema] :as error}]
+  ([error] (error-message error {}))
+  ([{:keys [type schema] :as error} opts]
   (let [[t props children] (split-form schema)]
-    (or (:error/message props)
+    (or (when-some [f (:error/fn props)]
+          (f error opts))
+        (when-some [messages (:error/messages props)]
+          (get messages (or (:locale opts) :en)))
+        (:error/message props)
+        (get (:messages opts) type)
+        (get-in locale-messages [(or (:locale opts) :en) type])
+        (extension-message t)
         (case type
           :balli.core/invalid-type (get type-messages t "invalid type")
           :balli.core/invalid (invalid-message t children)
@@ -192,7 +213,8 @@
           (str "should be spelled "
                (str/join " or " (map (comp str last)
                                      (:balli.error/likely-misspelling-of error))))
-          "invalid value"))))
+          :balli.extension/invalid "invalid value"
+          "invalid value")))))
 
 ;; ---------------------------------------------------------------------------
 ;; Spell-checking (semantics §D)
@@ -407,11 +429,12 @@
   both its own errors and nested child errors (e.g. a collection :min
   violation alongside a bad element), the level renders as a map and its
   own messages live under the reserved :balli/error key."
-  [explain-map]
-  (when explain-map
-    (render-tree
-     (reduce (fn [tree error]
-               (insert-message tree (:value explain-map) (:in error)
-                               (error-message error)))
-             {:msgs nil :children {}}
-             (:errors explain-map)))))
+  ([explain-map] (humanize explain-map {}))
+  ([explain-map opts]
+   (when explain-map
+     (render-tree
+      (reduce (fn [tree error]
+                (insert-message tree (:value explain-map) (:in error)
+                                (error-message error opts)))
+              {:msgs nil :children {}}
+              (:errors explain-map))))))

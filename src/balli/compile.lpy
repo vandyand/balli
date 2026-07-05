@@ -18,7 +18,8 @@
   layer the registry per subtree (balli.registry/push-layer); ref caches are
   keyed [kw layer-token] so shadowed keywords never share compiled fns (see
   compile-ref)."
-  (:require [balli.normalize :as norm]
+  (:require [balli.extension :as ext]
+            [balli.normalize :as norm]
             [balli.regex :as rx]
             [balli.registry :as reg]
             [balli.time :as bt]))
@@ -199,6 +200,23 @@
             default-vf (default-vf x)
             :else false))
         (catch python/Exception _ false)))))
+
+(defn- compile-ext
+  [node registry cache]
+  (let [spec (ext/type-spec (:ext-type node))
+        child-fns (mapv #(compile-node % registry cache) (:children node))]
+    (when-not spec
+      (throw (ex-info "Unregistered extension schema type"
+                      {:type :balli.core/invalid-schema :form (:form node)})))
+    (if-some [compile-f (:compile-validator spec)]
+      (compile-f node registry cache compile-node)
+      (if-some [validate (:validate spec)]
+        (fn [x]
+          (try
+            (boolean (validate x (:properties node) child-fns))
+            (catch python/Exception _ false)))
+        (throw (ex-info "Extension schema type has no validator"
+                        {:type :balli.core/invalid-schema :form (:form node)}))))))
 
 (defn- compile-ref
   "Refs resolve AND their targets compile eagerly at compile time, so
@@ -394,6 +412,7 @@
       (fn [x] (boolean (and (string? x) (re-matches pattern x)))))
 
     :multi (compile-multi node registry cache)
+    :balli/ext (compile-ext node registry cache)
     :ref (compile-ref node registry cache)
 
     ;; transparent wrapper: validates exactly as its child
@@ -831,6 +850,17 @@
           :else [(err path in form x :balli.core/invalid)])))
 
     :multi (explain-multi node registry cache)
+    :balli/ext
+    (let [valid? (compile-ext node registry cache)
+          spec (ext/type-spec (:ext-type node))
+          form (:form node)
+          err-type (or (:error/type (:properties node))
+                       (:error/type spec)
+                       :balli.extension/invalid)]
+      (fn [x path in]
+        (if (valid? x)
+          []
+          [(err path in form x err-type)])))
     :ref (explain-ref node registry cache)
 
     ;; transparent wrapper: explains exactly as its child (no :path segment)
@@ -1230,7 +1260,7 @@
           :uuid :time/instant :time/offset-date-time :time/zoned-date-time
           :time/local-date-time :time/local-date :time/local-time :time/offset-time
           :time/duration :time/period :time/zone-id :time/zone-offset
-          :enum := :fn :re :not :=> :function
+          :enum := :fn :re :not :=> :function :balli/ext
           :balli/pred :> :>= :< :<= :not=)
     (let [valid? (compile-node node registry (atom {}))]
       (fn [x] (if (valid? x) x -invalid)))

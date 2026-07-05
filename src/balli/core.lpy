@@ -17,7 +17,7 @@
             [balli.registry :as reg]
             [balli.transform :as bt]))
 
-(def version "0.4.0")
+(def version "0.5.0")
 
 (defn schema?
   "True when `x` is a balli schema object."
@@ -497,6 +497,14 @@
             form (if (and (= :map t) (empty? props) (empty? entries))
                    :map
                    (into (if (seq props) [t props] [t]) entries))]
+        (f form path))
+
+      (= :balli/ext t)
+      (let [children (into []
+                           (map-indexed (fn [i c] (walk-ast c (conj path i) f))
+                                        (:children node)))
+            form (into (if (seq props) [(:ext-type node) props] [(:ext-type node)])
+                       children)]
         (f form path))
 
       :else

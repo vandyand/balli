@@ -1,0 +1,15 @@
+(ns balli.plantuml
+  "PlantUML class-style schema visualization."
+  (:require [balli.dot :as dot]))
+
+(defn transform
+  "Return a simple PlantUML wrapper containing the DOT-style schema graph as
+  notes. This is intentionally lossy but useful in PlantUML renderers."
+  ([s] (transform s {}))
+  ([s opts]
+   (str "@startuml\n"
+        "object BalliSchema\n"
+        "note right of BalliSchema\n"
+        (.replace (dot/transform s opts) "\n" "\\n\n")
+        "end note\n"
+        "@enduml\n")))
