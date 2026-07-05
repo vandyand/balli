@@ -271,9 +271,10 @@
       :map-of (with-min-max {"type" "object"
                              "additionalProperties" (child (second children))}
                 props "minProperties" "maxProperties")
-      (:vector :sequential) (with-min-max {"type" "array"
-                                           "items" (child (first children))}
-                              props "minItems" "maxItems")
+      (:vector :sequential :seqable :every)
+      (with-min-max {"type" "array"
+                     "items" (child (first children))}
+        props "minItems" "maxItems")
       :set (with-min-max {"type" "array"
                           "items" (child (first children))
                           "uniqueItems" true}

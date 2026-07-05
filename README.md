@@ -2,7 +2,7 @@
 
 Data-driven schemas for [Basilisp](https://github.com/basilisp-lang/basilisp), inspired by [Malli](https://github.com/metosin/malli).
 
-Schemas are plain data in Malli's vector syntax — no macros, no protocols to implement. Balli covers most of Malli's surface: validation and Malli-shaped explain data with `:path`/`:in`, humanized errors with key spell-checking and localized/custom messages, value transformation (decode/encode/coerce), parse/unparse with tagged branches, sequence (regex) schemas with an iterative backtracking engine, function schemas with generative checking and instrumentation, deterministic seeded generators with regex generation and heuristic shrinking, JSON Schema/OpenAPI/Swagger/DOT/PlantUML/description export, schema utilities (`merge`/`union`/`closed-schema`/...), form walking, safe schema serialization through named function refs, custom schema type extensions, schema inference from sample data, predicate/comparator schemas, time schemas, default branches, self-contained local registries, and mutable/lazy/dynamic custom registries with recursive refs. Malli-inspired, not a strict port — see [Differences from Malli](#differences-from-malli). Pure Basilisp; no Python dependencies beyond the standard library.
+Schemas are plain data in Malli's vector syntax, plus Malli-style map syntax / AST input — no macros, no protocols to implement. Balli covers most of Malli's surface: validation and Malli-shaped explain data with `:path`/`:in`, humanized errors with key spell-checking and localized/custom messages, value transformation (decode/encode/coerce), parse/unparse with tagged branches, sequence (regex) schemas with an iterative backtracking engine, function schemas with generative checking and instrumentation, deterministic seeded generators with regex generation, generator objects, and heuristic shrinking, JSON Schema/OpenAPI/Swagger/DOT/PlantUML/description export, schema utilities (`merge`/`union`/`closed-schema`/...), form walking, safe schema serialization through named function refs and EDN wrappers, custom schema type extensions, schema inference/destructuring from sample data, predicate/comparator schemas, time schemas, default branches, self-contained local registries, and mutable/lazy/dynamic/var custom registries with recursive refs. Malli-inspired, not a strict port — see [Differences from Malli](#differences-from-malli). Pure Basilisp; no Python dependencies beyond the standard library.
 
 ## Install
 
@@ -207,7 +207,7 @@ Infer a schema from sample data:
 
 ## Supported schemas
 
-All 56 builtin schema type keywords, each with a validating example. Predicate
+All 59 builtin schema type keywords, each with a validating example. Predicate
 schemas are supported too, but they are not builtin keywords: the schema is the
 predicate fn or quoted symbol itself, e.g. `int?` or `'int?`.
 
@@ -239,6 +239,8 @@ predicate fn or quoted symbol itself, e.g. `int?` or `'int?`.
 | `:map-of` | `(b/validate [:map-of :keyword :int] {:a 1 :b 2})` |
 | `:vector` | `(b/validate [:vector :int] [1 2 3])` |
 | `:sequential` | `(b/validate [:sequential :int] '(1 2))` |
+| `:seqable` | `(b/validate [:seqable :int] #{1 2})` |
+| `:every` | `(b/validate [:every {:coll-check-limit 2} :int] [1 2 "unchecked"])` |
 | `:set` | `(b/validate [:set :int] #{1 2})` |
 | `:tuple` | `(b/validate [:tuple :string :int] ["a" 1])` |
 | `:enum` | `(b/validate [:enum "S" "M" "L"] "M")` |
@@ -263,6 +265,7 @@ predicate fn or quoted symbol itself, e.g. `int?` or `'int?`.
 | `:repeat` | `(b/validate [:repeat {:min 1 :max 3} :int] [1 2])` (bounded repetition) |
 | `:schema` | `(b/validate [:schema :int] 5)` (transparent wrapper; stops seqex splicing) |
 | `:=>` | `(b/validate [:=> [:cat :int] :int] inc)` (function schema: input seqex + output) |
+| `:->` | `(b/function-info [:-> :int :string :boolean])` (function shorthand; inputs followed by output) |
 | `:function` | `(b/validate [:function [:=> [:cat :int] :int] [:=> [:cat :int :int] :int]] +)` (multi-arity) |
 | `:>` | `(b/validate [:> 10] 11)` |
 | `:>=` | `(b/validate [:>= 10] 10)` |
@@ -745,6 +748,7 @@ Maps with many distinct keys but uniform key/value shapes become `[:map-of k v]`
 | `schema` | `(schema form)` `(schema form opts)` | Wrap a form into a schema object (normalized AST + registry + compile cache). Idempotent on schema objects. `opts` may carry `:balli.core/function-checker`. |
 | `schema?` | `(schema? x)` | True when `x` is a balli schema object. |
 | `form` | `(form s)` | The original schema form. |
+| `ast` / `from-ast` | `(ast s)` / `(from-ast ast opts?)` | Malli-style map syntax / AST view and construction. |
 | `properties` | `(properties s)` | Properties map of the root node, e.g. `{:closed true}`. |
 | `children` | `(children s)` | AST children of the root node. |
 | `validator` / `validate` | `(validator s opts?)` / `(validate s value opts?)` | Compiled 1-arg boolean validator / one-shot boolean. |
@@ -792,6 +796,7 @@ Maps with many distinct keys but uniform key/value shapes become `[:map-of k v]`
 | `balli.error/levenshtein` | `(levenshtein a b)` — edit distance. |
 | `balli.generator/generate` | `(generate s opts?)` — one value; `{:seed :size :registry}`. |
 | `balli.generator/sample` | `(sample s opts?)` — vector of values; `:size` is the count (default 10). |
+| `balli.generator/generator` / `generate*` / `sample*` / `shrink*` | Reusable data generator objects, accepted by `:gen/gen`. |
 | `balli.generator/shrink` / `shrink-candidates` | Smaller valid candidates for a value; `{:predicate f}` keeps only still-failing values. |
 | `balli.generator/function-checker` | `(function-checker opts?)` — generative `:=>`/`:function` checker; `{:iterations n}` (default 100). |
 | `balli.openapi/schema` / `openapi` / `request-body` / `response` / `parameter` | Export OpenAPI 3 schema objects, minimal documents, and operation fragments. |
@@ -799,20 +804,27 @@ Maps with many distinct keys but uniform key/value shapes become `[:map-of k v]`
 | `balli.dot/transform` | Export a Graphviz DOT string for a schema graph. |
 | `balli.plantuml/transform` | Export a PlantUML wrapper for a schema graph. |
 | `balli.describe/describe` | Return a small English description for a schema. |
+| `balli.lite/form` / `schema` | Explicit data-spec-style lite syntax conversion. |
+| `balli.destructure/destructure` / `paths` | Validate/parse a value into a named destructuring shape; list named schema paths. |
+| `balli.pretty/explain-str` / `validate-str` / `throw!` | Pretty development-time validation messages. |
 | `balli.extension/register-type!` / `unregister-type!` / `type-spec` / `custom-type?` / `clear-types!` | Register custom schema keywords with validate/generate/transform/export/message callbacks. |
 | `balli.serial/register-function!` / `unregister-function!` / `serialize` / `deserialize` / `write-string` / `read-string` | EDN-safe schema serialization with named function references and regex pattern round-tripping. |
+| `balli.edn/write-string` / `read-string` / `serialize` / `deserialize` | Malli-named wrappers over Balli's safe serialization. |
 | `balli.dev/register!` / `unregister!` / `start!` / `stop!` / `running` / `capture-fail!` / `captured-failures` | Explicit development instrumentation for atoms holding functions. |
+| `balli.clj-kondo/function-config` / `lint-config` | Static-analysis metadata for function schemas. |
+| `balli.sci/sci-context` | Data-only namespace map for embedding Balli public functions in restricted evaluators. |
 | `balli.provider/provide` | `(provide samples opts?)` — infer a schema form; `{:map-of-threshold n :infer-enums true :enum-threshold n :infer-tuples true}`. |
 | `balli.registry/registry` | `(registry & schema-maps)` — layer `{qualified-kw form}` maps over the default registry. |
 | `balli.registry/lazy-registry` | `(lazy-registry provider)` / `(lazy-registry base provider)` — provider-on-miss registry with memoized forms. |
 | `balli.registry/dynamic-registry` | `(dynamic-registry source)` — read an atom/fn source at raw-form lookup time. |
+| `balli.registry/var-registry` | `(var-registry {kw derefable-or-form})` — dereference schema refs on raw-form lookup. |
 | `balli.registry/default-registry` | `(default-registry)` — returns the current mutable default registry. |
 | `balli.registry/register!` | `(register! kw form)` / `(register! {kw form ...})` — merge schemas into the current default registry. |
 | `balli.registry/set-default-registry!` | `(set-default-registry! r)` — replace the mutable default registry. |
 | `balli.registry/composite` | `(composite r1 r2 ...)` — eager first-hit registry merge. |
 | `balli.registry/mutation-epoch` | atom — bumped by default-registry mutations; raw-form caches use it for invalidation. |
 | `balli.registry/resolve-ref` | `(resolve-ref reg k)` — registered form or nil. |
-| `balli.registry/builtin-types` | var — the set of 56 builtin type keywords. |
+| `balli.registry/builtin-types` | var — the set of 59 builtin type keywords. |
 
 Unknown or malformed schema forms throw `ex-info` with `:type :balli.core/invalid-schema`; a `:ref` to an unregistered keyword throws `:balli.core/unresolved-ref` at compile time (fail fast, not at validate).
 
@@ -820,13 +832,15 @@ Unknown or malformed schema forms throw `ex-info` with `:type :balli.core/invali
 
 Balli covers most of Malli's core surface but is Malli-**inspired**, not a port. Not implemented:
 
+See also [docs/malli-compatibility.md](docs/malli-compatibility.md) for the
+feature-family compatibility matrix.
+
 - **No executable sexpr property code** — schema properties take real Basilisp fns (`:fn` children, `:dispatch`, `:gen/fmap`, `:decode/*` overrides, ...); safe serialization is explicit via `balli.serial` named function refs and never evals code.
 - **No old (pre-0.18) parse format** shim.
-- **No var registry** — Balli has plain registry maps, eager `composite`, local `:registry` properties, a mutable default registry, lazy registries, and explicit dynamic registries.
 - **Time schemas use Python's stdlib model** — offset/zoned distinctions follow Python `datetime`/`zoneinfo`, and `:time/period` is a map of calendar fields.
-- **Heuristic shrinking, not test.check shrinking** — `balli.generator/shrink` returns practical smaller candidates, but Balli does not expose test.check generator objects.
+- **Heuristic shrinking, not test.check shrinking** — `balli.generator/shrink` returns practical smaller candidates, and `balli.generator/generator` exposes reusable Balli generator objects, but Balli does not expose Clojure test.check generator objects.
 - **`:fn` generation requires `:gen/*` props** — otherwise `:balli.core/no-generator` is thrown.
-- **No `malli.experimental` or clj-kondo modules.**
+- **No executable `malli.experimental` or real SCI/clj-kondo runtime integration** — Balli provides `balli.sci` and `balli.clj-kondo` data exports for host tooling, not Clojure analyzers.
 
 Behavioral deviations:
 

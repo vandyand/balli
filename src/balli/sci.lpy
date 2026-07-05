@@ -1,0 +1,41 @@
+(ns balli.sci
+  "SCI-style namespace data for embedding Balli in restricted evaluators.
+
+  Basilisp does not ship SCI, so this namespace exposes ordinary data maps of
+  safe public Vars that a host can choose to install in its evaluator."
+  (:require [balli.core :as b]
+            [balli.edn :as edn]
+            [balli.error :as error]
+            [balli.generator :as gen]
+            [balli.json-schema :as json-schema]
+            [balli.registry :as registry]
+            [balli.transform :as transform]))
+
+(def namespaces
+  {'balli.core {'schema b/schema
+                'schema? b/schema?
+                'ast b/ast
+                'from-ast b/from-ast
+                'validate b/validate
+                'explain b/explain
+                'parse b/parse
+                'unparse b/unparse}
+   'balli.error {'humanize error/humanize}
+   'balli.generator {'generate gen/generate
+                     'sample gen/sample
+                     'generator gen/generator}
+   'balli.json-schema {'transform json-schema/transform}
+   'balli.registry {'registry registry/registry
+                    'var-registry registry/var-registry
+                    'lazy-registry registry/lazy-registry
+                    'dynamic-registry registry/dynamic-registry}
+   'balli.transform {'string-transformer transform/string-transformer
+                     'json-transformer transform/json-transformer
+                     'collection-transformer transform/collection-transformer}
+   'balli.edn {'write-string edn/write-string
+               'read-string edn/read-string}})
+
+(defn sci-context
+  "Return a simple context map suitable for host evaluators."
+  []
+  {:namespaces namespaces})

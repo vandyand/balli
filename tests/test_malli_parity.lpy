@@ -1,0 +1,162 @@
+(ns tests.test-malli-parity
+  "Focused Malli parity coverage for syntax and collection semantics."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.clj-kondo :as kondo]
+            [balli.core :as b]
+            [balli.destructure :as destructure]
+            [balli.edn :as edn]
+            [balli.error :as be]
+            [balli.generator :as bg]
+            [balli.json-schema :as js]
+            [balli.lite :as lite]
+            [balli.pretty :as pretty]
+            [balli.registry :as reg]
+            [balli.sci :as sci]
+            [balli.transform :as bt]))
+
+(deftest map-syntax-and-function-shorthand
+  (testing "map syntax validates directly and round-trips through ast"
+    (let [schema {:type :map
+                  :properties {:closed true}
+                  :children [{:key :id :schema {:type :int}}
+                             {:key :name :properties {:optional true}
+                              :schema {:type :string :properties {:min 1}}}
+                             {:key :tags
+                              :schema {:type :set
+                                       :children [{:type :keyword}]}}]}
+          so (b/schema schema)]
+      (is (true? (b/validate so {:id 1 :name "Ada" :tags #{:a :b}})))
+      (is (false? (b/validate so {:id 1 :tags #{:a} :extra true})))
+      (is (= :map (:type (b/ast so))))
+      (is (= schema (b/ast (b/from-ast (b/ast so)))))))
+  (testing ":=> map syntax and :-> shorthand"
+    (let [arrow {:type :=>
+                 :input {:type :cat :children [{:type :int}]}
+                 :output {:type :int}}
+          shorthand [:-> :int :string :boolean]]
+      (is (true? (b/validate arrow inc)))
+      (is (= {:min 2 :max 2 :arity 2
+              :input [:cat :int :string]
+              :output :boolean}
+             (b/function-info shorthand))))))
+
+(deftest lite-syntax-parity
+  (let [schema (lite/schema {:id :int
+                             :tags [:keyword]
+                             :point [:double :double]
+                             :state #{:draft :published}})]
+    (let [lite-map (lite/form {:id :int
+                               :tags [:keyword]
+                               :point [:double :double]})]
+      (is (= :map (first lite-map)))
+      (is (= #{[:id :int]
+               [:tags [:vector :keyword]]
+               [:point [:tuple :double :double]]}
+             (set (rest lite-map)))))
+    (is (true? (b/validate schema {:id 1
+                                   :tags [:a :b]
+                                   :point [1.0 2.0]
+                                   :state :draft})))
+    (is (false? (b/validate schema {:id "1"
+                                    :tags [:a]
+                                    :point [1.0 2.0]
+                                    :state :draft})))))
+
+(deftest seqable-and-every-collection-parity
+  (testing ":seqable checks every element of any seqable collection"
+    (is (true? (b/validate [:seqable :int] [1 2 3])))
+    (is (true? (b/validate [:seqable :int] #{1 2 3})))
+    (is (false? (b/validate [:seqable :int] [1 "x"])))
+    (is (= [1 2 3] (b/parse [:seqable :int] '(1 2 3)))))
+  (testing ":every checks bounded prefixes like Malli's large/lazy-friendly schema"
+    (is (true? (b/validate [:every {:coll-check-limit 2} :int]
+                           [1 2 "unchecked"])))
+    (is (false? (b/validate [:every {:coll-check-limit 3} :int]
+                            [1 2 "checked"])))
+    (is (= [1 2 "unchecked"]
+           (b/parse [:every {:coll-check-limit 2} :int]
+                    [1 2 "unchecked"])))
+    (is (= [1 2 "unchecked"]
+           (b/unparse [:every {:coll-check-limit 2} :int]
+                      [1 2 "unchecked"])))
+    (is (false? (b/validate [:every {:min 4 :coll-check-limit 2} :int]
+                            [1 2 3])))
+    (is (true? (b/validate [:every {:coll-check-limit 2} :int]
+                           (range))))
+    (is (false? (b/validate [:every {:max 3 :coll-check-limit 2} :int]
+                            (range))))
+    (is (= :balli.core/invalid-schema
+           (try
+             (b/schema [:every {:coll-check-limit -1} :int])
+             (catch python/Exception e (:type (ex-data e))))))
+    (is (= :balli.core/invalid-schema
+           (try
+             (b/schema [:every {:coll-check-limit "2"} :int])
+             (catch python/Exception e (:type (ex-data e)))))))
+  (testing "generation, JSON Schema, and collection transformers understand both"
+    (doseq [schema [[:seqable {:min 1 :max 3} :int]
+                    [:every {:min 1 :max 3 :coll-check-limit 3} :int]]]
+      (let [v (bg/generate schema {:seed 7})
+            decoded (b/decode schema #{1 2} (bt/collection-transformer))]
+        (is (true? (b/validate schema v)))
+        (is (true? (b/validate schema decoded)))
+        (is (= {"type" "array"
+                "items" {"type" "integer"}
+                "minItems" 1
+                "maxItems" 3}
+               (js/transform schema)))))))
+
+(deftest var-registry-and-generator-object-parity
+  (testing "var registry dereferences current schema refs"
+    (let [schema-ref (atom :int)
+          r (reg/var-registry {:parity/value schema-ref})]
+      (is (true? (b/validate :parity/value 1 {:registry r})))
+      (is (false? (b/validate :parity/value "x" {:registry r})))
+      (is (= 1 (b/parse :parity/value 1 {:registry r})))
+      (reset! schema-ref :string)
+      (is (true? (b/validate :parity/value "x" {:registry r})))
+      (is (false? (b/validate :parity/value 1 {:registry r})))
+      (is (= "x" (b/parse :parity/value "x" {:registry r})))
+      (is (= :balli.core/invalid (b/parse :parity/value 1 {:registry r})))))
+  (testing "generator objects and :gen/gen hooks are reusable data"
+    (let [g (bg/generator [:int {:min 10 :max 20}])
+          schema [:map [:n [:int {:gen/gen g}]]]]
+      (is (true? (bg/generator? g)))
+      (is (= (bg/generate* g {:seed 4})
+             (bg/generate [:int {:min 10 :max 20}] {:seed 4})))
+      (is (true? (b/validate schema (bg/generate schema {:seed 2})))))))
+
+(deftest destructure-and-compatibility-modules
+  (testing "destructure returns named schema shape after parse"
+    (is (= {:id 1 :profile {:name "Ada" :age 37}}
+           (destructure/destructure
+            [:map [:id :int] [:profile [:map [:name :string] [:age {:optional true} :int]]]]
+            {:id 1 :profile {:name "Ada" :age 37} :extra true})))
+    (is (= {:ok 1}
+           (destructure/destructure [:orn [:ok :int] [:err :string]] 1)))
+    (is (= [[:a :b] :int]
+           (first (filter #(= [:a :b] (first %))
+                          (destructure/paths [:map [:a [:map [:b :int]]]]))))))
+  (testing "edn, pretty, sci, and static-analysis compatibility exports"
+    (let [schema [:=> [:cat :int] :int]
+          encoded (edn/write-string schema)]
+      (is (= schema (edn/read-string encoded)))
+      (is (.startswith (pretty/validate-str :int "x") "invalid"))
+      (is (contains? (:namespaces (sci/sci-context)) 'balli.core))
+      (is (= {:arity 1 :min 1 :max 1 :input [:cat :int] :output :int}
+             (kondo/function-config schema)))
+      (is (= {:arities [{:arity 1 :min 1 :max 1 :input [:cat :int] :output :int}
+                        {:arity 2 :min 2 :max 2 :input [:cat :int :int] :output :int}]}
+             (kondo/function-config
+              [:function [:=> [:cat :int] :int]
+                         [:=> [:cat :int :int] :int]])))
+      (is (= ["should be seqable"]
+             (be/humanize (b/explain [:seqable :int] 1))))
+      (is (= ["should have at least 2 elements"]
+             (be/humanize (b/explain [:every {:min 2} :int] [1])))))))
+
+(deftest ast-literal-map-children-round-trip
+  (doseq [schema [[:= {:type :int}]
+                  [:enum {:type :int}]
+                  [:not= {:type :int}]]]
+    (is (= schema (:form (b/from-ast (b/ast schema)))))))

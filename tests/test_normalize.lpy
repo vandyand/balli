@@ -234,9 +234,11 @@
   (is (contains? reg/builtin-types :=))
   ;; 28 MVP types + Phase 6: :cat :catn :alt :altn :? :* :+ :repeat :schema
   ;; + Phase 8: :=> :function + Tier 3: :> :>= :< :<= :not=
-  ;; + Tier 4 time: 11 :time/* scalar types (predicate
-  ;; schemas are AST-only -- :balli/pred is deliberately NOT a builtin type)
-  (is (= 56 (count reg/builtin-types)))
+	  ;; + Tier 4 time: 11 :time/* scalar types
+	  ;; + Malli parity: :seqable :every :->
+	  ;; (predicate
+	  ;; schemas are AST-only -- :balli/pred is deliberately NOT a builtin type)
+	  (is (= 59 (count reg/builtin-types)))
   (is (contains? reg/builtin-types :>))
   (is (contains? reg/builtin-types :not=))
   (is (not (contains? reg/builtin-types :balli/pred)))

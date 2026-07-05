@@ -14,6 +14,7 @@
   otherwise), so equal seeds produce equal values.
 
   Property hooks, checked in priority order BEFORE the type default:
+    :gen/gen      -> Balli generator object or fn [rnd size] -> value
     :gen/return   -> that constant (nil included -- presence-checked)
     :gen/elements -> uniform .choice from the given collection
     :gen/schema   -> generate that schema instead
@@ -54,7 +55,9 @@
   element. [:schema <seqex>] is a single element whose VALUE is the inner
   seqex's flat vector. A :ref directly in seqex child position throws
   :balli.core/potentially-recursive-seqex, mirroring the compilers.
-  :sequential generates a vector (vectors satisfy sequential?).
+  :sequential/:seqable/:every generate vectors (vectors satisfy all three
+  predicates; :every generation is finite despite validation's bounded-prefix
+  semantics).
 
   Recursion cap (exact behavior): `depth` counts :ref expansions on the
   current generation path; the cap is 5. Entering a :ref with depth >= 5:
@@ -73,7 +76,7 @@
             [balli.registry :as reg]
             [balli.time :as bt]))
 
-(declare gen)
+(declare gen generate sample shrink)
 
 (defn- layered-registry
   "Registry for descending into `ast`: its :local-registry (when present)
@@ -533,7 +536,7 @@
       (:orn :multi) (child (:schema (.choice rnd (:children ast))))
       :map (gen-map ast registry rnd size depth)
       :map-of (gen-map-of ast registry rnd size depth)
-      (:vector :sequential)
+      (:vector :sequential :seqable :every)
       (into [] (repeatedly (rand-count props rnd size reduced?)
                            #(child (first (:children ast)))))
       :set (gen-set ast registry rnd size depth)
@@ -556,6 +559,47 @@
       (:cat :catn :alt :altn :? :* :+ :repeat)
       (gen-seqex-chunk ast registry rnd size depth))))
 
+(defn generator?
+  "True when `x` is a Balli generator object."
+  [x]
+  (boolean (and (map? x) (:balli/generator x))))
+
+(defn generator
+  "Return a small generator object for schema `s`. The object is data and can
+  be stored in :gen/gen; use `generate*`, `sample*`, or `shrink*` to run it."
+  ([s] (generator s {}))
+  ([s opts]
+   {:balli/generator true
+    :schema s
+    :opts opts
+    :generate (fn [opts*] (generate s (merge opts opts*)))
+    :sample (fn [opts*] (sample s (merge opts opts*)))
+    :shrink (fn [value opts*] (shrink s value (merge opts opts*)))}))
+
+(defn generate*
+  "Run a Balli generator object or a raw schema form."
+  ([g] (generate* g {}))
+  ([g opts]
+   (if (generator? g)
+     ((:generate g) opts)
+     (generate g opts))))
+
+(defn sample*
+  "Sample from a Balli generator object or a raw schema form."
+  ([g] (sample* g {}))
+  ([g opts]
+   (if (generator? g)
+     ((:sample g) opts)
+     (sample g opts))))
+
+(defn shrink*
+  "Shrink with a Balli generator object or a raw schema form."
+  ([g value] (shrink* g value {}))
+  ([g value opts]
+   (if (generator? g)
+     ((:shrink g) value opts)
+     (shrink g value opts))))
+
 (defn- gen
   "Generate a value for AST `ast`: :gen/return -> :gen/elements ->
   :gen/schema -> type default, then :gen/fmap post-maps the result. Layer-
@@ -565,6 +609,17 @@
   (let [registry (layered-registry ast registry)
         props (:properties ast)
         base (cond
+               (contains? props :gen/gen)
+               (let [g (:gen/gen props)]
+                 (cond
+                   (generator? g) (generate* g {:seed (.randint rnd 0 2147483647)
+                                                :size size
+                                                :registry registry})
+                   (python/callable g) (g rnd size)
+                   :else (throw (ex-info ":gen/gen must be a Balli generator or fn"
+                                         {:type :balli.core/invalid-schema
+                                          :schema (:form ast)}))))
+
                (contains? props :gen/return)
                (:gen/return props)
 

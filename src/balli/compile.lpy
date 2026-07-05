@@ -124,6 +124,42 @@
       (:properties node)
       count)))
 
+(defn- every-element-check-limit
+  [node]
+  (let [props (:properties node)
+        limit (or (:coll-check-limit props)
+                  (:balli.core/coll-check-limit props)
+                  101)]
+    limit))
+
+(defn- at-least-count?
+  [x n]
+  (<= n (count (take n x))))
+
+(defn- at-most-count?
+  [x n]
+  (<= (count (take (inc n) x)) n))
+
+(defn- every-bounds-valid?
+  [x props]
+  (try
+    (and (or (nil? (:min props)) (at-least-count? x (:min props)))
+         (or (nil? (:max props)) (at-most-count? x (:max props))))
+    (catch python/Exception _ false)))
+
+(defn- compile-every
+  "Validator for Malli's :every: checks seqable input and validates only a
+  bounded prefix. :min/:max are checked with bounded counting, so lazy or
+  infinite sequences do not require a full count."
+  [node registry cache]
+  (let [child (compile-node (first (:children node)) registry cache)
+        props (:properties node)
+        limit (every-element-check-limit node)]
+    (fn [x]
+      (and (seqable? x)
+           (every-bounds-valid? x props)
+           (every? child (take limit x))))))
+
 (defn- compile-tuple
   [node registry cache]
   (let [fns (mapv #(compile-node % registry cache) (:children node))
@@ -377,6 +413,8 @@
 
     :vector (compile-coll vector? node registry cache)
     :sequential (compile-coll sequential? node registry cache)
+    :seqable (compile-coll seqable? node registry cache)
+    :every (compile-every node registry cache)
     :set (compile-coll set? node registry cache)
 
     :tuple (compile-tuple node registry cache)
@@ -798,6 +836,24 @@
 
     :vector (explain-coll vector? node registry cache)
     :sequential (explain-coll sequential? node registry cache)
+    :seqable (explain-coll seqable? node registry cache)
+    :every
+    (let [child (explain-node (first (:children node)) registry cache)
+          props (:properties node)
+          form (:form node)
+          limit (every-element-check-limit node)]
+      (fn [x path in]
+        (if-not (seqable? x)
+          [(err path in form x :balli.core/invalid-type)]
+          (let [acc (if (every-bounds-valid? x props)
+                      (transient [])
+                      (transient [(err path in form x :balli.core/limits)]))
+                child-path (conj path 0)]
+            (persistent!
+             (reduce (fn [acc [i v]]
+                       (into! acc (child v child-path (conj in i))))
+                     acc
+                     (take limit (map-indexed vector x))))))))
     :set (explain-coll set? node registry cache)
 
     :tuple (explain-tuple node registry cache)
@@ -1166,6 +1222,30 @@
               (if to-set (set v) v))))
         -invalid))))
 
+(defn- coder-every
+  "Parse/unparse for :every mirrors validate: child coders run only over the
+  bounded checked prefix, unchecked tail values pass through unchanged, and
+  :min/:max bounds use bounded counting."
+  [node registry cache mode]
+  (let [f (coder-node (first (:children node)) registry cache mode)
+        props (:properties node)
+        limit (every-element-check-limit node)]
+    (fn [x]
+      (if-not (and (seqable? x) (every-bounds-valid? x props))
+        -invalid
+        (loop [s (seq (take limit x))
+               acc (transient [])]
+          (if s
+            (let [r (f (first s))]
+              (if (-invalid? r)
+                -invalid
+                (recur (next s) (conj! acc r))))
+            (let [checked (persistent! acc)
+                  tail (drop limit x)]
+              (if (vector? x)
+                (into checked tail)
+                (concat checked tail)))))))))
+
 (defn- coder-tuple
   [node registry cache mode]
   (let [fns (mapv #(coder-node % registry cache mode) (:children node))
@@ -1290,6 +1370,8 @@
 
     :vector (coder-coll vector? node registry cache mode)
     :sequential (coder-coll sequential? node registry cache mode)
+    :seqable (coder-coll seqable? node registry cache mode)
+    :every (coder-every node registry cache mode)
     :set (coder-coll set? node registry cache mode)
 
     :tuple (coder-tuple node registry cache mode)

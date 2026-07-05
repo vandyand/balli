@@ -17,7 +17,7 @@
             [balli.registry :as reg]
             [balli.transform :as bt]))
 
-(def version "0.5.0")
+(def version "0.6.0")
 
 (defn schema?
   "True when `x` is a balli schema object."
@@ -54,6 +54,16 @@
   "The original schema form of `s` (raw form or schema object)."
   [s]
   (:form (schema s)))
+
+(defn ast
+  "Return a Malli-style map syntax view of `s`'s normalized schema AST."
+  [s]
+  (norm/to-ast (:ast (schema s))))
+
+(defn from-ast
+  "Create a schema object from Malli-style map syntax / schema AST `a`."
+  ([a] (from-ast a {}))
+  ([a opts] (schema (norm/from-ast-form a) opts)))
 
 (defn properties
   "The properties map of the root of `s` (raw form or schema object)."
@@ -153,7 +163,8 @@
 
 (defn- dynamic-registry?
   [r]
-  (boolean (:balli/dynamic-source r)))
+  (boolean (or (:balli/dynamic-source r)
+               (:balli/var-schemas r))))
 
 (defn- compile-validator!
   "Compile a validator for schema object `s` (honoring its baked-in function
@@ -407,10 +418,12 @@
    (if (schema? s)
      (or (:parser @(:cache s))
          (compile-parser! s))
-     ;; raw form: bounded global cache keyed by [form registry-id]
-     (let [k [s (registry-id (:registry opts))]]
-       (or (raw-cache-get k :parser)
-           (raw-cache-put! k :parser (parser (schema s opts))))))))
+     (if (dynamic-registry? (:registry opts))
+       (parser (schema s opts))
+       ;; raw form: bounded global cache keyed by [form registry-id]
+       (let [k [s (registry-id (:registry opts))]]
+         (or (raw-cache-get k :parser)
+             (raw-cache-put! k :parser (parser (schema s opts)))))))))
 
 (defn unparser
   "Compiled 1-arg unparser for `s` -- the exact inverse of `parser`: parsed
@@ -421,10 +434,12 @@
    (if (schema? s)
      (or (:unparser @(:cache s))
          (compile-unparser! s))
-     ;; raw form: bounded global cache keyed by [form registry-id]
-     (let [k [s (registry-id (:registry opts))]]
-       (or (raw-cache-get k :unparser)
-           (raw-cache-put! k :unparser (unparser (schema s opts))))))))
+     (if (dynamic-registry? (:registry opts))
+       (unparser (schema s opts))
+       ;; raw form: bounded global cache keyed by [form registry-id]
+       (let [k [s (registry-id (:registry opts))]]
+         (or (raw-cache-get k :unparser)
+             (raw-cache-put! k :unparser (unparser (schema s opts)))))))))
 
 (defn parse
   "Parse `value` against `s`: the value itself for non-transforming schemas

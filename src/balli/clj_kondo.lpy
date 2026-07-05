@@ -1,0 +1,41 @@
+(ns balli.clj-kondo
+  "Static-analysis metadata exports.
+
+  This does not run clj-kondo under Basilisp. It emits data describing
+  function schemas so external tools can generate analyzer config."
+  (:require [balli.core :as b]
+            [balli.normalize :as norm]))
+
+(defn- arity-config
+  [node]
+  (let [[input output guard] (:children node)
+        {:keys [min max]} (norm/regex-min-max input)]
+    (cond-> {:arity (if (and max (= min max)) min :varargs)
+             :min min
+             :input (:form input)
+             :output (:form output)}
+      max (assoc :max max)
+      guard (assoc :guard (:form guard)))))
+
+(defn function-config
+  "Return analyzer-friendly arity metadata for a :=> or :function schema.
+  Root :=> schemas return a single arity map. Root :function schemas return
+  {:arities [...]}."
+  ([schema] (function-config schema {}))
+  ([schema opts]
+   (let [so (b/schema schema opts)
+         ast (:ast so)]
+     (case (:type ast)
+       :=> (arity-config ast)
+       :function {:arities (mapv arity-config (:children ast))}
+       nil))))
+
+(defn lint-config
+  "Return a map of symbol -> function-config for schema entries."
+  ([schemas] (lint-config schemas {}))
+  ([schemas opts]
+   (into {}
+         (keep (fn [[sym schema]]
+                 (when-let [cfg (function-config schema opts)]
+                   [sym cfg])))
+         schemas)))

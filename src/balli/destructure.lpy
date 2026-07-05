@@ -1,0 +1,90 @@
+(ns balli.destructure
+  "Schema-guided destructuring helpers.
+
+  `destructure` validates/parses a value and returns a smaller shape keyed by
+  schema names: map entries become maps, :catn becomes its tag map, and
+  :orn/:multi/:altn become a one-entry map keyed by the matched branch."
+  (:require [balli.core :as b]
+            [balli.normalize :as norm]
+            [balli.registry :as reg]))
+
+(declare destructure-node)
+
+(defn- layered
+  [node registry]
+  (if-let [local (:local-registry node)]
+    (reg/push-layer registry local)
+    registry))
+
+(defn- resolve-ref-node
+  [node registry]
+  (let [r (reg/resolve-ref-layered registry (:ref node))]
+    (when (nil? r)
+      (throw (ex-info "Unresolved ref"
+                      {:type :balli.core/unresolved-ref :ref (:ref node)})))
+    [(norm/normalize (:form r) {:registry (:registry r)}) (:registry r)]))
+
+(defn- destructure-entry-map
+  [entries value registry]
+  (persistent!
+   (reduce (fn [acc {:keys [key schema]}]
+             (if (contains? value key)
+               (assoc! acc key (destructure-node schema (get value key) registry))
+               acc))
+           (transient {})
+           entries)))
+
+(defn- destructure-node
+  [node value registry]
+  (let [registry (layered node registry)]
+    (case (:type node)
+      :schema (destructure-node (first (:children node)) value registry)
+      :ref (let [[target target-registry] (resolve-ref-node node registry)]
+             (destructure-node target value target-registry))
+      :map (destructure-entry-map (:children node) value registry)
+      :tuple (mapv (fn [schema v] (destructure-node schema v registry))
+                   (:children node)
+                   value)
+      (:vector :sequential :seqable :every :set)
+      (mapv #(destructure-node (first (:children node)) % registry) value)
+      :catn (if (b/tags? value)
+              (:values value)
+              value)
+      (:orn :multi :altn)
+      (if (b/tag? value)
+        {(:key value) (:value value)}
+        value)
+      value)))
+
+(defn destructure
+  "Validate and destructure `value` according to schema `s`. Returns
+  :balli.core/invalid when parsing fails."
+  ([s value] (destructure s value {}))
+  ([s value opts]
+   (let [so (b/schema s opts)
+         parsed (b/parse so value)]
+     (if (b/invalid? parsed)
+       parsed
+       (destructure-node (:ast so) parsed (:registry so))))))
+
+(defn paths
+  "Return [path schema-form] pairs for named schema positions."
+  ([s] (paths s {}))
+  ([s opts]
+   (letfn [(walk [node path registry]
+             (let [registry (layered node registry)]
+               (case (:type node)
+                 :schema (walk (first (:children node)) path registry)
+                 :ref (let [[target target-registry] (resolve-ref-node node registry)]
+                        (walk target path target-registry))
+                 (:map :catn :orn :multi :altn :andn)
+                 (into [[path (:form node)]]
+                       (mapcat (fn [{:keys [key schema]}]
+                                 (walk schema (conj path key) registry)))
+                       (:children node))
+                 (into [[path (:form node)]]
+                       (mapcat (fn [[i child]]
+                                 (walk child (conj path i) registry)))
+                       (map-indexed vector (:children node))))))]
+     (let [so (b/schema s opts)]
+       (vec (walk (:ast so) [] (:registry so)))))))
