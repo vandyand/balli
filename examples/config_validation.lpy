@@ -1,0 +1,18 @@
+(ns examples.config-validation
+  (:require [balli.core :as b]
+            [balli.error :as be]))
+
+(def config-schema
+  [:map {:closed true}
+   [:host [:string {:min 1}]]
+   [:port [:int {:min 1 :max 65535}]]
+   [:debug {:optional true} :boolean]])
+
+(def config
+  {:host "localhost"
+   :port 8080
+   :debug false})
+
+(if (b/validate config-schema config)
+  (println "config ok")
+  (println (be/humanize (b/explain config-schema config))))

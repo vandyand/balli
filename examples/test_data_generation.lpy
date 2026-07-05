@@ -1,0 +1,11 @@
+(ns examples.test-data-generation
+  (:require [balli.generator :as bg]))
+
+(def order-schema
+  [:map
+   [:id :uuid]
+   [:total [:int {:min 0 :max 10000}]]
+   [:status [:enum :draft :paid :shipped]]])
+
+(doseq [sample (bg/sample order-schema {:seed 42 :n 3})]
+  (println sample))

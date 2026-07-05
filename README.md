@@ -1,23 +1,51 @@
 # Balli
 
+[![CI](https://github.com/vandyand/balli/actions/workflows/ci.yml/badge.svg)](https://github.com/vandyand/balli/actions/workflows/ci.yml)
+[![Docs](https://github.com/vandyand/balli/actions/workflows/docs.yml/badge.svg)](https://github.com/vandyand/balli/actions/workflows/docs.yml)
+[![PyPI](https://img.shields.io/pypi/v/balli.svg)](https://pypi.org/project/balli/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Data-driven schemas for [Basilisp](https://github.com/basilisp-lang/basilisp), inspired by [Malli](https://github.com/metosin/malli).
 
 Schemas are plain data in Malli's vector syntax, plus Malli-style map syntax / AST input — no macros, no protocols to implement. Balli covers most of Malli's surface: validation and Malli-shaped explain data with `:path`/`:in`, humanized errors with key spell-checking and localized/custom messages, value transformation (decode/encode/coerce), parse/unparse with tagged branches, sequence (regex) schemas with an iterative backtracking engine, function schemas with generative checking and instrumentation, deterministic seeded generators with regex generation, generator objects, and heuristic shrinking, JSON Schema/OpenAPI/Swagger/DOT/PlantUML/description export, schema utilities (`merge`/`union`/`closed-schema`/...), form walking, safe schema serialization through named function refs and EDN wrappers, custom schema type extensions, schema inference/destructuring from sample data, predicate/comparator schemas, time schemas, default branches, self-contained local registries, and mutable/lazy/dynamic/var custom registries with recursive refs. Malli-inspired, not a strict port — see [Differences from Malli](#differences-from-malli). Pure Basilisp; no Python dependencies beyond the standard library.
 
+## Project resources
+
+- Hosted docs: <https://vandyand.github.io/balli/>
+- API reference: <https://vandyand.github.io/balli/api/>
+- Compatibility matrix: [docs/malli-compatibility.md](docs/malli-compatibility.md)
+- Examples: [examples/](examples/)
+- Benchmarks: [benchmarks/](benchmarks/)
+- Release process: [RELEASE.md](RELEASE.md)
+- Changelog: [CHANGELOG.md](CHANGELOG.md)
+
 ## Install
+
+From PyPI, after a release has been published:
+
+```bash
+python -m pip install balli
+```
 
 From source:
 
 ```bash
 git clone https://github.com/vandyand/balli.git
 cd balli
-pip install .
+python -m pip install .
 ```
 
 On PEP-668 ("externally managed environment") systems, either use a virtualenv or add `--break-system-packages`:
 
 ```bash
-pip install . --break-system-packages
+python -m pip install . --break-system-packages
+```
+
+To verify a fresh clone quickly:
+
+```bash
+python -m pip install -e ".[dev]"
+scripts/user_suite.sh
 ```
 
 ## Quick start

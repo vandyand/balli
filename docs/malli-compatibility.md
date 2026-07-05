@@ -35,3 +35,9 @@ matrix tracks the major Malli feature families Balli intentionally covers.
 | SCI integration | Data-only host context via `balli.sci`; no Clojure SCI runtime |
 | clj-kondo / static analyzer integration | Data export via `balli.clj-kondo`; no Clojure analyzer runtime |
 | `malli.experimental` | Not ported as executable Clojure experimental APIs |
+
+## Evidence
+
+Compatibility claims are backed by CI tests where practical. See
+[Compatibility Evidence](compatibility-evidence.md) and
+`tests/test_compatibility_corpus.lpy` for the executable corpus.

@@ -1,0 +1,15 @@
+(ns examples.openapi-export
+  (:require [balli.json-schema :as json-schema]
+            [balli.openapi :as openapi]))
+
+(def user-schema
+  [:map
+   [:id :uuid]
+   [:name [:string {:min 1}]]
+   [:roles [:set :keyword]]])
+
+(println "JSON Schema")
+(println (json-schema/transform user-schema))
+
+(println "OpenAPI Schema")
+(println (openapi/schema user-schema))
