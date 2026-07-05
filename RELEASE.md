@@ -10,13 +10,32 @@ Balli releases are intended to be published as Python packages.
 - PyPI trusted publishing is configured for the GitHub repository environment
   named `pypi`.
 
+## PyPI Trusted Publisher
+
+Configure a PyPI trusted publisher before cutting the first release:
+
+- PyPI project: `balli`
+- Owner: `vandyand`
+- Repository name: `balli`
+- Workflow name: `release.yml`
+- Environment name: `pypi`
+
+The GitHub environment `pypi` exists in this repository. A manual release
+workflow run on July 5, 2026 reached the PyPI publish step and failed with
+`invalid-publisher` because PyPI did not yet have a matching trusted publisher.
+The OIDC claims PyPI reported were:
+
+```text
+sub: repo:vandyand/balli:environment:pypi
+repository: vandyand/balli
+workflow_ref: vandyand/balli/.github/workflows/release.yml@refs/heads/main
+environment: pypi
+```
+
 ## Cut A Release
 
 ```bash
-basilisp run scripts/compile_check.lpy
-basilisp test
-python -m build
-git diff --check
+scripts/release_check.sh
 git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
