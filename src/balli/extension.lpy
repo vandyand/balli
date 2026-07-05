@@ -1,0 +1,53 @@
+(ns balli.extension
+  "Custom schema type extension registry.
+
+  Extension specs are maps keyed by a custom schema keyword:
+    {:validate    (fn [value props children] boolean)
+     :generate    (fn [node registry rnd size gen-child] value)
+     :decode      (fn [value props child-transformers] value)
+     :encode      (fn [value props child-transformers] value)
+     :json-schema (fn [node child-json] string-keyed-map)
+     :describe    (fn [node child-descriptions] string)
+     :message     \"humanized default message\"}
+
+  `children` passed to :validate are compiled child validator fns. Most
+  simple extension types are leaf schemas and ignore them."
+  (:refer-basilisp :exclude [type])
+  (:require [balli.registry :as reg]))
+
+(defonce ^:private type-specs
+  (atom {}))
+
+(defn register-type!
+  "Register custom schema type keyword `k` with extension `spec`. Returns k."
+  [k spec]
+  (when-not (keyword? k)
+    (throw (ex-info "Extension type key must be a keyword"
+                    {:type :balli.extension/invalid-extension :key k})))
+  (when-not (map? spec)
+    (throw (ex-info "Extension spec must be a map"
+                    {:type :balli.extension/invalid-extension :key k :spec spec})))
+  (swap! type-specs assoc k spec)
+  ;; raw-form caches may have rejected this keyword before registration.
+  (swap! reg/mutation-epoch inc)
+  k)
+
+(defn unregister-type!
+  [k]
+  (swap! type-specs dissoc k)
+  (swap! reg/mutation-epoch inc)
+  nil)
+
+(defn type-spec
+  [k]
+  (get @type-specs k))
+
+(defn custom-type?
+  [k]
+  (contains? @type-specs k))
+
+(defn clear-types!
+  []
+  (reset! type-specs {})
+  (swap! reg/mutation-epoch inc)
+  nil)

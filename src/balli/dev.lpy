@@ -1,0 +1,101 @@
+(ns balli.dev
+  "Development-time instrumentation registry.
+
+  Register atoms that hold functions, then start!/stop! wraps/restores them.
+  This is explicit and Pythonic: Balli does not mutate namespace vars."
+  (:require [balli.core :as b]))
+
+(defonce ^:private entries
+  (atom {}))
+
+(defonce ^:private running?
+  (atom false))
+
+(defonce ^:private failures
+  (atom []))
+
+(defn capture-fail!
+  "Clear and start collecting instrumentation failures reported through this
+  namespace's default reporter."
+  []
+  (reset! failures [])
+  nil)
+
+(defn uncapture-fail!
+  []
+  (let [xs @failures]
+    (reset! failures [])
+    xs))
+
+(defn captured-failures
+  []
+  @failures)
+
+(defn- default-report
+  [type data]
+  (let [failure (assoc data :type type)]
+    (swap! failures conj failure)
+    (throw (ex-info (str "Instrumentation failed: " type) failure))))
+
+(defn register!
+  "Register function atom `fn-atom` under `k` with function schema `schema`.
+  opts are passed to balli.core/instrument."
+  ([k fn-atom schema] (register! k fn-atom schema {}))
+  ([k fn-atom schema opts]
+   (let [existing (get @entries k)]
+     (when (and existing (not (identical? fn-atom (:atom existing))))
+       (reset! (:atom existing) (:original existing)))
+     (let [original (if (and @running?
+                             existing
+                             (identical? fn-atom (:atom existing)))
+                      (:original existing)
+                      @fn-atom)]
+       (swap! entries assoc k {:atom fn-atom
+                               :schema schema
+                               :opts opts
+                               :original original})
+       (when @running?
+         (reset! fn-atom (b/instrument (merge {:schema schema
+                                               :report default-report}
+                                              opts)
+                                       original)))))
+   k))
+
+(defn unregister!
+  [k]
+  (when-let [{:keys [atom original]} (get @entries k)]
+    (reset! atom original))
+  (swap! entries dissoc k)
+  nil)
+
+(defn registered
+  []
+  (set (keys @entries)))
+
+(defn start!
+  "Instrument every registered function atom. Idempotent."
+  ([] (start! {}))
+  ([start-opts]
+   (when-not @running?
+     (doseq [[k entry] @entries]
+       (let [{:keys [atom schema opts]} entry]
+       (swap! entries assoc-in [k :original] @atom)
+       (reset! atom (b/instrument (merge {:schema schema
+                                          :report default-report}
+                                         start-opts
+                                         opts)
+                                  @atom))))
+     (reset! running? true))
+   true))
+
+(defn stop!
+  "Restore every registered function atom to its original function."
+  []
+  (doseq [[_ {:keys [atom original]}] @entries]
+    (reset! atom original))
+  (reset! running? false)
+  true)
+
+(defn running
+  []
+  @running?)

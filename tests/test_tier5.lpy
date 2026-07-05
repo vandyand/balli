@@ -1,0 +1,379 @@
+(ns tests.test-tier5
+  "Tier 5 parity: extension API, richer errors, safe serialization, dev
+  instrumentation, shrinking/regex generation, and richer exports."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.describe :as desc]
+            [balli.dev :as dev]
+            [balli.dot :as dot]
+            [balli.error :as be]
+            [balli.extension :as ext]
+            [balli.generator :as bg]
+            [balli.json-schema :as js]
+            [balli.openapi :as openapi]
+            [balli.plantuml :as plantuml]
+            [balli.serial :as serial]
+            [balli.swagger :as swagger]
+            [balli.transform :as bt]))
+
+(defn evenish?
+  [x]
+  (and (int? x) (even? x)))
+
+(defn posish?
+  [x]
+  (and (int? x) (pos? x)))
+
+(defn- ex-type
+  [f]
+  (try
+    (f)
+    nil
+    (catch python/Exception e
+      (:type (ex-data e)))))
+
+(ext/register-type!
+ :tier5/even
+ {:validate (fn [x _props _children] (evenish? x))
+  :generate (fn [_node _registry _rnd _size _gen-child] 2)
+  :decode (fn [x _props _children] (if (string? x) (python/int x) x))
+  :encode (fn [x _props _children] (str x))
+  :json-schema (fn [_node _children] {"type" "integer" "multipleOf" 2})
+  :describe (fn [_node _children] "an even integer")
+  :message "should be an even integer"})
+
+(deftest extension-api-roundtrip
+  (let [s :tier5/even]
+    (is (true? (b/validate s 4)))
+    (is (false? (b/validate s 5)))
+    (is (= ["should be an even integer"] (be/humanize (b/explain s 5))))
+    (is (= 2 (bg/generate s {:seed 1})))
+    (is (= 42 (b/decode s "42" (bt/string-transformer))))
+    (is (= "42" (b/encode s 42 (bt/string-transformer))))
+    (is (= {"type" "integer" "multipleOf" 2} (js/transform s)))
+    (is (= "an even integer" (desc/describe s)))
+    (is (some? (.find (dot/transform s) ":tier5/even")))))
+
+(deftest richer-errors
+  (testing "locale and caller message overrides"
+    (is (= ["tipo invalido"]
+           (be/humanize (b/explain :int "x") {:locale :es})))
+    (is (= {:name ["nombre requerido"]}
+           (be/humanize (b/explain [:map [:name :string]] {})
+                        {:messages {:balli.core/missing-key "nombre requerido"}}))))
+  (testing "schema-level localized messages and functions"
+    (is (= ["entero"]
+           (be/humanize (b/explain [:int {:error/messages {:es "entero"}}]
+                                  "x")
+                        {:locale :es})))
+    (is (= ["bad: :balli.core/invalid-type"]
+           (be/humanize
+            (b/explain [:int {:error/fn (fn [e _opts] (str "bad: " (:type e)))}] "x"))))))
+
+(deftest safe-serialization
+  (serial/register-function! :tier5/posish posish?)
+  (let [schema [:map
+                [:x [:fn posish?]]
+                [:code [:re #"\d+"]]]
+        data (serial/serialize schema)
+        restored (serial/deserialize data)
+        edn (serial/write-string schema)
+        read-back (serial/read-string edn)]
+    (is (= [:balli.fn/ref :tier5/posish] (get-in data [1 1 1])))
+    (is (true? (b/validate restored {:x 1 :code "7"})))
+    (is (false? (b/validate restored {:x -1 :code "7"})))
+    (is (true? (b/validate read-back {:x 2 :code "9"})))
+    (is (= [:= [:balli.fn/ref :literal]]
+           (serial/deserialize (serial/serialize [:= [:balli.fn/ref :literal]]))))
+    (is (= [:= [:balli.re/pattern "literal"]]
+           (serial/deserialize (serial/serialize [:= [:balli.re/pattern "literal"]]))))
+    (is (= :balli.serial/unregistered-function
+           (ex-type #(serial/serialize [:fn (fn [_] true)]))))))
+
+(deftest dev-instrumentation
+  (dev/stop!)
+  (dev/capture-fail!)
+  (let [f (atom (fn [x] (inc x)))]
+    (dev/register! :tier5/inc f [:=> [:cat :int] :int])
+    (is (false? (dev/running)))
+    (dev/start!)
+    (is (true? (dev/running)))
+    (is (= 2 (@f 1)))
+    (is (= :balli.core/invalid-input
+           (ex-type #(@f "x"))))
+    (is (= 1 (count (dev/captured-failures))))
+    (dev/stop!)
+    (is (false? (dev/running)))
+    (is (= 2 (@f 1)))
+    (dev/unregister! :tier5/inc)))
+
+(deftest extension-transformer-child-coders
+  (ext/register-type!
+   :tier5/box
+   {:validate (fn [x _props children]
+                (and (map? x)
+                     (contains? x :value)
+                     (every? #(% (:value x)) children)))
+    :decode (fn [x _props children]
+              (if (and (map? x) (seq children))
+                (assoc x :value ((first children) (:value x)))
+                x))
+    :encode (fn [x _props children]
+              (if (and (map? x) (seq children))
+                (assoc x :value ((first children) (:value x)))
+                x))})
+  (try
+    (let [s [:tier5/box :int]]
+      (is (= {:value 42}
+             (b/decode s {:value "42"} (bt/string-transformer))))
+      (is (= {:value "42"}
+             (b/encode s {:value 42} (bt/string-transformer))))
+      (is (true? (b/validate s {:value 42})))
+      (is (false? (b/validate s {:value "42"}))))
+    (finally
+      (ext/unregister-type! :tier5/box))))
+
+(deftest generator-shrink-and-regex
+  (testing "simple regex generation now works without :gen/*"
+    (doseq [schema [[:re #"\d+"] [:re #"[ab]\d"] [:re #"^a+$"]]]
+      (let [v (bg/generate schema {:seed 4 :size 8})]
+        (is (true? (b/validate schema v)) (str "regex value failed: " v)))))
+  (testing "shrinking keeps schema validity and optional failure predicate"
+    (is (= [0 5 9] (bg/shrink [:int {:min 0}] 10)))
+    (is (= [[10]]
+           (bg/shrink [:vector :int] [10 20]
+                      {:predicate (fn [v] (= 1 (count v)))})))))
+
+(deftest richer-exports
+  (let [s [:map [:id :int] [:name :string]]]
+    (is (= "a map with :id is :int, :name is :string" (desc/describe s)))
+    (is (.startswith (plantuml/transform s) "@startuml"))
+    (is (= "application/json"
+           (first (keys (get (openapi/request-body s) "content")))))
+    (is (= "OK" (get (openapi/response s) "description")))
+    (is (= {"name" "id" "in" "query" "required" true
+            "schema" {"type" "integer"}}
+           (openapi/parameter "id" "query" :int)))
+    (is (= {"name" "body" "in" "body" "required" true
+            "schema" {"type" "object"
+                      "properties" {"id" {"type" "integer"}
+                                    "name" {"type" "string"}}
+                      "required" ["id" "name"]}}
+           (swagger/parameter "body" "body" s)))
+    (is (= "OK" (get (swagger/response s) "description")))))
+
+(deftest tier5-fuzz-extension-serialization-and-exports
+  (serial/register-function! :tier5/evenish evenish?)
+  (let [schemas [:tier5/even
+                 [:vector :tier5/even]
+                 [:map [:x :tier5/even]]
+                 [:fn evenish?]
+                 [:re #"\d+"]]]
+    (doseq [i (range 80)
+            s schemas]
+      (let [s* (serial/deserialize (serial/serialize s))
+            v (try
+                (bg/generate s* {:seed i :size 8})
+                (catch python/Exception _ ::no-generated))]
+        (is (map? (js/transform s*)))
+        (is (string? (desc/describe s*)))
+        (is (.startswith (plantuml/transform s*) "@startuml"))
+        (when-not (= ::no-generated v)
+          (is (true? (b/validate s* v))))))))
+
+(deftest tier5-stress-dev-start-stop
+  (let [f (atom (fn [x] x))]
+    (dev/register! :tier5/id f [:=> [:cat :int] :int])
+    (doseq [_ (range 40)]
+      (dev/start!)
+      (is (= 1 (@f 1)))
+      (dev/stop!)
+      (is (= 1 (@f 1))))
+    (dev/unregister! :tier5/id)))
+
+(deftest tier5-stress-dev-reregister-while-running
+  (dev/stop!)
+  (let [f (atom (fn [x] x))]
+    (dev/register! :tier5/reregister f [:=> [:cat :int] :int])
+    (dev/start!)
+    (is (= :balli.core/invalid-input (ex-type #(@f "x"))))
+    (dev/register! :tier5/reregister f [:=> [:cat :int] :int])
+    (dev/stop!)
+    (is (= "x" (@f "x")))
+    (dev/unregister! :tier5/reregister)))
+
+(deftest tier5-stress-extension-lifecycle-and-cache-invalidation
+  (doseq [i (range 40)]
+    (let [k (keyword "tier5.dynamic" (str "n" i))]
+      (ext/register-type!
+       k
+       {:validate (fn [x props children]
+                    (and (int? x)
+                         (<= (or (:min props) 0) x)
+                         (every? #(% x) children)))
+        :generate (fn [node _registry _rnd _size _gen-child]
+                    (or (:min (:properties node)) 0))
+        :json-schema (fn [node _children]
+                       {"type" "integer"
+                        "minimum" (or (:min (:properties node)) 0)})
+        :describe (fn [node _children]
+                    (str "dynamic integer >= " (or (:min (:properties node)) 0)))
+        :message "dynamic extension failed"})
+      (let [s [k {:min i} [:>= i]]]
+        (is (true? (b/validate s i)) (str "registered extension failed " k))
+        (is (false? (b/validate s (dec i))))
+        (is (= i (bg/generate s {:seed i})))
+        (is (= {"type" "integer" "minimum" i} (js/transform s)))
+        (is (= (str "dynamic integer >= " i) (desc/describe s)))
+        (is (= ["dynamic extension failed"] (be/humanize (b/explain s (dec i))))))
+      (ext/unregister-type! k)
+      (is (= :balli.core/invalid-schema
+             (ex-type #(b/validate k i)))
+          (str "unregistered extension still resolved " k)))))
+
+(deftest tier5-extension-registry-collision-prefers-registry
+  (ext/register-type!
+   :tier5/collide
+   {:validate (fn [_x _props _children] false)})
+  (try
+    (let [r {:types #{}
+             :schemas {:tier5/collide :int}}]
+      (is (true? (b/validate :tier5/collide 1 {:registry r})))
+      (is (false? (b/validate :tier5/collide "x" {:registry r})))
+      (is (true? (b/validate [:schema {:registry {:tier5/collide :int}}
+                              :tier5/collide]
+                             1)))
+      (is (false? (b/validate :tier5/collide 1))))
+    (finally
+      (ext/unregister-type! :tier5/collide))))
+
+(deftest tier5-fuzz-error-message-precedence
+  (doseq [i (range 60)]
+    (let [type (if (zero? (mod i 2)) :int :string)
+          bad (if (= :int type) "x" 12)
+          locale (if (zero? (mod i 3)) :es :en)]
+      (is (= ["fn wins"]
+             (be/humanize
+              (b/explain [type {:error/fn (fn [_e _opts] "fn wins")
+                                :error/messages {:es "schema locale"}
+                                :error/message "schema literal"}]
+                         bad)
+              {:locale locale
+               :messages {:balli.core/invalid-type "caller"}})))
+      (is (= [(if (= :es locale) "schema locale" "schema literal")]
+             (be/humanize
+              (b/explain [type {:error/messages {:es "schema locale"}
+                                :error/message "schema literal"}]
+                         bad)
+              {:locale locale
+               :messages {:balli.core/invalid-type "caller"}})))
+      (is (= ["caller"]
+             (be/humanize
+              (b/explain type bad)
+              {:locale locale
+               :messages {:balli.core/invalid-type "caller"}}))))))
+
+(deftest tier5-fuzz-serialization-nested-schemas
+  (serial/register-function! :tier5/posish posish?)
+  (serial/register-function! :tier5/evenish evenish?)
+  (let [schemas [[:map
+                  [:x [:fn posish?]]
+                  [:nested
+                   [:vector
+                    [:map
+                     [:code [:re #"\d+"]]
+                     [:even [:fn evenish?]]]]]]
+                 [:or
+                  [:map [:kind [:= :a]] [:v [:fn posish?]]]
+                  [:map [:kind [:= :b]] [:v [:re #"[ab]\d"]]]]
+                 [:tuple
+                  [:fn evenish?]
+                  [:re #"^a+$"]
+                  [:set :keyword]]]
+        values [{:x 1 :nested [{:code "7" :even 2}]}
+                {:kind :a :v 3}
+                [4 "aaa" #{:ok}]]]
+    (doseq [i (range 90)]
+      (let [idx (mod i (count schemas))
+            s (nth schemas idx)
+            v (nth values idx)
+            data (serial/serialize s)
+            restored (serial/deserialize data)
+            read-back (serial/read-string (serial/write-string s))]
+        (is (true? (b/validate restored v)))
+        (is (true? (b/validate read-back v)))
+        (is (= data (serial/serialize restored)))))))
+
+(deftest tier5-stress-regex-generation-and-shrinking
+  (let [regex-schemas [[:re #"\d+"]
+                       [:re #"\w{1,4}"]
+                       [:re #"[ab]\d?"]
+                       [:re #"[a-z]"]
+                       [:re #"[A-Z]{2}"]
+                       [:re #"[a-z0-9]{2,4}"]
+                       [:re #"^a{2,5}$"]
+                       [:re #"id-\d{2}"]]]
+    (doseq [seed (range 120)
+            s regex-schemas]
+      (let [v (bg/generate s {:seed seed :size 12})]
+        (is (true? (b/validate s v))
+            (str "regex generated invalid value " s " -> " v)))))
+  (doseq [s [[:re #"a|b"]
+             [:re #"a\.b"]
+             [:re #"\s+"]
+             [:re #"[^^a]"]]]
+    (is (= :balli.core/no-generator
+           (ex-type #(bg/generate s {:seed 0 :size 12})))
+        (str "unsupported regex should throw no-generator: " s)))
+  (let [cases [[:int {:min 0} 25]
+               [:string "abcdef"]
+               [[:vector :int] [10 20 30]]
+               [[:map [:a :int] [:b {:optional true} :string]] {:a 1 :b "x"}]
+               [[:set :keyword] #{:a :b}]]]
+    (doseq [[s v] cases]
+      (doseq [candidate (bg/shrink s v)]
+        (is (true? (b/validate s candidate))
+            (str "shrink produced invalid candidate " candidate " for " s)))))
+  (is (every? #(= 1 (count %))
+              (bg/shrink [:vector :int] [1 2 3]
+                         {:predicate (fn [v] (= 1 (count v)))}))))
+
+(deftest tier5-stress-export-fragments
+  (let [schemas [:int
+                 [:string {:min 1 :max 8}]
+                 [:map [:id :int] [:name :string]]
+                 [:vector [:map [:x :int]]]
+                 [:or :int :string]
+                 :tier5/even]]
+    (doseq [i (range 80)]
+      (let [s (nth schemas (mod i (count schemas)))
+            ct (str "application/x-tier5-" i)]
+        (is (= ct (first (keys (get (openapi/request-body s {:content-type ct})
+                                    "content")))))
+        (is (= (str "desc-" i)
+               (get (openapi/response s {:description (str "desc-" i)})
+                    "description")))
+        (is (= false
+               (get (openapi/parameter "q" "query" s {:required false})
+                    "required")))
+        (is (map? (swagger/parameter "body" "body" s)))
+        (is (= (str "sw-" i)
+               (get (swagger/response s {:description (str "sw-" i)})
+                    "description")))
+        (is (string? (desc/describe s)))
+        (is (.startswith (plantuml/transform s) "@startuml"))))))
+
+(deftest tier5-stress-dev-failure-capture-lifecycle
+  (dev/stop!)
+  (dev/capture-fail!)
+  (let [f (atom (fn [x] x))]
+    (dev/register! :tier5/capture f [:=> [:cat :int] :int])
+    (doseq [i (range 30)]
+      (dev/start!)
+      (is (= i (@f i)))
+      (is (= :balli.core/invalid-input (ex-type #(@f (str i)))))
+      (is (= (inc i) (count (dev/captured-failures))))
+      (dev/stop!))
+    (is (= 30 (count (dev/uncapture-fail!))))
+    (is (= 0 (count (dev/captured-failures))))
+    (dev/unregister! :tier5/capture)))

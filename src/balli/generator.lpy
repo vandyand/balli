@@ -33,9 +33,10 @@
   retries until the whole :and validates (cap 100); :not generates :any
   values and filters (cap 100); :multi picks a branch entry and generates its
   schema -- the branch schema itself must produce the dispatch value (e.g.
-  contain a [:dispatch-key [:= tag]] entry); :re/:fn have NO default
-  generator and throw :balli.core/no-generator unless a :gen/* hook is
-  supplied. Predicate schemas (:balli/pred) generate through the
+  contain a [:dispatch-key [:= tag]] entry); :re has a small built-in
+  generator for common regex forms; :fn has NO default generator and throws
+  :balli.core/no-generator unless a :gen/* hook is supplied. Predicate
+  schemas (:balli/pred) generate through the
   pred-gen-forms mapping (unmapped preds, incl. inst? until Phase 5, throw
   no-generator); comparators generate ints relative to their child value
   (non-numeric children throw no-generator; :not= filters the :any pool).
@@ -64,9 +65,10 @@
   collection/seqex rep counts collapse to their minimum (0 unless :min/:+
   says otherwise) -- so recursion hidden behind optional keys or 0-min
   collections terminates by omission before the ref escape is ever needed."
-  (:import datetime math random uuid zoneinfo)
+  (:import datetime math random re uuid zoneinfo)
   (:require [balli.compile :as c]
             [balli.core :as b]
+            [balli.extension :as ext]
             [balli.normalize :as norm]
             [balli.registry :as reg]
             [balli.time :as bt]))
@@ -424,6 +426,73 @@
             :<= (let [hi (int-floor v)] (.randint rnd (- hi span) hi))))
         (no-generator! ast)))))
 
+(defn- gen-regex
+  "Small dependency-free generator for common regex forms. It handles the
+  forms Balli users usually write in examples: \\d, \\w, literal chars,
+  simple character classes, +/*/? quantifiers, {m,n}, anchors."
+  [ast rnd size]
+  (let [src (.-pattern (first (:children ast)))
+        src (-> src (.replace "^" "") (.replace "$" ""))
+        char-range (fn [a b]
+                     (let [lo (python/ord a)
+                           hi (python/ord b)]
+                       (if (<= lo hi)
+                         (apply str (map python/chr (range lo (inc hi))))
+                         (str a "-" b))))
+        class-chars (fn [body]
+                      (loop [i 0
+                             out ""]
+                        (if (>= i (count body))
+                          out
+                          (if (and (< (+ i 2) (count body))
+                                   (= "-" (subs body (inc i) (+ i 2))))
+                            (recur (+ i 3)
+                                   (str out
+                                        (char-range (subs body i (inc i))
+                                                    (subs body (+ i 2) (+ i 3)))))
+                            (recur (inc i)
+                                   (str out (subs body i (inc i))))))))
+        chars (fn [token]
+                (cond
+                  (= "\\d" token) "0123456789"
+                  (= "\\w" token) "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+                  (.startswith token "[") (class-chars (subs token 1 (dec (count token))))
+                  :else token))
+        token-re (re/compile "(\\\\d|\\\\w|\\[[^\\]]+\\]|.)((?:\\+|\\*|\\?|\\{\\d+,?\\d*\\})?)")
+        matches (iterator-seq (.finditer token-re src))]
+    (if (seq matches)
+      (let [candidate (apply str
+                             (mapcat
+                              (fn [m]
+                                (let [token (.group m 1)
+                                      q (.group m 2)
+                                      pool (chars token)
+                                      n (cond
+                                          (= "+" q) (.randint rnd 1 (max 1 (quot size 3)))
+                                          (= "*" q) (.randint rnd 0 (max 0 (quot size 3)))
+                                          (= "?" q) (.randint rnd 0 1)
+                                          (.startswith q "{") (let [body (subs q 1 (dec (count q)))
+                                                                     parts (.split body ",")
+                                                                     lo (python/int (first parts))
+                                                                     hi (if (and (= 2 (count parts)) (seq (second parts)))
+                                                                          (python/int (second parts))
+                                                                          lo)]
+                                                                 (.randint rnd lo hi))
+                                          :else 1)]
+                                  (repeatedly n #(.choice rnd pool))))
+                              matches))]
+        (if (b/validate (:form ast) candidate)
+          candidate
+          (no-generator! ast)))
+      (no-generator! ast))))
+
+(defn- gen-ext
+  [ast registry rnd size depth]
+  (let [spec (ext/type-spec (:ext-type ast))]
+    (if-some [f (:generate spec)]
+      (f ast registry rnd size #(gen % registry rnd size depth))
+      (no-generator! ast))))
+
 ;; ---------------------------------------------------------------------------
 ;; Dispatch
 
@@ -469,9 +538,10 @@
                            #(child (first (:children ast)))))
       :set (gen-set ast registry rnd size depth)
       :tuple (mapv child (:children ast))
-      ;; no default strategy -- only :gen/* hooks (checked before this
-      ;; dispatch) can generate these.
-      (:re :fn) (no-generator! ast)
+      :re (gen-regex ast rnd size)
+      ;; no default strategy -- only :gen/* hooks can generate :fn.
+      :fn (no-generator! ast)
+      :balli/ext (gen-ext ast registry rnd size depth)
       ;; predicate schemas map to existing type generators where obvious;
       ;; unmapped preds throw no-generator (see pred-gen-forms).
       :balli/pred (gen-pred ast registry rnd size depth)
@@ -550,6 +620,45 @@
          rnd (make-rnd opts)]
      (mapv (fn [_] (gen (:ast so) (:registry so) rnd default-size 0))
            (range n)))))
+
+;; ---------------------------------------------------------------------------
+;; Shrinking
+
+(declare shrink-candidates)
+
+(defn- valid-candidates
+  [s opts xs]
+  (let [v? (b/validator s opts)]
+    (vec (filter v? xs))))
+
+(defn- shrink-candidates
+  [x]
+  (cond
+    (int? x) (vec (distinct [0 (quot x 2) (dec x)]))
+    (float? x) (vec (distinct [0.0 (/ x 2.0)]))
+    (string? x) (vec (distinct ["" (subs x 0 (quot (count x) 2))]))
+    (keyword? x) [(keyword "a")]
+    (symbol? x) [(symbol "a")]
+    (vector? x) (vec (concat [[] (subvec x 0 (quot (count x) 2))]
+                             (map-indexed (fn [i v]
+                                            (mapv identity (assoc x i (first (shrink-candidates v)))))
+                                          x)))
+    (map? x) (vec (concat [{}]
+                          (map (fn [k] (dissoc x k)) (keys x))))
+    (set? x) [#{}]
+    :else []))
+
+(defn shrink
+  "Return schema-valid smaller candidates for `value`. With `:predicate`,
+  only candidates for which predicate returns truthy are kept; this models
+  shrinking a failing generated case while preserving the failure."
+  ([s value] (shrink s value {}))
+  ([s value opts]
+   (let [pred (:predicate opts)
+         candidates (valid-candidates s opts (shrink-candidates value))]
+     (if pred
+       (vec (filter pred candidates))
+       candidates))))
 
 ;; ---------------------------------------------------------------------------
 ;; function-checker (generative :=>/:function validation, Phase 8)

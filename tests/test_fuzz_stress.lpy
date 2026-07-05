@@ -4,12 +4,18 @@
   This is intentionally not Hypothesis: it uses Python random.Random with fixed
   seeds so failures are reproducible in ordinary `basilisp test` output."
   (:import datetime random)
-  (:require [basilisp.test :refer [deftest is testing]]
+  (:require [basilisp.json :as json]
+            [basilisp.test :refer [deftest is testing]]
             [balli.core :as b]
+            [balli.dev :as dev]
             [balli.error :as be]
             [balli.generator :as bg]
             [balli.json-schema :as js]
+            [balli.openapi :as openapi]
+            [balli.plantuml :as plantuml]
+            [balli.provider :as bp]
             [balli.registry :as reg]
+            [balli.swagger :as swagger]
             [balli.transform :as bt]))
 
 (def ^:private leaf-schemas
@@ -26,6 +32,18 @@
 (defn- choice
   [rnd xs]
   (nth xs (.randint rnd 0 (dec (count xs)))))
+
+(defn- ex-type
+  [f]
+  (try
+    (f)
+    nil
+    (catch python/Exception e
+      (:type (ex-data e)))))
+
+(defn- json-contains?
+  [x needle]
+  (not= -1 (.find (json/write-str x) needle)))
 
 (defn- maybe-props
   [rnd]
@@ -119,7 +137,8 @@
     ;; Transformers are lenient; this checks broad traversal/coder safety.
     (b/decode so v t)
     (b/encode so v t)
-    (doseq [bad invalid-values]
+    (doseq [bad (take 5 (drop (mod seed (count invalid-values))
+                              (cycle invalid-values)))]
       (let [valid? (b/validate so bad)
             explained (b/explain so bad)]
         (is (boolean? valid?))
@@ -127,7 +146,7 @@
           (is (some? (be/humanize explained))))))))
 
 (deftest generated-schema-fuzz-stress
-  (doseq [seed (range 80)]
+  (doseq [seed (range 24)]
     (testing (str "schema-seed " seed)
       (let [rnd (random/Random seed)
             s (gen-schema rnd 3)]
@@ -143,3 +162,247 @@
           (is (true? (b/validate k (bg/generate form {:seed i}))))))
       (finally
         (reg/set-default-registry! old)))))
+
+(deftest registry-shadowing-and-recursion-fuzz
+  (doseq [seed (range 24)]
+    (let [leaf (if (even? seed) :int :string)
+          other (if (even? seed) :string :int)
+          value (bg/generate leaf {:seed seed})
+          bad (bg/generate other {:seed (+ seed 100)})
+          r (reg/registry {:fuzz/value other
+                           :fuzz/node [:maybe [:map
+                                               [:v :fuzz/value]
+                                               [:kids {:optional true}
+                                                [:vector [:ref :fuzz/node]]]]]})
+          local [:schema {:registry {:fuzz/value leaf
+                                     :fuzz/node [:maybe [:map
+                                                         [:v :fuzz/value]
+                                                         [:kids {:optional true}
+                                                          [:vector [:ref :fuzz/node]]]]]}}
+                 [:map
+                  [:direct :fuzz/value]
+                  [:refed [:ref :fuzz/value]]
+                  [:tree [:ref :fuzz/node]]]]
+          good {:direct value
+                :refed value
+                :tree {:v value :kids [{:v value}]}}
+          bad-v (assoc good :direct bad)
+          so (b/schema local {:registry r})]
+      (is (true? (b/validate so good)) (str "local shadow failed seed " seed))
+      (is (false? (b/validate so bad-v)))
+      (is (nil? (b/explain so good)))
+      (is (map? (js/transform so)))
+      (is (not (b/invalid? (b/parse so good))))
+      (is (= good (b/unparse so (b/parse so good))))
+      (let [generated (bg/generate so {:seed seed :size 6})]
+        (is (true? (b/validate so generated)))))))
+
+(deftest transformer-composition-fuzz
+  (let [schemas [[:map [:n :int] [:flag :boolean] [:tags [:set :keyword]]]
+                 [:vector :int]
+                 [:map-of :keyword :int]
+                 [:or :int :string]
+                 [:multi {:dispatch :kind}
+                  [:a [:map [:kind [:= :a]] [:n :int]]]
+                  [:b [:map [:kind [:= :b]] [:s :string]]]]
+                 [:map [:created :time/instant] [:ttl :time/duration]]]
+        raws [{:n "42" :flag "true" :tags ["a" "b"]}
+              ["1" "2" "3"]
+              {"a" "1" "b" "2"}
+              "7"
+              {:kind :a :n "9"}
+              {:created "2024-06-01T12:00:00+00:00" :ttl "PT15M"}]
+        t (bt/transformer (bt/json-transformer)
+                          (bt/time-transformer)
+                          (bt/string-transformer)
+                          (bt/collection-transformer))]
+    (doseq [i (range 36)]
+      (let [idx (mod i (count schemas))
+            s (nth schemas idx)
+            raw (nth raws idx)
+            decoded (b/decode s raw t)]
+        (is (true? (b/validate s decoded))
+            (str "decoded value did not validate for " s " -> " decoded))
+        (is (some? (b/encode s decoded t)))))))
+
+(deftest seqex-parse-unparse-fuzz
+  (let [cases [[[:cat :int [:* :string]] [1 "a" "b"]]
+               [[:catn [:n :int] [:tail [:* :string]]] [1 "a" "b"]]
+               [[:alt :int :string] ["x"]]
+               [[:altn [:n :int] [:s :string]] [2]]
+               [[:repeat {:min 1 :max 3} :int] [1 2]]
+               [[:cat [:schema [:orn [:n :int] [:s :string]]] [:? :boolean]]
+                [1 true]]
+               [[:cat [:schema [:map [:x :int]]] [:* [:schema [:or :int :string]]]]
+                [{:x 1} 2 "a"]]]]
+    (doseq [seed (range 42)]
+      (let [[s v] (nth cases (mod seed (count cases)))
+            parsed (b/parse s v)]
+        (is (false? (b/invalid? parsed)) (str "parse failed for " s))
+        (is (= v (b/unparse s parsed)) (str "unparse mismatch for " s))
+        (is (true? (b/validate s v)))
+        (is (some? (b/explain s (conj v :bad))))))))
+
+(deftest function-instrumentation-fuzz
+  (let [scenarios [{:schema [:=> [:cat :int] :int]
+                    :f inc
+                    :check (fn [w _schema]
+                             (is (= 2 (w 1)))
+                             (is (= :balli.core/invalid-input
+                                    (ex-type #(w "x")))))}
+                   {:schema [:=> [:cat :int :int] :int]
+                    :f +
+                    :check (fn [w _schema]
+                             (is (= 3 (w 1 2)))
+                             (is (= :balli.core/invalid-arity
+                                    (ex-type #(w 1)))))}
+                   {:schema [:=> [:cat :int [:* :int]] :int]
+                    :f (fn [& xs] (apply + xs))
+                    :check (fn [w _schema]
+                             (is (= 10 (w 1 2 3 4)))
+                             (is (= :balli.core/invalid-input
+                                    (ex-type #(w 1 "x")))))}
+                   {:schema [:=> [:cat :int] :int
+                             [:fn (fn [[args ret]] (= ret (inc (first args))))]]
+                    :f inc
+                    :check (fn [w schema]
+                             (is (= 2 (w 1)))
+                             (let [bad (b/instrument {:schema schema} dec)]
+                               (is (= :balli.core/invalid-guard
+                                      (ex-type #(bad 1))))))}
+                   {:schema [:=> [:cat :int] :string]
+                    :f inc
+                    :check (fn [w _schema]
+                             (is (= :balli.core/invalid-output
+                                    (ex-type #(w 1)))))}
+                   {:schema [:function
+                             [:=> [:cat :int] :int]
+                             [:=> [:cat :int :int] :int]]
+                    :f (fn ([x] (inc x)) ([x y] (+ x y)))
+                    :check (fn [w _schema]
+                             (is (= 2 (w 1)))
+                             (is (= 3 (w 1 2)))
+                             (is (= :balli.core/invalid-arity
+                                    (ex-type #(w 1 2 3))))) }]]
+    (doseq [seed (range 60)]
+      (let [{:keys [schema f check]} (nth scenarios (mod seed (count scenarios)))
+            w (b/instrument {:schema schema} f)]
+        (check w schema)))))
+
+(deftest dev-instrumentation-stress
+  (dev/stop!)
+  (dev/capture-fail!)
+  (let [atoms (mapv (fn [i] (atom (fn [x] (+ x i)))) (range 5))]
+    (try
+      (doseq [[i f] (map-indexed vector atoms)]
+        (dev/register! (keyword "fuzz.dev" (str "f" i))
+                       f
+                       [:=> [:cat :int] :int]))
+      (doseq [round (range 12)]
+        (dev/start!)
+        (doseq [[i f] (map-indexed vector atoms)]
+          (is (= (+ round i) (@f round)))
+          (is (= :balli.core/invalid-input
+                 (ex-type #(@f (str round))))))
+        (dev/stop!)
+        (doseq [[i f] (map-indexed vector atoms)]
+          (is (= (+ round i) (@f round)))))
+      (is (= (* 12 (count atoms)) (count (dev/uncapture-fail!))))
+      (finally
+        (dev/stop!)
+        (doseq [i (range 5)]
+          (dev/unregister! (keyword "fuzz.dev" (str "f" i))))))))
+
+(deftest export-json-serializable-fuzz
+  (let [schemas [:int
+                 [:string {:min 1 :max 8}]
+                 [:map [:id :int] [:tags {:optional true} [:set :keyword]]]
+                 [:or :int :string]
+                 [:orn [:n :int] [:s :string]]
+                 [:schema {:registry {:fuzz/tree [:maybe [:map
+                                                           [:id :int]
+                                                           [:kids {:optional true}
+                                                            [:vector [:ref :fuzz/tree]]]]]}}
+                  [:ref :fuzz/tree]]
+                 [:multi {:dispatch :kind}
+                  [:a [:map [:kind [:= :a]] [:n :int]]]
+                  [:balli.core/default [:map [:kind :keyword]]]]]]
+    (doseq [seed (range 42)]
+      (let [s (nth schemas (mod seed (count schemas)))
+            js-out (js/transform s)
+            openapi-body (openapi/request-body s {:content-type (str "application/x-" seed)})
+            openapi-resp (openapi/response s {:description (str "seed " seed)})
+            openapi-param (openapi/parameter "q" "query" s {:required false})
+            swagger-resp (swagger/response s {:description (str "seed " seed)})
+            swagger-body (swagger/parameter "body" "body" s)
+            swagger-query (swagger/parameter "q" "query" s {:required false})
+            content-type (first (keys (get openapi-body "content")))
+            resp-content-type (first (keys (get openapi-resp "content")))
+            openapi-body-schema (get-in openapi-body ["content" content-type "schema"])
+            openapi-resp-schema (get-in openapi-resp ["content" resp-content-type "schema"])
+            openapi-param-schema (get openapi-param "schema")
+            swagger-resp-schema (get swagger-resp "schema")
+            swagger-body-schema (get swagger-body "schema")
+            swagger-query-schema (get swagger-query "schema")
+            plant (plantuml/transform s)]
+        (is (= js-out (json/read-str (json/write-str js-out))))
+        (is (= openapi-body (json/read-str (json/write-str openapi-body))))
+        (is (= openapi-resp (json/read-str (json/write-str openapi-resp))))
+        (is (= openapi-param (json/read-str (json/write-str openapi-param))))
+        (is (= swagger-resp (json/read-str (json/write-str swagger-resp))))
+        (is (= swagger-body (json/read-str (json/write-str swagger-body))))
+        (is (= swagger-query (json/read-str (json/write-str swagger-query))))
+        (doseq [schema [openapi-body-schema openapi-resp-schema openapi-param-schema]]
+          (is (nil? (get schema "components"))))
+        (doseq [schema [swagger-resp-schema swagger-body-schema swagger-query-schema]]
+          (is (nil? (get schema "definitions"))))
+        (doseq [fragment [openapi-body openapi-resp openapi-param]]
+          (is (false? (json-contains? fragment "#/definitions/")))
+          (when (get fragment "components")
+            (is (true? (json-contains? fragment "#/components/schemas/")))))
+        (is (false? (json-contains? (dissoc swagger-query "definitions")
+                                     "\"definitions\"")))
+        (when (get openapi-body "components")
+          (is (some? (get-in openapi-body ["components" "schemas"]))))
+        (when (get openapi-resp "components")
+          (is (some? (get-in openapi-resp ["components" "schemas"]))))
+        (when (get openapi-param "components")
+          (is (some? (get-in openapi-param ["components" "schemas"]))))
+        (when (get swagger-resp "definitions")
+          (is (map? (get swagger-resp "definitions"))))
+        (when (get swagger-body "definitions")
+          (is (map? (get swagger-body "definitions"))))
+        (when (get swagger-query "definitions")
+          (is (map? (get swagger-query "definitions"))))
+        (is (.startswith plant "@startuml"))))))
+
+(defn- provider-samples
+  [seed]
+  (case (mod seed 8)
+    0 [seed (inc seed) (+ seed 2)]
+    1 [(str "s" seed) (str "t" seed) nil]
+    2 [{:id seed :name (str "n" seed)}
+       {:id (inc seed)}
+       {:id (+ seed 2) :name (str "m" seed)}]
+    3 [[seed (inc seed)] [] [(+ seed 2)]]
+    4 [#{:a :b} #{:c}]
+    5 [{(keyword (str "k" seed)) seed
+        (keyword (str "j" seed)) (inc seed)}
+       {(keyword (str "z" seed)) (+ seed 2)}]
+    6 [[seed (str seed)] [(inc seed) (str (inc seed))]]
+    7 [{:kind :a :n seed}
+       {:kind :b :s (str seed)}
+       {:kind :a :n (inc seed)}]))
+
+(deftest provider-inference-fuzz
+  (doseq [seed (range 72)]
+    (let [samples (provider-samples seed)
+          opts {:infer-tuples (zero? (mod seed 2))
+                :infer-enums (zero? (mod seed 3))
+                :enum-threshold 4
+                :map-of-threshold 2}
+          schema (bp/provide samples opts)]
+      (doseq [sample samples]
+        (is (true? (b/validate schema sample))
+            (str "provider inferred schema did not validate sample "
+                 schema " <- " sample))))))

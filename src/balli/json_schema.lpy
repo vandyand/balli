@@ -32,6 +32,7 @@
   via a small clj->py conversion (or `basilisp.json/write-str`, which accepts
   it directly)."
   (:require [balli.core :as b]
+            [balli.extension :as ext]
             [balli.normalize :as norm]
             [balli.registry :as reg]
             [balli.time :as bt]))
@@ -232,6 +233,11 @@
         children (:children node)
         child #(-transform % registry ctx)]
     (case (:type node)
+      :balli/ext
+      (if-some [f (:json-schema (ext/type-spec (:ext-type node)))]
+        (f node (mapv child children))
+        {})
+
       ;; :=>/:function: JSON Schema has no function values -- lossy {} like :fn
       (:any :fn :=> :function) {}
       :balli/pred (get pred-json-schemas (:pred-key node) {})

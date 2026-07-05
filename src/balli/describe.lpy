@@ -1,0 +1,52 @@
+(ns balli.describe
+  "Small English schema descriptions."
+  (:require [balli.core :as b]
+            [balli.extension :as ext]
+            [balli.normalize :as norm]
+            [balli.registry :as reg]
+            [basilisp.string :as str]))
+
+(declare describe-node)
+
+(defn- entry-desc
+  [{:keys [key schema]}]
+  (str key " is " (describe-node schema)))
+
+(defn- describe-node
+  [node]
+  (let [children (:children node)]
+    (case (:type node)
+      :balli/ext
+      (if-some [f (:describe (ext/type-spec (:ext-type node)))]
+        (f node (mapv describe-node children))
+        (str (:ext-type node)))
+
+      :map (str "a map with " (str/join ", " (map entry-desc children)))
+      :map-of (str "a map from " (describe-node (first children))
+                   " to " (describe-node (second children)))
+      :vector (str "a vector of " (describe-node (first children)))
+      :set (str "a set of " (describe-node (first children)))
+      :tuple (str "a tuple of " (str/join ", " (map describe-node children)))
+      :maybe (str "nil or " (describe-node (first children)))
+      :and (str/join " and " (map describe-node children))
+      :andn (str/join " and " (map #(describe-node (:schema %)) children))
+      :or (str/join " or " (map describe-node children))
+      :orn (str/join " or " (map #(describe-node (:schema %)) children))
+      :enum (str "one of " (str/join ", " children))
+      := (str "equal to " (first children))
+      :ref (str "reference " (:ref node))
+      :schema (describe-node (first children))
+      (:cat :catn :alt :altn :? :* :+ :repeat) "a sequence"
+      (:=> :function) "a function"
+      (str (:type node)))))
+
+(defn describe
+  ([s] (describe s {}))
+  ([s opts]
+   (let [registry (if (b/schema? s)
+                    (:registry s)
+                    (or (:registry opts) (reg/default-registry)))
+         ast (if (b/schema? s)
+               (:ast s)
+               (norm/normalize s {:registry registry}))]
+     (describe-node ast))))

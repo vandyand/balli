@@ -1,0 +1,104 @@
+(ns balli.serial
+  "Safe schema serialization helpers.
+
+  Balli does not eval serialized code. Register functions by keyword, then
+  `serialize` replaces function values with [:balli.fn/ref kw]. `deserialize`
+  rehydrates those references from the same registry."
+  (:import re)
+  (:require [basilisp.edn :as edn]
+            [balli.normalize :as norm]))
+
+(defonce ^:private functions
+  (atom {}))
+
+(defn register-function!
+  "Register function `f` under keyword `k`. Returns k."
+  [k f]
+  (when-not (keyword? k)
+    (throw (ex-info "Function name must be a keyword"
+                    {:type :balli.serial/invalid-function-name :key k})))
+  (when-not (norm/fn-like? f)
+    (throw (ex-info "Registered value must be function-like"
+                    {:type :balli.serial/invalid-function :key k :value f})))
+  (swap! functions assoc k f)
+  k)
+
+(defn unregister-function!
+  [k]
+  (swap! functions dissoc k)
+  nil)
+
+(defn clear-functions!
+  []
+  (reset! functions {})
+  nil)
+
+(defn- function-name
+  [f]
+  (some (fn [[k v]] (when (identical? f v) k)) @functions))
+
+(defn- regex-pattern?
+  [x]
+  (instance? re/Pattern x))
+
+(defn- marker-vector?
+  [x]
+  (and (vector? x)
+       (= 2 (count x))
+       (contains? #{:balli.fn/ref :balli.re/pattern :balli.literal/vector}
+                  (first x))))
+
+(declare serialize deserialize)
+
+(defn serialize
+  "Return EDN-friendly schema data. Registered functions become
+  [:balli.fn/ref kw], regex patterns become [:balli.re/pattern source]."
+  [x]
+  (cond
+    (norm/fn-like? x)
+    (if-some [k (function-name x)]
+      [:balli.fn/ref k]
+      (throw (ex-info "Cannot serialize unregistered function"
+                      {:type :balli.serial/unregistered-function :value x})))
+
+    (regex-pattern? x)
+    [:balli.re/pattern (.-pattern x)]
+
+    (marker-vector? x)
+    [:balli.literal/vector (mapv serialize x)]
+
+    (map? x) (into {} (map (fn [[k v]] [(serialize k) (serialize v)])) x)
+    (vector? x) (mapv serialize x)
+    (set? x) (set (map serialize x))
+    (seq? x) (mapv serialize x)
+    :else x))
+
+(defn deserialize
+  "Resolve data emitted by `serialize` back into a usable Balli schema."
+  [x]
+  (cond
+    (and (vector? x) (= 2 (count x)) (= :balli.literal/vector (first x)))
+    (mapv deserialize (second x))
+
+    (and (vector? x) (= 2 (count x)) (= :balli.fn/ref (first x)))
+    (if-some [f (get @functions (second x))]
+      f
+      (throw (ex-info "Unknown serialized function reference"
+                      {:type :balli.serial/unknown-function :key (second x)})))
+
+    (and (vector? x) (= 2 (count x)) (= :balli.re/pattern (first x)))
+    (re/compile (second x))
+
+    (map? x) (into {} (map (fn [[k v]] [(deserialize k) (deserialize v)])) x)
+    (vector? x) (mapv deserialize x)
+    (set? x) (set (map deserialize x))
+    (seq? x) (mapv deserialize x)
+    :else x))
+
+(defn write-string
+  [schema]
+  (edn/write-string (serialize schema)))
+
+(defn read-string
+  [s]
+  (deserialize (edn/read-string s)))

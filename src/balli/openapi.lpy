@@ -35,6 +35,11 @@
        (assoc out "components" {"schemas" (rewrite-refs defs)})
        out))))
 
+(defn- split-schema
+  [s opts]
+  (let [sch (schema s opts)]
+    [(dissoc sch "components") (get sch "components")]))
+
 (defn openapi
   "Build a minimal OpenAPI 3.1 document.
   opts:
@@ -54,3 +59,34 @@
                                        {"schemas" {"Root" root}}
                                        components)}
        (:servers opts) (assoc "servers" (:servers opts))))))
+
+(defn request-body
+  "OpenAPI requestBody object for schema `s`."
+  ([s] (request-body s {}))
+  ([s opts]
+   (let [[sch components] (split-schema s opts)]
+     (cond-> {"required" (not (false? (:required opts)))
+              "content" {(or (:content-type opts) "application/json")
+                         {"schema" sch}}}
+       components (assoc "components" components)))))
+
+(defn response
+  "OpenAPI response object for schema `s`."
+  ([s] (response s {}))
+  ([s opts]
+   (let [[sch components] (split-schema s opts)]
+     (cond-> {"description" (or (:description opts) "OK")
+              "content" {(or (:content-type opts) "application/json")
+                         {"schema" sch}}}
+       components (assoc "components" components)))))
+
+(defn parameter
+  "OpenAPI parameter object for a scalar schema."
+  [name in s & [opts]]
+  (let [opts (or opts {})
+        [sch components] (split-schema s opts)]
+    (cond-> {"name" name
+             "in" in
+             "required" (not (false? (:required opts)))
+             "schema" sch}
+      components (assoc "components" components))))

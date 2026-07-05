@@ -21,7 +21,8 @@
   Entry point: (normalize form opts) where opts may carry {:registry r}.
   Unknown/invalid forms throw ex-info with {:type :balli.core/invalid-schema}."
   (:import re)
-  (:require [balli.registry :as reg]
+  (:require [balli.extension :as ext]
+            [balli.registry :as reg]
             [balli.time :as bt]))
 
 (defn- invalid!
@@ -200,15 +201,20 @@
   A registered predicate (core fn or quoted symbol) in schema position — bare
   or as a vector HEAD — dispatches to :balli/pred; a pred in child position
   (e.g. [:fn int?]) is untouched, since dispatch only inspects the head."
-  (fn [form _opts]
-    (cond
+  (fn [form opts]
+    (let [registry (or (:registry opts) (reg/default-registry))]
+      (cond
+      (and (keyword? form)
+           (ext/custom-type? form)
+           (nil? (reg/resolve-ref registry form))) :balli/ext
       (keyword? form) form
       (vector? form) (let [h (first form)]
-                       (if (and (not (keyword? h)) (some? (pred-form-key h)))
-                         :balli/pred
-                         h))
+                       (cond
+                         (and (not (keyword? h)) (some? (pred-form-key h))) :balli/pred
+                         (and (keyword? h) (ext/custom-type? h)) :balli/ext
+                         :else h))
       (some? (pred-form-key form)) :balli/pred
-      :else ::unknown)))
+      :else ::unknown))))
 
 ;; ---------------------------------------------------------------------------
 ;; Scalars
@@ -435,6 +441,21 @@
         :else
         (invalid! (str (first form) " accepts only an optional properties map") form)))
     (pred-node (pred-form-key form) {} form)))
+
+(defmethod normalize* :balli/ext [form opts]
+  (if (keyword? form)
+    {:type :balli/ext
+     :ext-type form
+     :properties {}
+     :children []
+     :form form}
+    (let [t (first form)
+          [props elems] (split-props (rest form))]
+      {:type :balli/ext
+       :ext-type t
+       :properties props
+       :children (mapv #(normalize % opts) elems)
+       :form form})))
 
 ;; ---------------------------------------------------------------------------
 ;; Comparator schemas: :> :>= :< :<= :not=
@@ -701,6 +722,7 @@
         (contains? leading-props-types h) (second form)
         (> (count form) 2) (second form)
         (contains? scalar-types h) (second form)
+        (and (keyword? h) (ext/custom-type? h)) (second form)
         (and (not (keyword? h)) (some? (pred-form-key h))) (second form)
         :else nil))))
 
