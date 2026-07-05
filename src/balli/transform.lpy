@@ -308,7 +308,7 @@
              (case (:type node)
                :vector (fn [x] (into [] (map t) x))
                :set (fn [x] (into #{} (map t) x))
-               :sequential (fn [x] (mapv t x)))))))
+               (:sequential :seqable :every) (fn [x] (mapv t x)))))))
 
 (defn- transform-tuple
   [node registry chain method opts cache]
@@ -399,7 +399,7 @@
     :multi (transform-multi node registry chain method opts cache)
     :map (transform-map node registry chain method opts cache)
     :map-of (transform-map-of node registry chain method opts cache)
-    (:vector :sequential :set) (transform-coll node registry chain method opts cache)
+    (:vector :sequential :seqable :every :set) (transform-coll node registry chain method opts cache)
     :tuple (transform-tuple node registry chain method opts cache)
     :ref (transform-ref node registry chain method opts cache)))
 
@@ -609,7 +609,9 @@
            ;; malli. The json transformer needs the explicit key-decoding
            ;; compile hook below because json decoders lack string->number.
            :map-of (-transform-map-keys -keyword->string)
-           :vector -sequential->vector})))
+           :vector -sequential->vector
+           :seqable -sequential->vector
+           :every -sequential->vector})))
 
 (defn- base-json-encoders []
   {:keyword -keyword->string
@@ -835,11 +837,14 @@
        :encoders {:map add-defaults}}))))
 
 (defn collection-transformer
-  "Coerce between collection kinds: :vector/:tuple from sequential-or-set,
-  :set from sequential, :sequential from vector/set. Both decode and encode."
+  "Coerce between collection kinds: :vector/:tuple/:seqable/:every from
+  sequential-or-set, :set from sequential, :sequential from vector/set. Both
+  decode and encode."
   []
   (let [coders {:vector -sequential-or-set->vector
                 :sequential -sequential-or-set->seq
+                :seqable -sequential-or-set->vector
+                :every -sequential-or-set->vector
                 :set -sequential->set
                 :tuple -sequential->vector}]
     (transformer

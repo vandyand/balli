@@ -1,0 +1,26 @@
+(ns balli.pretty
+  "Pretty development-time error rendering."
+  (:require [balli.core :as b]
+            [balli.error :as be]))
+
+(defn explain-str
+  "Return a compact human-readable string for an explain map."
+  [explain-map]
+  (if-not explain-map
+    "valid"
+    (let [human (be/humanize explain-map)]
+      (str "invalid " (:schema explain-map) " at " human))))
+
+(defn validate-str
+  "Validate `value` against `schema` and return `valid` or a pretty error."
+  ([schema value] (validate-str schema value {}))
+  ([schema value opts]
+   (explain-str (b/explain schema value opts))))
+
+(defn throw!
+  "Throw ex-info with a pretty message when validation fails."
+  ([schema value] (throw! schema value {}))
+  ([schema value opts]
+   (if-let [ex (b/explain schema value opts)]
+     (throw (ex-info (explain-str ex) (assoc ex :type :balli.pretty/invalid)))
+     value)))

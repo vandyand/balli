@@ -77,6 +77,8 @@
    :vector "should be a vector"
    :set "should be a set"
    :sequential "should be sequential"
+   :seqable "should be seqable"
+   :every "should be seqable"
    :tuple "should be a tuple"
    :re "should be a string"
    :nil "should be nil"
@@ -84,7 +86,7 @@
    :function "should be a function"})
 
 (def ^:private numeric-types #{:int :float :double :number})
-(def ^:private counted-types #{:vector :sequential :set :map-of})
+(def ^:private counted-types #{:vector :sequential :seqable :every :set :map-of})
 (def ^:private time-types (set (keys bt/types)))
 
 (def ^:private comparator-message-prefixes

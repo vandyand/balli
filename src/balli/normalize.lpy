@@ -31,6 +31,115 @@
 
 (declare normalize)
 
+(def ^:private entry-types
+  #{:map :multi :orn :andn :catn :altn})
+
+(def ^:private literal-child-types
+  #{:enum := :fn :re :balli/pred :> :>= :< :<= :not=})
+
+(defn ast-syntax?
+  "True when `x` is Malli-style map syntax / schema AST input."
+  [x]
+  (and (map? x) (contains? x :type)))
+
+(declare from-ast-form)
+
+(defn- ast-child-form
+  [x]
+  (if (ast-syntax? x) (from-ast-form x) x))
+
+(defn- ast-entry-form
+  [entry]
+  (when-not (and (map? entry) (contains? entry :key))
+    (invalid! "AST entry children must carry :key" entry))
+  (let [schema (or (:schema entry) (:value entry))
+        props (or (:properties entry) {})]
+    (when-not (contains? entry :schema)
+      (when-not (contains? entry :value)
+        (invalid! "AST entry children must carry :schema or :value" entry)))
+    (if (seq props)
+      [(:key entry) props (ast-child-form schema)]
+      [(:key entry) (ast-child-form schema)])))
+
+(defn from-ast-form
+  "Convert Malli-style map syntax into Balli vector syntax. This accepts the
+  common AST shape {:type t :properties p :children [...]} plus entry maps
+  {:key k :schema s}. It also accepts :=> :input/:output/:guard fields."
+  [ast]
+  (if-not (ast-syntax? ast)
+    ast
+    (let [t (:type ast)
+          props (or (:properties ast) {})
+          raw-children (vec (:children ast))
+          children (cond
+                     (= :=> t)
+                     (cond-> [(:input ast) (:output ast)]
+                       (contains? ast :guard) (conj (:guard ast)))
+
+                     (contains? entry-types t)
+                     (mapv ast-entry-form raw-children)
+
+                     (= :ref t)
+                     [(or (:ref ast) (first raw-children))]
+
+                     (contains? literal-child-types t)
+                     raw-children
+
+                     :else
+                     (mapv ast-child-form raw-children))
+          head (if (seq props) [t props] [t])]
+      (cond
+        (= :-> t)
+        (let [args (mapv ast-child-form raw-children)]
+          (when (< (count args) 2)
+            (invalid! ":-> expects at least input and output schemas" ast))
+          [:=> (into [:cat] (butlast args)) (last args)])
+
+        (and (= :=> t) (or (nil? (:input ast)) (nil? (:output ast))))
+        (invalid! ":=> AST syntax requires :input and :output" ast)
+
+        (contains? literal-child-types t)
+        (into head children)
+
+        :else
+        (into head (mapv ast-child-form children))))))
+
+(defn- node->ast
+  [node]
+  (let [base {:type (:type node)}
+        base (cond-> base
+               (seq (:properties node)) (assoc :properties (:properties node)))]
+    (case (:type node)
+      (:map :multi :orn :andn :catn :altn)
+      (let [entry-ast (fn [{:keys [key properties schema]}]
+                        (cond-> {:key key :schema (node->ast schema)}
+                          (seq properties) (assoc :properties properties)))
+            children (mapv entry-ast (:children node))
+            children (if-some [de (:default-entry node)]
+                       (conj children (entry-ast de))
+                       children)]
+        (cond-> base
+          (seq children) (assoc :children children)))
+
+      :ref (assoc base :ref (:ref node))
+
+      :=> (let [[input output guard] (:children node)]
+            (cond-> (assoc base :input (node->ast input)
+                          :output (node->ast output))
+              guard (assoc :guard (node->ast guard))))
+
+      (:enum := :fn :re :balli/pred :> :>= :< :<= :not=)
+      (cond-> base
+        (seq (:children node)) (assoc :children (:children node)))
+
+      (cond-> base
+        (seq (:children node)) (assoc :children (mapv node->ast (:children node)))))))
+
+(defn to-ast
+  "Return a Malli-style map syntax view of normalized AST node `node`."
+  [node]
+  (node->ast node))
+
 (defn fn-like?
   "True when `x` is function-like: a Basilisp fn, or a Python callable that
   is not a Basilisp collection, keyword, or symbol. Bare `python/callable`
@@ -137,7 +246,7 @@
 (def ^:private bounded-types
   "Types whose :min/:max properties participate in numeric comparisons at
   validate time (string length, numeric value, collection count)."
-  #{:string :int :float :double :number :vector :sequential :set :map-of})
+  #{:string :int :float :double :number :vector :sequential :seqable :every :set :map-of})
 
 (def ^:private time-types
   (set (keys bt/types)))
@@ -294,6 +403,15 @@
 (defmethod normalize* :vector [form opts] (normalize-single-child form opts))
 (defmethod normalize* :sequential [form opts] (normalize-single-child form opts))
 (defmethod normalize* :set [form opts] (normalize-single-child form opts))
+(defmethod normalize* :seqable [form opts] (normalize-single-child form opts))
+(defmethod normalize* :every [form opts]
+  (let [node (normalize-single-child form opts)
+        limit (or (:coll-check-limit (:properties node))
+                  (:balli.core/coll-check-limit (:properties node)))]
+    (when (and (some? limit)
+               (not (and (int? limit) (<= 0 limit))))
+      (invalid! ":every :coll-check-limit must be a non-negative integer" form))
+    node))
 
 ;; ---------------------------------------------------------------------------
 ;; N-child schemas: :and :or :tuple
@@ -629,6 +747,14 @@
                         {:type :balli.core/invalid-input-schema :form form})))
       (node :=> props children form))))
 
+(defmethod normalize* :-> [form opts]
+  (when (keyword? form)
+    (invalid! ":-> requires at least input and output schemas" form))
+  (let [[props elems] (split-props-leading (rest form))]
+    (when (< (count elems) 2)
+      (invalid! ":-> expects at least input and output schemas" form))
+    (normalize (into [:=> props (into [:cat] (butlast elems))] [(last elems)]) opts)))
+
 (defmethod normalize* :function [form opts]
   (when (keyword? form)
     (invalid! ":function requires at least one :=> child" form))
@@ -746,8 +872,9 @@
   node gains :local-registry (see the section comment above). Unknown or
   invalid forms throw ex-info with {:type :balli.core/invalid-schema}."
   [form opts]
-  (if-let [local (local-registry-prop form)]
-    (let [effective (or (:registry opts) (reg/default-registry))
-          opts* (assoc opts :registry (update effective :schemas merge local))]
-      (assoc (normalize* form opts*) :local-registry local))
-    (normalize* form opts)))
+  (let [form (if (ast-syntax? form) (from-ast-form form) form)]
+    (if-let [local (local-registry-prop form)]
+      (let [effective (or (:registry opts) (reg/default-registry))
+            opts* (assoc opts :registry (update effective :schemas merge local))]
+        (assoc (normalize* form opts*) :local-registry local))
+      (normalize* form opts))))

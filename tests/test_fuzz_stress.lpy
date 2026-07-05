@@ -6,15 +6,21 @@
   (:import datetime random)
   (:require [basilisp.json :as json]
             [basilisp.test :refer [deftest is testing]]
+            [balli.clj-kondo :as kondo]
             [balli.core :as b]
             [balli.dev :as dev]
+            [balli.destructure :as destructure]
+            [balli.edn :as edn]
             [balli.error :as be]
             [balli.generator :as bg]
             [balli.json-schema :as js]
+            [balli.lite :as lite]
             [balli.openapi :as openapi]
             [balli.plantuml :as plantuml]
+            [balli.pretty :as pretty]
             [balli.provider :as bp]
             [balli.registry :as reg]
+            [balli.sci :as sci]
             [balli.swagger :as swagger]
             [balli.transform :as bt]))
 
@@ -101,7 +107,9 @@
     (case (.randint rnd 0 13)
       0 (choice rnd leaf-schemas)
       1 [:maybe (gen-schema rnd (dec depth))]
-      2 [:vector (gen-schema rnd (dec depth))]
+      2 (choice rnd [[:vector (gen-schema rnd (dec depth))]
+                     [:seqable (gen-schema rnd (dec depth))]
+                     [:every {:coll-check-limit 5} (gen-schema rnd (dec depth))]])
       3 [:set {:max 1} (gen-schema rnd (dec depth))]
       4 [:tuple (gen-schema rnd (dec depth)) (gen-schema rnd (dec depth))]
       5 [:or (gen-schema rnd (dec depth)) (gen-schema rnd (dec depth))]
@@ -116,6 +124,10 @@
       11 (gen-local-registry-schema rnd (dec depth))
       12 [:schema (gen-schema rnd (dec depth))]
       13 [:map [:created :time/instant] [:ttl :time/duration]])))
+
+(defn- ast-syntax
+  [s]
+  (b/ast (b/schema s)))
 
 (defn- stress-one!
   [s seed]
@@ -406,3 +418,50 @@
         (is (true? (b/validate schema sample))
             (str "provider inferred schema did not validate sample "
                  schema " <- " sample))))))
+
+(deftest malli-parity-compatibility-fuzz
+  (doseq [seed (range 48)]
+    (let [schema (case (mod seed 7)
+                   0 [:seqable {:min 0 :max 4} :int]
+                   1 [:every {:coll-check-limit 3 :min 0 :max 6} :int]
+                   2 [:-> :int :string :boolean]
+                   3 [:map [:id :int] [:name {:optional true} :string]]
+                   4 [:orn [:n :int] [:s :string]]
+                   5 [:map [:items [:vector :int]]]
+                   6 (lite/form {:id :int :tags [:keyword]}))
+          ast (ast-syntax schema)]
+      (is (= ast (b/ast (b/from-ast ast))))
+      (is (= ast (b/ast (b/schema ast))))
+      (is (= schema (edn/read-string (edn/write-string schema))))
+      (is (contains? (:namespaces (sci/sci-context)) 'balli.core))
+      (cond
+        (= 2 (mod seed 7))
+        (do
+          (is (= :boolean (:output (b/function-info schema))))
+          (is (some? (kondo/function-config schema))))
+
+        (= 4 (mod seed 7))
+        (let [v (if (even? seed) seed (str seed))]
+          (is (true? (b/validate schema v)))
+          (is (map? (destructure/destructure schema v))))
+
+        :else
+        (let [g (bg/generate schema {:seed seed :size 8})]
+          (is (true? (b/validate schema g)))
+          (is (= g (b/parse schema g)))
+          (is (not= "valid" (pretty/validate-str schema :definitely-invalid))))))))
+
+(deftest var-registry-and-generator-object-stress
+  (doseq [seed (range 36)]
+    (let [schema-ref (atom (if (even? seed) :int :string))
+          r (reg/var-registry {:fuzz/live schema-ref})
+          good (if (even? seed) seed (str seed))
+          bad (if (even? seed) (str seed) seed)]
+      (is (true? (b/validate :fuzz/live good {:registry r})))
+      (is (false? (b/validate :fuzz/live bad {:registry r})))
+      (reset! schema-ref (if (even? seed) :string :int))
+      (is (true? (b/validate :fuzz/live bad {:registry r})))
+      (let [g (bg/generator :fuzz/live {:registry r})]
+        (is (true? (bg/generator? g)))
+        (is (true? (b/validate :fuzz/live (bg/generate* g {:seed seed})
+                                {:registry r})))))))

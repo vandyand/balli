@@ -26,7 +26,8 @@
 
   Balli also supports lightweight dynamic and lazy registry maps. A dynamic
   registry derefs a source atom/fn on lookup; a lazy registry asks a provider
-  fn on cache miss and memoizes returned schema forms.")
+  fn on cache miss and memoizes returned schema forms. A var registry stores
+  derefable schema references and resolves their current value on lookup.")
 
 (def builtin-types
   "The set of schema type keywords balli supports natively. Predicate schemas
@@ -37,11 +38,11 @@
     :time/instant :time/offset-date-time :time/zoned-date-time
     :time/local-date-time :time/local-date :time/local-time :time/offset-time
     :time/duration :time/period :time/zone-id :time/zone-offset
-    :map :map-of :vector :sequential :set :tuple :enum := :maybe :and :andn :or :orn
+    :map :map-of :vector :sequential :seqable :every :set :tuple :enum := :maybe :and :andn :or :orn
     :not :fn :multi :re :ref
     :> :>= :< :<= :not=
     :cat :catn :alt :altn :? :* :+ :repeat :schema
-    :=> :function})
+    :=> :-> :function})
 
 (defn- check-registry!
   "Throw :balli.core/invalid-registry unless `r` has the registry shape
@@ -139,6 +140,21 @@
             :balli/lazy-provider provider
             :balli/lazy-cache (atom {})))))
 
+(defn var-registry
+  "Registry backed by a map of keyword -> derefable schema references. Values
+  are dereferenced on every lookup, matching Malli's var-registry use case
+  without requiring Clojure Vars in Basilisp. Non-derefable values are used as
+  schema forms directly."
+  ([schema-vars] (var-registry (registry) schema-vars))
+  ([base schema-vars]
+   (when-not (and (map? schema-vars) (every? keyword? (keys schema-vars)))
+     (throw (ex-info "var-registry takes a {keyword schema-ref ...} map"
+                     {:type :balli.core/invalid-registry :value schema-vars})))
+   (let [base (if (and (map? base) (contains? base :schemas))
+                base
+                (registry base))]
+     (assoc base :balli/var-schemas schema-vars))))
+
 (defn- source-registry
   [source]
   (let [r (cond
@@ -154,6 +170,9 @@
   [reg k]
   (or (when (contains? (:schemas reg) k)
         (get (:schemas reg) k))
+      (when (contains? (:balli/var-schemas reg) k)
+        (let [v (get (:balli/var-schemas reg) k)]
+          (try @v (catch python/Exception _ v))))
       (when-some [source (:balli/dynamic-source reg)]
         (resolve-ref (source-registry source) k))
       (when-some [provider (:balli/lazy-provider reg)]
