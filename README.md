@@ -11,6 +11,7 @@ Schemas are plain data in Malli's vector syntax, plus Malli-style map syntax / A
 
 ## Project resources
 
+- PyPI package: <https://pypi.org/project/balli/>
 - Hosted docs: <https://vandyand.github.io/balli/>
 - API reference: <https://vandyand.github.io/balli/api/>
 - Compatibility matrix: [docs/malli-compatibility.md](docs/malli-compatibility.md)
@@ -21,7 +22,7 @@ Schemas are plain data in Malli's vector syntax, plus Malli-style map syntax / A
 
 ## Install
 
-From PyPI, after a release has been published:
+From PyPI:
 
 ```bash
 python -m pip install balli
