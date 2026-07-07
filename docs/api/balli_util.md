@@ -109,3 +109,21 @@ Sub-schema form of `s` at key/index `k`: :map/:multi/:orn/:catn/:altn entries by
 Kind: `defn`
 
 `get` repeatedly along `ks`; nil as soon as any step is absent. Empty `ks` returns the form of `s` itself.
+
+## `path-map`
+
+Kind: `defn`
+
+Return {path schema-form} for every schema node in `s` using Balli walk path conventions. Refs are left as ref nodes.
+
+## `update-at`
+
+Kind: `defn`
+
+Update the schema node at `path` with `(f form & args)`. Throws when the path is not present. This is a form-level counterpart to Malli utility workflows that rewrite nested schemas by path.
+
+## `diff`
+
+Kind: `defn`
+
+Compare two schemas by path and return data about added, removed, and changed schema nodes. Paths are the same vectors used by `walk`/`explain`.

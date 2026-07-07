@@ -110,6 +110,24 @@ Kind: `defn`
 
 One-shot `coercer`: decode `value` with `t`, return it when it validates against `s`, else throw ex-info {:type :balli.core/coercion ...}.
 
+## `coercion-report`
+
+Kind: `defn`
+
+Return data about decoding/coercion without throwing: {:schema form :value original :decoded decoded :valid? bool :explain maybe}. This is useful at API boundaries and mirrors Malli-style coercion workflows where callers often need both the coerced value and explain data.
+
+## `coerce?`
+
+Kind: `defn`
+
+True when `value` decodes with transformer `t` into a value valid for `s`.
+
+## `roundtrip?`
+
+Kind: `defn`
+
+Decode then encode `value` with transformer `t` and compare to the original value. When `:validate?` is true (default), the decoded value must also validate against `s`.
+
 ## `tag`
 
 Kind: `defn`
@@ -193,3 +211,15 @@ Arity/shape info for a :=> schema `s` (raw form or schema object): {:min n :max 
 Kind: `defn`
 
 Wrap fn `f` with validation per `props`: {:schema s ;; :=> or :function (raw form or object) :scope #{:input :output} ;; default both :report (fn [type data] ..)} ;; default: throw ex-info Per call: arity check against the input seqex bounds (:balli.core/invalid-arity), argument-vector validation against the input seqex (:balli.core/invalid-input, with :explain data), the call, return validation (:balli.core/invalid-output), and -- when the :=> has a guard child -- [args ret] guard validation (:balli.core/invalid-guard). A :function schema dispatches on (count args) over its :=> children's regex-min-max ranges (bounded arities first, the varargs child as fallback); an argument count matching no child reports :balli.core/invalid-arity and then calls `f` unwrapped. `props` may also carry {:registry r} for raw-form schemas.
+
+## `wrap-function`
+
+Kind: `defn`
+
+Ergonomic alias around `instrument`: `(wrap-function schema f)` returns a callable guarded by a :=> or :function schema. `opts` is merged into the instrument props, so callers can pass :scope, :report, or :registry.
+
+## `function-contract`
+
+Kind: `defn`
+
+Return static function-contract metadata for a :=> or :function schema. Root :=> returns {:type :=> :arities [...]}; root :function returns one arity map per child. Non-function schemas return nil.

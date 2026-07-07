@@ -86,6 +86,18 @@ Kind: `defn`
 
 Greedily shrink `value`, returning every accepted step. With `:predicate`, only candidates preserving the predicate are accepted.
 
+## `check`
+
+Kind: `defn`
+
+Generate `:iterations` values from schema/generator `g` and validate them against `schema` (defaults to `g` when `g` is a raw schema form). Returns a report map with failing examples, never throws for ordinary invalid values. Useful as a small Balli-native property check in CI and docs examples.
+
+## `check-roundtrip`
+
+Kind: `defn`
+
+Generate values for `schema`, encode then decode them with transformer `t`, and report any values that do not roundtrip or no longer validate.
+
 ## `function-checker`
 
 Kind: `defn`

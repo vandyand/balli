@@ -61,6 +61,11 @@
                             (bt/transformer (bt/string-transformer)
                                             (bt/collection-transformer)))]
       (is (= {:age 42 :tags #{:a}} decoded))
+      (is (true? (:valid? (b/coercion-report schema {:age "42" :tags ["a"]}
+                                             (bt/transformer
+                                              (bt/string-transformer)
+                                              (bt/collection-transformer))))))
+      (is (true? (b/roundtrip? :int "8" (bt/string-transformer))))
       (is (map? (json-schema/transform schema)))))
   (testing "integration transformer presets"
     (let [env-schema [:map {:closed true} [:port :int] [:debug :boolean]]
@@ -95,10 +100,26 @@
                                            (bg/generator (u/dissoc edited :enabled)))
                                   {:seed 5})]
       (is (true? (b/validate provided {:id 1 :name "a"})))
+      (is (true? (:valid? (bp/provide-report [{:id 1} {:id 2}]))))
+      (is (map? (u/diff provided edited)))
+      (is (true? (:valid? (bg/check edited
+                                     (bg/fmap #(assoc % :enabled true)
+                                              (bg/generator (u/dissoc edited :enabled)))
+                                     {:iterations 5 :seed 9}))))
       (is (true? (b/validate edited generated)))))
   (testing "experimental analysis, integrations, and inspection"
     (let [schema [:map [:id :int] [:tags [:vector :keyword]]]]
       (is (pos? (:paths (exp/coverage schema))))
+      (is (= :additive
+             (exp/migration-impact [:map [:id :int]]
+                                   [:map [:id :int] [:name :string]])))
+      (is (map? (exp/dependency-graph {:id :int :user [:map [:id :id]]})))
       (is (= :int (integ/annotation-schema python/int)))
+      (is (= 1 ((integ/coercer :int (bt/string-transformer)) "1")))
       (is (true? (inspect/valid-schema? schema)))
       (is (false? (inspect/valid-schema? [:ref :missing/ref]))))))
+
+(deftest compatibility-function-ergonomics
+  (let [wrapped (b/wrap-function [:=> [:cat :int] :int] inc)]
+    (is (= 2 (wrapped 1))))
+  (is (= :=> (:type (b/function-contract [:=> [:cat :int] :int])))))

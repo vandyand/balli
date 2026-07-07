@@ -20,6 +20,18 @@ Kind: `defn`
 
 Return a Python-callable validator for schema `s`.
 
+## `coercer`
+
+Kind: `defn`
+
+Return a Python-callable coercer for schema `s` and transformer `t`. The callable decodes, validates, and returns the decoded value or raises Balli's coercion ex-info.
+
+## `coercion-report`
+
+Kind: `defn`
+
+Return Balli's non-throwing coercion report at a Python boundary.
+
 ## `assert-valid`
 
 Kind: `defn`

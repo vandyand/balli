@@ -780,6 +780,52 @@
          (recur next (conj trace next))
          trace)))))
 
+(defn check
+  "Generate `:iterations` values from schema/generator `g` and validate them
+  against `schema` (defaults to `g` when `g` is a raw schema form). Returns a
+  report map with failing examples, never throws for ordinary invalid values.
+  Useful as a small Balli-native property check in CI and docs examples."
+  ([schema] (check schema schema {}))
+  ([schema g] (check schema g {}))
+  ([schema g opts]
+   (let [iterations (or (:iterations opts) 100)
+         seed (or (:seed opts) 0)
+         valid? (b/validator schema opts)
+         failures (atom [])]
+     (doseq [i (range iterations)]
+       (let [value (generate* g (assoc opts :seed (+ seed i)))]
+         (when-not (valid? value)
+           (swap! failures conj {:iteration i :value value}))))
+     {:schema (b/form schema)
+      :iterations iterations
+      :seed seed
+      :valid? (empty? @failures)
+      :failures @failures})))
+
+(defn check-roundtrip
+  "Generate values for `schema`, encode then decode them with transformer `t`,
+  and report any values that do not roundtrip or no longer validate."
+  ([schema t] (check-roundtrip schema t {}))
+  ([schema t opts]
+   (let [iterations (or (:iterations opts) 100)
+         seed (or (:seed opts) 0)
+         valid? (b/validator schema opts)
+         failures (atom [])]
+     (doseq [i (range iterations)]
+       (let [value (generate schema (assoc opts :seed (+ seed i)))
+             encoded (b/encode schema value t opts)
+             decoded (b/decode schema encoded t opts)]
+         (when-not (and (= value decoded) (valid? decoded))
+           (swap! failures conj {:iteration i
+                                 :value value
+                                 :encoded encoded
+                                 :decoded decoded}))))
+     {:schema (b/form schema)
+      :iterations iterations
+      :seed seed
+      :valid? (empty? @failures)
+      :failures @failures})))
+
 ;; ---------------------------------------------------------------------------
 ;; function-checker (generative :=>/:function validation, Phase 8)
 

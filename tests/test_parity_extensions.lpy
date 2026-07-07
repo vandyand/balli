@@ -7,6 +7,7 @@
             [balli.inspect :as inspect]
             [balli.integrations :as integ]
             [balli.provider :as bp]
+            [balli.transform :as bt]
             [balli.util :as u]))
 
 (deftest provider-requiredness-and-map-of-knobs
@@ -23,7 +24,14 @@
             ["c" {:optional true} :int]]
            (bp/provide [{"a" 1 "b" 2} {"c" 3}]
                        {:map-of-threshold 2
-                        :prefer-map-of false})))))
+                        :prefer-map-of false}))))
+  (testing "provider reports expose validation evidence"
+    (let [report (bp/provide-report [{:id 1} {:id 2}]
+                                    {:closed-maps true})]
+      (is (= 2 (:samples report)))
+      (is (= 1.0 (:confidence report)))
+      (is (true? (:valid? report)))
+      (is (true? (b/validate (:schema report) {:id 1}))))))
 
 (deftest util-entry-surgery
   (is (= [:map [:id :int] [:name :string]]
@@ -37,7 +45,14 @@
          (u/transform-entries
           [:map [:id :int] [:debug :boolean]]
           (fn [entry]
-            (when-not (= :debug (:key entry)) entry))))))
+            (when-not (= :debug (:key entry)) entry)))))
+  (is (= :int (get (u/path-map [:map [:id :int]]) [:id])))
+  (is (= [:map [:id :string]]
+         (u/update-at [:map [:id :int]] [:id] (fn [_] :string))))
+  (let [d (u/diff [:map [:id :int]]
+                  [:map [:id :string] [:name {:optional true} :string]])]
+    (is (= [{:path [:name] :schema :string}] (:added d)))
+    (is (= [{:path [:id] :from :int :to :string}] (:changed d)))))
 
 (deftest generator-combinators-and-shrink-trace
   (is (= 42 (bg/generate* (bg/return 42) {:seed 1})))
@@ -51,7 +66,27 @@
           {:seed 0})))
   (let [trace (bg/shrink-trace [:int {:min 0}] 10)]
     (is (= 10 (first trace)))
-    (is (every? #(b/validate [:int {:min 0}] %) trace))))
+    (is (every? #(b/validate [:int {:min 0}] %) trace)))
+  (is (true? (:valid? (bg/check [:map [:id :int]]
+                                 [:map [:id :int]]
+                                 {:iterations 10 :seed 1}))))
+  (is (true? (:valid? (bg/check-roundtrip [:int {:min 0 :max 10}]
+                                          (bt/string-transformer)
+                                          {:iterations 10 :seed 1})))))
+
+(deftest coercion-and-function-ergonomics
+  (let [schema [:map [:id :int]]
+        t (bt/string-transformer)
+        report (b/coercion-report schema {:id "7"} t)]
+    (is (= {:id 7} (:decoded report)))
+    (is (true? (:valid? report)))
+    (is (true? (b/coerce? schema {:id "7"} t))))
+  (is (true? (b/roundtrip? :int "5" (bt/string-transformer))))
+  (let [wrapped (b/wrap-function [:=> [:cat :int] :int] inc)]
+    (is (= 2 (wrapped 1))))
+  (is (= {:type :=> :arities [{:min 1 :arity 1 :input [:cat :int]
+                               :output :int :max 1}]}
+         (b/function-contract [:=> [:cat :int] :int]))))
 
 (deftest experimental-analysis
   (let [schema [:map [:id :int] [:tags [:vector :keyword]]]
@@ -59,12 +94,25 @@
     (is (= 4 (:paths cov)))
     (is (= 2 (:max-depth cov)))
     (is (= 1 (get (:types cov) :map 0)))
-    (is (some #(= [:tags 0] (:path %)) (exp/leaf-paths schema)))))
+    (is (some #(= [:tags 0] (:path %)) (exp/leaf-paths schema))))
+  (is (= {:id #{}
+          :user #{:id}}
+         (exp/dependency-graph {:id :int
+                                :user [:map [:id :id]]})))
+  (is (= :additive
+         (exp/migration-impact [:map [:id :int]]
+                               [:map [:id :int] [:name :string]])))
+  (is (pos? (:risk-count (exp/risk-report [:or :int :string])))))
 
 (deftest integration-and-inspection-helpers
   (is (= :int (integ/annotation-schema python/int)))
   (is (= [:vector :any] (integ/annotation-schema python/list)))
   (is (true? ((integ/validator [:map [:id :int]]) {:id 1})))
+  (is (= {:id 1} ((integ/coercer [:map [:id :int]]
+                                 (bt/string-transformer))
+                  {:id "1"})))
+  (is (true? (:valid? (integ/coercion-report :int "1"
+                                             (bt/string-transformer)))))
   (is (= {:id 1} (integ/assert-valid [:map [:id :int]] {:id 1})))
   (is (true? (inspect/valid-schema? [:map [:id :int]])))
   (is (false? (inspect/valid-schema? [:ref :missing/ref])))
@@ -86,7 +134,14 @@
           g (bg/fmap #(assoc % :enabled true)
                      (bg/generator (u/dissoc schema* :enabled) {:seed seed}))]
       (is (every? #(b/validate schema %) samples))
+      (is (true? (:valid? (bp/provide-report samples {:closed-maps true}))))
       (is (true? (b/validate schema* value)))
+      (is (true? (:valid? (b/coercion-report [:map [:id :int]]
+                                             {:id (str seed)}
+                                             (bt/string-transformer)))))
+      (is (map? (u/diff schema schema*)))
       (is (empty? (inspect/problems schema*)))
       (is (map? (exp/coverage schema*)))
+      (is (keyword? (exp/migration-impact schema schema*)))
+      (is (true? (:valid? (bg/check schema* g {:iterations 3 :seed seed}))))
       (is (true? (b/validate schema* (bg/generate* g {:seed seed})))))))

@@ -280,3 +280,27 @@
   ([samples] (provide samples {}))
   ([samples opts]
    (synthesize (reduce fold (empty-stats) samples) opts)))
+
+(defn provide-report
+  "Infer a schema and return evidence about how it fits the source samples.
+  The report is data-only:
+  {:schema form :samples n :valid-samples n :valid? bool :confidence f
+   :invalid-samples [...]}
+
+  `:confidence` is the fraction of samples validated by the inferred schema.
+  A correct provider run should normally report 1.0; exposing it makes
+  provider fuzzing and user audits straightforward."
+  ([samples] (provide-report samples {}))
+  ([samples opts]
+   (let [samples (vec samples)
+         schema (provide samples opts)
+         valid? (b/validator schema opts)
+         invalids (into [] (remove valid?) samples)
+         n (count samples)
+         good (- n (count invalids))]
+     {:schema schema
+      :samples n
+      :valid-samples good
+      :valid? (empty? invalids)
+      :confidence (if (zero? n) 1.0 (/ good n))
+      :invalid-samples invalids})))
