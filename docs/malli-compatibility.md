@@ -1,7 +1,8 @@
 # Malli Compatibility Matrix
 
-Balli is Malli-inspired Basilisp code, not a byte-for-byte Clojure port. This
-matrix tracks the major Malli feature families Balli intentionally covers.
+Balli is a Malli clone for Basilisp. This matrix tracks the major Malli feature
+families Balli covers and calls out runtime or ecosystem differences where
+Basilisp/Python diverge from Clojure/JVM.
 
 | Area | Balli status |
 |---|---|

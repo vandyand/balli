@@ -1,8 +1,9 @@
 # Balli
 
-Balli is a Basilisp schema library inspired by Malli. It provides data-driven
-schemas for validation, explanations, transformation, parsing, generation,
-export, function instrumentation, registries, and Basilisp/Python interop.
+Balli is Malli for Basilisp: a data-driven schema library that brings Malli's
+schema syntax and core workflows to Python-hosted Basilisp code. It provides
+validation, explanations, transformation, parsing, generation, export, function
+instrumentation, registries, and Basilisp/Python interop.
 
 Use this documentation when you want the stable user-facing guide. The README
 remains the quick project overview.

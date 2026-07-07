@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "balli"
 version = "0.6.0"
-description = "Data-driven schemas for Basilisp - Malli-inspired."
+description = "Malli for Basilisp: data-driven schemas, validation, transformation, and generation."
 readme = "README.md"
 license = "MIT"
 authors = [

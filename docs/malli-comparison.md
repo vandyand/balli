@@ -1,8 +1,10 @@
 # Balli vs Malli
 
-Balli is a Basilisp schema library inspired by Malli. It aims to make Malli's
-data-driven style useful in Python-hosted Basilisp code, not to be a byte-for-
-byte port of Malli's Clojure implementation.
+Balli is Malli for Basilisp: a data-driven schema library that ports Malli's
+schema syntax and core workflows into Python-hosted Basilisp code. It is not a
+byte-for-byte copy of Malli's Clojure implementation; the differences below are
+the places where Basilisp/Python runtime constraints or ecosystem maturity
+change the shape of the library.
 
 ## What Balli Covers
 

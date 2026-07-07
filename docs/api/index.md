@@ -4,7 +4,7 @@ Generated from `src/balli/*.lpy`.
 
 - [`balli.clj-kondo`](balli_clj_kondo.md) - Static-analysis metadata exports
 - [`balli.compile`](balli_compile.md) - AST -> compiled validator + explainer closures
-- [`balli.core`](balli_core.md) - Public API for balli - Malli-inspired data-driven schemas for Basilisp
+- [`balli.core`](balli_core.md) - Public API for balli - Malli for Basilisp
 - [`balli.describe`](balli_describe.md) - Small English schema descriptions.
 - [`balli.destructure`](balli_destructure.md) - Schema-guided destructuring helpers
 - [`balli.dev`](balli_dev.md) - Development-time instrumentation registry
