@@ -20,9 +20,10 @@ Basilisp/Python diverge from Clojure/JVM.
 | Generative function checking | Supported |
 | Value generation / sampling | Supported |
 | Reusable generator objects | Supported via `balli.generator/generator` and `:gen/gen` |
-| Shrinking | Heuristic Balli shrinker; not Clojure test.check shrinking |
+| Generator combinators | Supported via Balli-native generator objects (`return`, `elements`, `fmap`, `bind`) |
+| Shrinking | Heuristic Balli shrinker with `shrink-trace`; not Clojure test.check shrinking |
 | Provider inference | Supported |
-| Provider closed-map inference | Supported via `{:closed-maps true}` |
+| Provider closed-map/common-key inference | Supported via `{:closed-maps true}` and `{:optional-threshold f}` metadata |
 | Destructuring | Supported via `balli.destructure` |
 | Immutable/custom registries | Supported |
 | Mutable default registry | Supported |
@@ -35,7 +36,11 @@ Basilisp/Python diverge from Clojure/JVM.
 | DOT / PlantUML visualization | Supported |
 | English descriptions | Supported |
 | `malli.util`-style map introspection | Supported via `entries`, `keys`, `required-key?`, and `optional-key?` |
+| `malli.util`-style map surgery | Supported via `set-entry`, `update-entry`, `rename-keys`, and `transform-entries` |
 | EDN schema persistence | Supported safely via named function refs |
+| Experimental schema analysis | Balli-native data-only helpers via `balli.experimental` |
+| Python ecosystem integrations | Supported at adapter boundaries via `balli.integrations` |
+| Static schema inspection | Supported via `balli.inspect` |
 | SCI integration | Data-only host context via `balli.sci`; no Clojure SCI runtime |
 | clj-kondo / static analyzer integration | Data export via `balli.clj-kondo`; no Clojure analyzer runtime |
 | `malli.experimental` | Not ported as executable Clojure experimental APIs |

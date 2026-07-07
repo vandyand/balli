@@ -1,0 +1,64 @@
+(ns balli.inspect
+  "Static inspection helpers for Balli schemas.
+
+  `problems` is intentionally conservative: it reports malformed schemas,
+  unresolved refs, and export smoke failures without executing user predicate
+  code."
+  (:require [balli.core :as b]
+            [balli.json-schema :as js]))
+
+(defn- problem
+  [kind message data]
+  (merge {:kind kind :message message} data))
+
+(defn problems
+  "Return a vector of problem maps for schema `s`."
+  ([s] (problems s {}))
+  ([s opts]
+   (let [out (atom [])]
+     (try
+       (b/schema s opts)
+       (catch python/Exception e
+         (swap! out conj
+                (problem :schema
+                         (str e)
+                         {:type (:type (ex-data e))
+                          :data (ex-data e)}))))
+     (when (empty? @out)
+       (try
+         (b/walk s (fn [form _path] form) opts)
+         (catch python/Exception e
+           (swap! out conj
+                  (problem :walk
+                           (str e)
+                           {:type (:type (ex-data e))
+                            :data (ex-data e)})))))
+     (when (empty? @out)
+       (try
+         (js/transform s opts)
+         (catch python/Exception e
+           (swap! out conj
+                  (problem :export
+                           (str e)
+                           {:type (:type (ex-data e))
+                            :data (ex-data e)})))))
+     @out)))
+
+(defn valid-schema?
+  "True when `problems` finds no schema issues."
+  ([s] (valid-schema? s {}))
+  ([s opts] (empty? (problems s opts))))
+
+(defn report
+  "Human-readable inspection report."
+  ([s] (report s {}))
+  ([s opts]
+   (let [ps (problems s opts)]
+     (if (empty? ps)
+       "OK"
+       (apply str
+              (interpose
+               "\n"
+               (map (fn [{:keys [kind message type]}]
+                      (str (name kind) ": " (or type "unknown") " - " message))
+                    ps)))))))

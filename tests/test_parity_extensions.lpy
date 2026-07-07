@@ -1,0 +1,92 @@
+(ns tests.test-parity-extensions
+  "Focused tests for Malli parity gap closers added after the core parity pass."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [balli.core :as b]
+            [balli.experimental :as exp]
+            [balli.generator :as bg]
+            [balli.inspect :as inspect]
+            [balli.integrations :as integ]
+            [balli.provider :as bp]
+            [balli.util :as u]))
+
+(deftest provider-requiredness-and-map-of-knobs
+  (testing ":optional-threshold marks common optional keys without invalidating samples"
+    (is (= [:map [:id :int]
+            [:name {:optional true :balli.provider/common true} :string]]
+           (bp/provide [{:id 1 :name "a"}
+                        {:id 2 :name "b"}
+                        {:id 3}]
+                       {:optional-threshold 0.6}))))
+  (testing ":prefer-map-of false keeps record-shaped output for dict samples"
+    (is (= [:map ["a" {:optional true} :int]
+            ["b" {:optional true} :int]
+            ["c" {:optional true} :int]]
+           (bp/provide [{"a" 1 "b" 2} {"c" 3}]
+                       {:map-of-threshold 2
+                        :prefer-map-of false})))))
+
+(deftest util-entry-surgery
+  (is (= [:map [:id :int] [:name :string]]
+         (u/set-entry [:map [:id :int]] :name :string)))
+  (is (= [:map [:id [:string {:min 1}]]]
+         (u/update-entry [:map [:id :string]] :id
+                         (fn [s] [s {:min 1}]))))
+  (is (= [:map [:user/id :int]]
+         (u/rename-keys [:map [:id :int]] {:id :user/id})))
+  (is (= [:map [:id :int]]
+         (u/transform-entries
+          [:map [:id :int] [:debug :boolean]]
+          (fn [entry]
+            (when-not (= :debug (:key entry)) entry))))))
+
+(deftest generator-combinators-and-shrink-trace
+  (is (= 42 (bg/generate* (bg/return 42) {:seed 1})))
+  (is (contains? #{:a :b}
+                 (bg/generate* (bg/elements [:a :b]) {:seed 2})))
+  (is (= "7" (bg/generate* (bg/fmap str (bg/return 7)) {:seed 0})))
+  (is (= "xxx"
+         (bg/generate*
+          (bg/bind (bg/return 3)
+                   (fn [n] (bg/return (apply str (repeat n "x")))))
+          {:seed 0})))
+  (let [trace (bg/shrink-trace [:int {:min 0}] 10)]
+    (is (= 10 (first trace)))
+    (is (every? #(b/validate [:int {:min 0}] %) trace))))
+
+(deftest experimental-analysis
+  (let [schema [:map [:id :int] [:tags [:vector :keyword]]]
+        cov (exp/coverage schema)]
+    (is (= 4 (:paths cov)))
+    (is (= 2 (:max-depth cov)))
+    (is (= 1 (get (:types cov) :map 0)))
+    (is (some #(= [:tags 0] (:path %)) (exp/leaf-paths schema)))))
+
+(deftest integration-and-inspection-helpers
+  (is (= :int (integ/annotation-schema python/int)))
+  (is (= [:vector :any] (integ/annotation-schema python/list)))
+  (is (true? ((integ/validator [:map [:id :int]]) {:id 1})))
+  (is (= {:id 1} (integ/assert-valid [:map [:id :int]] {:id 1})))
+  (is (true? (inspect/valid-schema? [:map [:id :int]])))
+  (is (false? (inspect/valid-schema? [:ref :missing/ref])))
+  (is (seq (inspect/problems [:ref :missing/ref]))))
+
+(deftest parity-extension-fuzz-stress
+  (doseq [seed (range 60)]
+    (let [samples (mapv (fn [i]
+                          (cond-> {:id i}
+                            (<= (mod i 4) (mod seed 4)) (assoc :name (str "n" i))))
+                        (range 1 6))
+          schema (bp/provide samples {:optional-threshold 0.5
+                                      :closed-maps true})
+          schema* (-> schema
+                      (u/set-entry :active :boolean)
+                      (u/update-entry :id (fn [s] [:and s [:>= 0]]))
+                      (u/rename-keys {:active :enabled}))
+          value (assoc (first samples) :enabled true)
+          g (bg/fmap #(assoc % :enabled true)
+                     (bg/generator (u/dissoc schema* :enabled) {:seed seed}))]
+      (is (every? #(b/validate schema %) samples))
+      (is (true? (b/validate schema* value)))
+      (is (empty? (inspect/problems schema*)))
+      (is (map? (exp/coverage schema*)))
+      (is (true? (b/validate schema* (bg/generate* g {:seed seed})))))))

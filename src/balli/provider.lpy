@@ -24,6 +24,10 @@
   - {:infer-tuples true} emits [:tuple ...] for vector samples that all share
     one arity.
   - {:closed-maps true} emits record-shaped maps as [:map {:closed true} ...].
+  - {:optional-threshold f} annotates optional map keys that appear in at
+    least f of record samples with {:balli.provider/common true}; schemas
+    still validate every source sample.
+  - {:prefer-map-of false} disables the [:map-of ...] heuristic.
 
   :map-of heuristic (opts key :map-of-threshold, default 3): at least
   threshold map samples AND every per-key value schema equal AND every key
@@ -40,6 +44,7 @@
   - Scalars none of the preference types accept (e.g. arbitrary Python
     objects) infer :any; :any among mixed branches collapses the whole
     union to :any."
+  (:import math)
   (:require [balli.core :as b]))
 
 ;; ---------------------------------------------------------------------------
@@ -62,6 +67,10 @@
   "Most specific type in `type-set` per scalar-preference; :any when none."
   [type-set]
   (or (first (filter type-set scalar-preference)) :any))
+
+(defn- int-ceil
+  [x]
+  (python/int (math/ceil x)))
 
 ;; ---------------------------------------------------------------------------
 ;; Pass 1: stats fold
@@ -182,16 +191,20 @@
 
 (defn- synthesize-map
   "[:map-of k v] when the heuristic holds, else [:map [k (props?) v] ...] with
-  {:optional true} iff the key was present in fewer samples than the total.
-  Entries in first-seen key order."
+  {:optional true} iff the key was missing from any sample. Optional keys above
+  :optional-threshold receive presence metadata. Entries in first-seen key
+  order."
   [branch opts]
   (let [n (:count branch)
         threshold (get opts :map-of-threshold 3)
+        optional-threshold (or (:optional-threshold opts) 1.0)
+        common-count (max 1 (int-ceil (* n optional-threshold)))
         val-schemas (into {}
                           (map (fn [k] [k (synthesize (get-in branch [:key-stats k]) opts)]))
                           (:key-order branch))
         distinct-keys (:distinct-keys branch)
-        map-of? (and (>= n threshold)
+        map-of? (and (not (false? (:prefer-map-of opts)))
+                     (>= n threshold)
                      (seq distinct-keys)
                      (= 1 (count (distinct (vals val-schemas))))
                      (= 1 (count (distinct (map (fn [k] (synthesize (fold (empty-stats) k) opts))
@@ -204,9 +217,13 @@
        (val (first val-schemas))]
       (into (if (:closed-maps opts) [:map {:closed true}] [:map])
             (map (fn [k]
-                   (let [v (get val-schemas k)]
-                     (if (< (get-in branch [:key-counts k]) n)
-                       [k {:optional true} v]
+                   (let [v (get val-schemas k)
+                         present (get-in branch [:key-counts k])]
+                     (if (< present n)
+                       [k (cond-> {:optional true}
+                            (>= present common-count)
+                            (assoc :balli.provider/common true))
+                        v]
                        [k v]))))
             (:key-order branch)))))
 
@@ -255,8 +272,11 @@
   "Infer a schema FORM from `samples` (any seqable of values). `opts`
   supports {:map-of-threshold n} (default 3) for the [:map-of ...]
   heuristic, {:infer-enums true :enum-threshold n}, {:infer-tuples true}, and
-  {:closed-maps true}. Every sample validates against the returned form. No
-  samples -> :any."
+  {:closed-maps true}. {:optional-threshold f} annotates optional keys present
+  in at least f of samples with {:balli.provider/common true}; it never makes
+  source samples invalid. {:prefer-map-of false} disables the [:map-of ...]
+  heuristic. Every sample validates against the returned form. No samples ->
+  :any."
   ([samples] (provide samples {}))
   ([samples opts]
    (synthesize (reduce fold (empty-stats) samples) opts)))

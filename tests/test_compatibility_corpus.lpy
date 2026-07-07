@@ -3,11 +3,16 @@
   (:require [basilisp.test :refer [deftest is testing]]
             [balli.core :as b]
             [balli.destructure :as destructure]
+            [balli.experimental :as exp]
             [balli.generator :as bg]
+            [balli.inspect :as inspect]
+            [balli.integrations :as integ]
             [balli.json-schema :as json-schema]
             [balli.lite :as lite]
+            [balli.provider :as bp]
             [balli.registry :as reg]
-            [balli.transform :as bt]))
+            [balli.transform :as bt]
+            [balli.util :as u]))
 
 (def compatibility-cases
   [{:area "vector syntax" :schema [:map [:id :int]] :valid {:id 1} :invalid {:id "1"}}
@@ -78,4 +83,22 @@
           value {:id 1 :profile {:name "Ada"}}
           generated (bg/generate schema {:seed 10})]
       (is (true? (b/validate schema generated)))
-      (is (= value (destructure/destructure schema value))))))
+      (is (= value (destructure/destructure schema value)))))
+  (testing "provider/util/generator parity helpers"
+    (let [provided (bp/provide [{:id 1 :name "a"} {:id 2}]
+                               {:optional-threshold 0.5
+                                :closed-maps true})
+          edited (-> provided
+                     (u/set-entry :active :boolean)
+                     (u/rename-keys {:active :enabled}))
+          generated (bg/generate* (bg/fmap #(assoc % :enabled true)
+                                           (bg/generator (u/dissoc edited :enabled)))
+                                  {:seed 5})]
+      (is (true? (b/validate provided {:id 1 :name "a"})))
+      (is (true? (b/validate edited generated)))))
+  (testing "experimental analysis, integrations, and inspection"
+    (let [schema [:map [:id :int] [:tags [:vector :keyword]]]]
+      (is (pos? (:paths (exp/coverage schema))))
+      (is (= :int (integ/annotation-schema python/int)))
+      (is (true? (inspect/valid-schema? schema)))
+      (is (false? (inspect/valid-schema? [:ref :missing/ref]))))))

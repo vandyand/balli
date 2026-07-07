@@ -6,10 +6,14 @@
   (:require [balli.core :as b]
             [balli.edn :as edn]
             [balli.error :as error]
+            [balli.experimental :as experimental]
             [balli.generator :as gen]
+            [balli.inspect :as inspect]
+            [balli.integrations :as integrations]
             [balli.json-schema :as json-schema]
             [balli.registry :as registry]
-            [balli.transform :as transform]))
+            [balli.transform :as transform]
+            [balli.util :as util]))
 
 (def namespaces
   "SCI namespace map exposing Balli public APIs."
@@ -22,9 +26,24 @@
                 'parse b/parse
                 'unparse b/unparse}
    'balli.error {'humanize error/humanize}
+   'balli.experimental {'paths experimental/paths
+                        'leaf-paths experimental/leaf-paths
+                        'coverage experimental/coverage}
    'balli.generator {'generate gen/generate
                      'sample gen/sample
-                     'generator gen/generator}
+                     'generator gen/generator
+                     'generator-from gen/generator-from
+                     'return gen/return
+                     'elements gen/elements
+                     'fmap gen/fmap
+                     'bind gen/bind
+                     'shrink-trace gen/shrink-trace}
+   'balli.inspect {'problems inspect/problems
+                   'valid-schema? inspect/valid-schema?
+                   'report inspect/report}
+   'balli.integrations {'annotation-schema integrations/annotation-schema
+                        'validator integrations/validator
+                        'assert-valid integrations/assert-valid}
    'balli.json-schema {'transform json-schema/transform}
    'balli.registry {'registry registry/registry
                     'var-registry registry/var-registry
@@ -36,6 +55,10 @@
                      'query-params-transformer transform/query-params-transformer
                      'json-api-transformer transform/json-api-transformer
                      'collection-transformer transform/collection-transformer}
+   'balli.util {'set-entry util/set-entry
+                'update-entry util/update-entry
+                'rename-keys util/rename-keys
+                'transform-entries util/transform-entries}
    'balli.edn {'write-string edn/write-string
                'read-string edn/read-string}})
 

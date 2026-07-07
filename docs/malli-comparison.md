@@ -16,14 +16,17 @@ Balli currently covers most user-facing schema workflows:
 - map, collection, predicate, comparator, enum, ref, multi, and regex schemas
 - function schemas, instrumentation, and generative checking
 - deterministic generators and shrinking
+- Balli-native generator objects and combinators
 - JSON Schema, OpenAPI, Swagger, DOT, PlantUML, and description export
-- schema walking and utility operations
+- schema walking, utility operations, and map-entry surgery
 - custom registries, local registries, lazy/dynamic/var registries, and
   recursive references
 - EDN-style safe serialization through registered function references
 - custom extension types
 - time schemas
 - schema inference and destructuring helpers
+- data-only experimental analysis helpers
+- Python integration adapters and static schema inspection
 
 ## Remaining Differences
 
@@ -32,7 +35,9 @@ Some Malli ecosystem features are intentionally thinner in Balli:
 - Malli's ClojureScript/browser ecosystem has no direct Basilisp equivalent.
 - Malli's documentation site and community examples are more mature.
 - Malli has broader downstream library integrations.
-- Malli's advanced provider ecosystem and schema tooling are deeper.
+- Malli's advanced provider ecosystem and schema tooling are still deeper, but
+  Balli now has provider knobs, static inspection, and data-only experimental
+  analysis helpers.
 - Balli's package ecosystem is younger because Basilisp's ecosystem is smaller.
 
 ## Practical Parity Target
