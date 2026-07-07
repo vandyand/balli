@@ -1,5 +1,7 @@
 # `balli.pretty`
 
+Pretty development-time error rendering.
+
 ## `explain-str`
 
 Kind: `defn`

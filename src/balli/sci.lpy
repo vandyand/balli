@@ -12,6 +12,7 @@
             [balli.transform :as transform]))
 
 (def namespaces
+  "SCI namespace map exposing Balli public APIs."
   {'balli.core {'schema b/schema
                 'schema? b/schema?
                 'ast b/ast

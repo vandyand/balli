@@ -33,20 +33,24 @@
   k)
 
 (defn unregister-type!
+  "Remove the custom schema type keyword `k` from the extension registry."
   [k]
   (swap! type-specs dissoc k)
   (swap! reg/mutation-epoch inc)
   nil)
 
 (defn type-spec
+  "Return the registered extension spec for custom schema type keyword `k`."
   [k]
   (get @type-specs k))
 
 (defn custom-type?
+  "Return true when `k` is registered as a custom schema type."
   [k]
   (contains? @type-specs k))
 
 (defn clear-types!
+  "Clear all custom schema type registrations."
   []
   (reset! type-specs {})
   (swap! reg/mutation-epoch inc)

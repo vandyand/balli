@@ -1,5 +1,7 @@
 # `balli.error`
 
+Humanized error messages for balli explain maps. (humanize explain-map) turns the output of balli.core/explain into a human-readable structure mirroring the shape of the value (Malli semantics): - nil (valid input) -> nil - root-level errors (:in []) -> flat vector of messages - map keys in :in -> nested maps {:x [\"msg\"]} - integer indices in :in -> sparse vectors [nil [\"msg\"]] - multiple errors at one :in -> accumulate into a single vector Messages come from a default table keyed by error :type, with :min/:max interpolation for :balli.core/limits. An :error/message property on the failing schema fragment (the error's :schema) overrides everything. (with-spell-checking explain-map) is an opt-in pre-humanize rewrite that turns extra-key / invalid-dispatch-value errors caused by likely typos into :balli.error/misspelled-key / :balli.error/misspelled-value errors (levenshtein distance vs the declared keys) and drops the missing-key errors those typos explain.
+
 ## `levenshtein`
 
 Kind: `defn`

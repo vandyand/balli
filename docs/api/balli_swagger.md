@@ -1,5 +1,7 @@
 # `balli.swagger`
 
+Swagger/OpenAPI 2.0 export helpers built on balli.json-schema.
+
 ## `schema`
 
 Kind: `defn`

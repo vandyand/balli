@@ -1,5 +1,7 @@
 # `balli.transform`
 
+Value transformers (decode/encode) for balli, per Malli 0.20 semantics. A transformer is a plain map: {:balli/transformer true :id <int> ; identity token for caching in core :chain [{:name <kw> :decoders {type interceptor} :encoders {type interceptor} :default-decoder interceptor :default-encoder interceptor} ...]} An interceptor is one of: - a plain fn -> {:enter f} - {:enter f :leave g} -> as-is (either key optional) - {:compile (fn [ast opts] ..)} -> compiled per schema node, result normalized + merged (real fns, no eval) Per schema node the chain folds IN ORDER: enter composes in chain order, leave in reverse chain order (interceptor stack). Per link, the interceptor resolves by priority: schema prop {:decode {:string f}} -> qualified prop :decode/string -> per-type table -> :default-decoder/:default-encoder. `compile-transformer` compiles an AST + registry + transformer + method into a single 1-arg fn, or nil when the whole subtree has no transformations (nil collapses to identity at the API layer -- no identity-fn wrapping).
+
 ## `transformer?`
 
 Kind: `defn`

@@ -1,5 +1,7 @@
 # `balli.dot`
 
+Graphviz DOT export for Balli schemas.
+
 ## `transform`
 
 Kind: `defn`

@@ -1,5 +1,7 @@
 # `balli.lite`
 
+Small data-spec-style schema shorthand. This is intentionally explicit: call `lite/schema` to turn plain data into Balli schema forms. Raw map literals remain invalid as ordinary schemas so `:=` and `:enum` keep unambiguous literal semantics.
+
 ## `form`
 
 Kind: `defn`

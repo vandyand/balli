@@ -28,12 +28,15 @@ The GitHub environment `pypi` exists in this repository. The first PyPI release,
 
 ```bash
 scripts/release_check.sh
-git tag vX.Y.Z
+git tag -a vX.Y.Z -m "vX.Y.Z"
 git push origin vX.Y.Z
 ```
 
-The `Release` workflow builds distributions and publishes to PyPI using trusted
-publishing.
+The `Release` workflow builds distributions, publishes to PyPI using trusted
+publishing, creates a GitHub release from the tag, generates release notes, and
+attaches the built distributions. The publish step uses `skip-existing: true`
+so a rerun or a backfilled tag does not fail if the package version already
+exists on PyPI.
 
 ## Verify
 
@@ -43,3 +46,10 @@ After publishing:
 python -m pip install --upgrade balli
 basilisp run -c "(require '[balli.core :as b]) (println b/version)"
 ```
+
+Also verify:
+
+- The GitHub release exists and includes `tar.gz` and `whl` artifacts.
+- The release workflow is green for the tag.
+- Hosted docs are current at <https://vandyand.github.io/balli/>.
+- `pip index versions balli` shows the new version.

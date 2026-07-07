@@ -366,7 +366,7 @@
 
 ;; Canonical fn-like? lives in balli.normalize (compile requires normalize;
 ;; the reverse import would be circular). Re-exported here for the public API.
-(def fn-like? norm/fn-like?)
+(def fn-like? "Return true for callable values Balli can treat as functions." norm/fn-like?)
 
 (defn- compile-node*
   [node registry cache]

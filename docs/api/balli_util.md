@@ -1,5 +1,7 @@
 # `balli.util`
 
+Schema utilities (Malli's malli.util, form->form). Every fn accepts a raw schema form or a balli schema object and returns a plain schema FORM (never a schema object). Entry introspection goes through balli.normalize; `opts` (where accepted) supports {:registry r} for raw forms — schema objects use their baked-in registry. Refs are never dereferenced: a ref-valued entry participates as its form (the bare keyword or [:ref k]), matching balli.core/walk's refs-not-entered rule.
+
 ## `merge`
 
 Kind: `defn`

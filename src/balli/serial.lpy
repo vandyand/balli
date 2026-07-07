@@ -24,11 +24,13 @@
   k)
 
 (defn unregister-function!
+  "Remove function registry entry `k`."
   [k]
   (swap! functions dissoc k)
   nil)
 
 (defn clear-functions!
+  "Clear every registered serialization function reference."
   []
   (reset! functions {})
   nil)
@@ -96,9 +98,11 @@
     :else x))
 
 (defn write-string
+  "Serialize `schema` to an EDN string without evaluating code."
   [schema]
   (edn/write-string (serialize schema)))
 
 (defn read-string
+  "Read an EDN string written by `write-string` back into schema data."
   [s]
   (deserialize (edn/read-string s)))

@@ -1,5 +1,7 @@
 # `balli.core`
 
+Public API for balli - Malli-inspired data-driven schemas for Basilisp. Schemas are plain data (Malli vector syntax). `schema` wraps a form into a schema object {:balli/schema true :form ... :ast ... :registry ... :cache (atom {})}; `validator`/`validate` accept either a raw form or a schema object. Compiled validators/explainers are cached: on the schema object's :cache atom, or (for raw forms) in a bounded global cache keyed by [form registry-id], where registry-id is an identity token assigned per registry map (default registry = token 0). The raw cache records the balli.registry/mutation-epoch it was filled under and clears itself when the default registry is mutated (register!/set-default-registry!), so raw forms always compile against the live default; schema objects keep their construction-time registry snapshot.
+
 ## `version`
 
 Kind: `def`

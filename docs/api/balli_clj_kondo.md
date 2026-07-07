@@ -1,5 +1,7 @@
 # `balli.clj-kondo`
 
+Static-analysis metadata exports. This does not run clj-kondo under Basilisp. It emits data describing function schemas so external tools can generate analyzer config.
+
 ## `function-config`
 
 Kind: `defn`
