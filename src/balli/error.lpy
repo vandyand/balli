@@ -10,9 +10,9 @@
     - integer indices in :in     -> sparse vectors [nil [\"msg\"]]
     - multiple errors at one :in -> accumulate into a single vector
 
-  Messages come from a default table keyed by error :type, with :min/:max
-  interpolation for :balli.core/limits. An :error/message property on the
-  failing schema fragment (the error's :schema) overrides everything.
+  Messages come from schema :error/fn, schema :error/messages, schema
+  :error/message, caller opts, locale defaults, and a default table keyed by
+  error :type, with :min/:max interpolation for :balli.core/limits.
 
   (with-spell-checking explain-map) is an opt-in pre-humanize rewrite that
   turns extra-key / invalid-dispatch-value errors caused by likely typos
@@ -217,6 +217,14 @@
                                      (:balli.error/likely-misspelling-of error))))
           :balli.extension/invalid "invalid value"
           "invalid value")))))
+
+(defn- format-message
+  "Apply opts-level message post-processing. :format-message receives
+  [message error opts] and returns the final rendered message."
+  [msg error opts]
+  (if-some [f (:format-message opts)]
+    (f msg error opts)
+    msg))
 
 ;; ---------------------------------------------------------------------------
 ;; Spell-checking (semantics §D)
@@ -430,13 +438,20 @@
   structure mirroring the value shape. nil in -> nil out. When a level has
   both its own errors and nested child errors (e.g. a collection :min
   violation alongside a bad element), the level renders as a map and its
-  own messages live under the reserved :balli/error key."
+  own messages live under the reserved :balli/error key.
+
+  Options:
+    :locale          locale keyword for built-in and schema :error/messages
+    :messages        map of error type -> caller override message
+    :format-message  (fn [message error opts] message') post-processor."
   ([explain-map] (humanize explain-map {}))
   ([explain-map opts]
    (when explain-map
      (render-tree
       (reduce (fn [tree error]
                 (insert-message tree (:value explain-map) (:in error)
-                                (error-message error opts)))
+                                (format-message (error-message error opts)
+                                                error
+                                                opts)))
               {:msgs nil :children {}}
               (:errors explain-map))))))

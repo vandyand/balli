@@ -87,6 +87,20 @@
          (be/humanize (b/explain [:map [:x [:string {:min 3 :error/message "custom limit"}]]]
                                  {:x "ab"})))))
 
+(deftest opts-format-message
+  (testing "global post-processing gets message, error, and opts"
+    (is (= ["E:balli.core/invalid-type:should be an integer"]
+           (be/humanize
+            (b/explain :int "x")
+            {:format-message (fn [msg error _opts]
+                               (str "E" (:type error) ":" msg))}))))
+  (testing "post-processing applies after schema-level overrides"
+    (is (= {:x ["wrapped(custom)"]}
+           (be/humanize
+            (b/explain [:map [:x [:int {:error/message "custom"}]]] {:x "x"})
+            {:format-message (fn [msg _error _opts]
+                               (str "wrapped(" msg ")"))})))))
+
 ;; ---------------------------------------------------------------------------
 ;; Enum / := / dispatch messages
 
