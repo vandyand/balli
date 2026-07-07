@@ -13,6 +13,9 @@ nav:
       - Overview: cookbook/index.md
       - Validation and Errors: cookbook/validation.md
       - Coercion and Transforms: cookbook/coercion.md
+      - Environment and CLI Config: cookbook/env-cli.md
+      - Query Parameters: cookbook/query-params.md
+      - JSON API Handlers: cookbook/json-api.md
       - Web API Validation: cookbook/web-api.md
       - Config Validation: cookbook/config.md
       - Registries: cookbook/registries.md
@@ -50,6 +53,7 @@ nav:
       - balli.transform: api/balli_transform.md
       - balli.util: api/balli_util.md
   - Compatibility:
+      - Malli Users Start Here: malli-users-start-here.md
       - Balli vs Malli: malli-comparison.md
       - Malli Matrix: malli-compatibility.md
       - CI Evidence: compatibility-evidence.md

@@ -67,3 +67,21 @@ Every schema: nil replaced by the :default property (contains?-based lookup, so 
 Kind: `defn`
 
 Coerce between collection kinds: :vector/:tuple/:seqable/:every from sequential-or-set, :set from sequential, :sequential from vector/set. Both decode and encode.
+
+## `env-transformer`
+
+Kind: `defn`
+
+Preset for flat environment/config maps with string keys and string values: string keys decode to keywords, scalar values decode with string rules, and encode turns keyword keys back into names.
+
+## `query-params-transformer`
+
+Kind: `defn`
+
+Preset for query/form parameter maps: string keys decode to keywords, string scalar values decode with string rules, and repeated/list values can be coerced into vectors or sets via collection rules.
+
+## `json-api-transformer`
+
+Kind: `defn`
+
+Preset for JSON API request/response bodies. Decode strips undeclared map keys, decodes JSON-friendly scalar representations including time values, and coerces collection shapes. Encode applies the reverse scalar/time conversions and strips extra keys.

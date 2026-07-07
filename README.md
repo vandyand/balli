@@ -16,6 +16,7 @@ Schemas are plain data in Malli's vector syntax, plus Malli-style map syntax / A
 - API reference: <https://vandyand.github.io/balli/api/>
 - Deployment status: [docs/deployment.md](docs/deployment.md)
 - Balli vs Malli: [docs/malli-comparison.md](docs/malli-comparison.md)
+- Malli users start here: [docs/malli-users-start-here.md](docs/malli-users-start-here.md)
 - Compatibility matrix: [docs/malli-compatibility.md](docs/malli-compatibility.md)
 - Examples: [examples/](examples/)
 - Benchmarks: [benchmarks/](benchmarks/)
@@ -494,7 +495,7 @@ tests that mutate it should restore the old default in `try`/`finally`.
 ;; => :balli.core/coercion
 ```
 
-The seven built-ins:
+The built-ins and presets:
 
 | Transformer | Behavior |
 |---|---|
@@ -505,6 +506,9 @@ The seven built-ins:
 | `key-transformer` | `{:decode f :encode g}` applied to map keys |
 | `default-value-transformer` | Replace nil (and fill missing required map keys) from the `:default` property; opts `{:key ... :defaults {type f} :add-optional-keys bool}` |
 | `collection-transformer` | Coerce between collection kinds (sequential↔set↔vector) |
+| `env-transformer` | Preset for string-keyed environment/config maps: keyword keys plus string scalar decoding |
+| `query-params-transformer` | Preset for query/form params: keyword keys, string scalar decoding, and repeated values into collections |
+| `json-api-transformer` | Preset for JSON API payloads: strip extras, JSON/time decoding, and collection coercion |
 
 ```clojure
 (b/decode [:map [:x :int]] {:x 1 :junk 2} (bt/strip-extra-keys-transformer))
@@ -518,6 +522,11 @@ The seven built-ins:
 
 (b/decode [:set :int] [1 1 2] (bt/collection-transformer))
 ;; => #{1 2}
+
+(b/decode [:map {:closed true} [:port :int] [:debug :boolean]]
+          {"port" "8080" "debug" "false"}
+          (bt/env-transformer))
+;; => {:port 8080 :debug false}
 ```
 
 Schemas can override a transformer per node with `:decode/<name>` / `:encode/<name>` properties (real fns, or `{:enter f :leave g}` maps):
@@ -562,9 +571,16 @@ Transformers compose with `bt/transformer` — decode runs the chain in order, e
 
 (u/get-in [:map [:a [:map [:b :int]]]] [:a :b])
 ;; => :int
+
+(u/entries [:map [:id :int] [:name {:optional true} :string]])
+;; => [{:key :id :properties {} :schema :int :optional false}
+;;     {:key :name :properties {:optional true} :schema :string :optional true}]
 ```
 
-Also: `required-keys`, `open-schema`, `get`. `u/get`/`get-in` address `:map`/`:multi`/`:orn`/`:catn`/`:altn` children by entry key and all indexed types (`:and`/`:or`/`:tuple`/colls/seqex/...) by integer index.
+Also: `required-keys`, `open-schema`, `get`, `keys`, `required-key?`, and
+`optional-key?`. `u/get`/`get-in` address `:map`/`:multi`/`:orn`/`:catn`/
+`:altn` children by entry key and all indexed types (`:and`/`:or`/`:tuple`/
+colls/seqex/...) by integer index.
 
 `balli.core/walk` is a form-level postwalk — at every node, children first, the rebuilt form and its path are passed to your fn, whose return value replaces the node:
 
@@ -814,6 +830,7 @@ Maps with many distinct keys but uniform key/value shapes become `[:map-of k v]`
 | `merge` / `union` | Combine two `:map` forms — last-wins / `[:or]`-combining. |
 | `select-keys` / `dissoc` | Keep / remove `:map` entries. |
 | `optional-keys` / `required-keys` | Set / clear `:optional` on entries (all, or a key seq). |
+| `entries` / `keys` / `required-key?` / `optional-key?` | Inspect `:map` entries and requiredness. |
 | `closed-schema` / `open-schema` | Recursively add / remove `{:closed true}` (explicit `{:closed false}` is respected). |
 | `get` / `get-in` | Sub-schema form by entry key or child index; nil when absent. |
 

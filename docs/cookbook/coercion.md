@@ -19,3 +19,11 @@ Compose transformers when data crosses multiple representation boundaries.
                 (bt/time-transformer)
                 (bt/string-transformer))
 ```
+
+For common boundaries, use the named presets:
+
+```clojure
+(bt/env-transformer)          ;; environment/CLI config maps
+(bt/query-params-transformer) ;; query/form parameter maps
+(bt/json-api-transformer)     ;; JSON API request/response bodies
+```

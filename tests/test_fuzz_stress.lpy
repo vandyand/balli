@@ -22,7 +22,8 @@
             [balli.registry :as reg]
             [balli.sci :as sci]
             [balli.swagger :as swagger]
-            [balli.transform :as bt]))
+            [balli.transform :as bt]
+            [balli.util :as u]))
 
 (def ^:private leaf-schemas
   [:any :nil :string :int :float :double :number :boolean :keyword :symbol :uuid
@@ -237,6 +238,58 @@
             (str "decoded value did not validate for " s " -> " decoded))
         (is (some? (b/encode s decoded t)))))))
 
+(deftest integration-transformer-presets-fuzz
+  (doseq [seed (range 60)]
+    (case (mod seed 3)
+      0 (let [schema [:map {:closed true}
+                      [:port [:int {:min 1 :max 65535}]]
+                      [:debug :boolean]
+                      [:host :string]]
+              raw {"port" (str (+ 1000 seed))
+                   "debug" (if (even? seed) "true" "false")
+                   "host" (str "svc" seed)}
+              decoded (b/decode schema raw (bt/env-transformer))]
+          (is (true? (b/validate schema decoded)))
+          (is (= (+ 1000 seed) (:port decoded)))
+          (is (string? (get (b/encode schema decoded (bt/env-transformer)) "port"))))
+
+      1 (let [schema [:map {:closed true}
+                      [:limit [:int {:min 1 :max 100}]]
+                      [:tags [:set :keyword]]]
+              raw {"limit" (str (inc (mod seed 100)))
+                   "tags" [(str "t" seed) "common"]}
+              decoded (b/decode schema raw (bt/query-params-transformer))]
+          (is (true? (b/validate schema decoded)))
+          (is (set? (:tags decoded))))
+
+      2 (let [schema [:map {:closed true}
+                      [:id :uuid]
+                      [:roles [:set :keyword]]]
+              raw {:id "550e8400-e29b-41d4-a716-446655440000"
+                   :roles ["admin" (str "seed" seed)]
+                   :extra seed}
+              decoded (b/decode schema raw (bt/json-api-transformer))]
+          (is (true? (b/validate schema decoded)))
+          (is (false? (contains? decoded :extra)))))))
+
+(deftest util-introspection-fuzz
+  (doseq [seed (range 40)]
+    (let [schema [:map {:closed (even? seed)}
+                  [:id :int]
+                  [:name {:optional true} :string]
+                  [:tag {:optional (zero? (mod seed 3))} :keyword]]
+          entries (u/entries schema)]
+      (is (= [:id :name :tag] (u/keys schema)))
+      (is (= (count entries) (count (u/keys schema))))
+      (is (true? (u/required-key? schema :id)))
+      (is (true? (u/optional-key? schema :name)))
+      (is (= (zero? (mod seed 3)) (u/optional-key? schema :tag)))
+      (doseq [{:keys [key schema]} entries]
+        (is (= schema (u/get [:map [:id :int]
+                              [:name {:optional true} :string]
+                              [:tag {:optional (zero? (mod seed 3))} :keyword]]
+                             key)))))))
+
 (deftest seqex-parse-unparse-fuzz
   (let [cases [[[:cat :int [:* :string]] [1 "a" "b"]]
                [[:catn [:n :int] [:tail [:* :string]]] [1 "a" "b"]]
@@ -411,6 +464,7 @@
     (let [samples (provider-samples seed)
           opts {:infer-tuples (zero? (mod seed 2))
                 :infer-enums (zero? (mod seed 3))
+                :closed-maps (zero? (mod seed 5))
                 :enum-threshold 4
                 :map-of-threshold 2}
           schema (bp/provide samples opts)]

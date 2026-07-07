@@ -11,6 +11,7 @@ matrix tracks the major Malli feature families Balli intentionally covers.
 | Validation / explain / humanize | Supported |
 | Spell checking and custom messages | Supported |
 | Value transformation / coercion | Supported |
+| Integration transformer presets | Supported for env/config maps, query params, and JSON API payloads |
 | Parse / unparse | Supported |
 | Sequence regex schemas | Supported |
 | `:seqable` / `:every` | Supported, including bounded-prefix `:every` checks |
@@ -20,6 +21,7 @@ matrix tracks the major Malli feature families Balli intentionally covers.
 | Reusable generator objects | Supported via `balli.generator/generator` and `:gen/gen` |
 | Shrinking | Heuristic Balli shrinker; not Clojure test.check shrinking |
 | Provider inference | Supported |
+| Provider closed-map inference | Supported via `{:closed-maps true}` |
 | Destructuring | Supported via `balli.destructure` |
 | Immutable/custom registries | Supported |
 | Mutable default registry | Supported |
@@ -31,10 +33,22 @@ matrix tracks the major Malli feature families Balli intentionally covers.
 | OpenAPI / Swagger export | Supported |
 | DOT / PlantUML visualization | Supported |
 | English descriptions | Supported |
+| `malli.util`-style map introspection | Supported via `entries`, `keys`, `required-key?`, and `optional-key?` |
 | EDN schema persistence | Supported safely via named function refs |
 | SCI integration | Data-only host context via `balli.sci`; no Clojure SCI runtime |
 | clj-kondo / static analyzer integration | Data export via `balli.clj-kondo`; no Clojure analyzer runtime |
 | `malli.experimental` | Not ported as executable Clojure experimental APIs |
+
+## Compatibility Corpus Categories
+
+The executable corpus in `tests/test_compatibility_corpus.lpy` uses three
+working categories:
+
+- **Supported**: behavior Balli implements and tests directly.
+- **Intentionally different**: behavior Balli documents where Python/Basilisp
+  semantics differ from JVM/Clojure, such as scalar type distinctions.
+- **Not applicable**: Clojure runtime ecosystem APIs that do not have a direct
+  Basilisp/Python equivalent, such as browser/ClojureScript integrations.
 
 ## Evidence
 

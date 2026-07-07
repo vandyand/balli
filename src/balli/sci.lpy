@@ -32,6 +32,9 @@
                     'dynamic-registry registry/dynamic-registry}
    'balli.transform {'string-transformer transform/string-transformer
                      'json-transformer transform/json-transformer
+                     'env-transformer transform/env-transformer
+                     'query-params-transformer transform/query-params-transformer
+                     'json-api-transformer transform/json-api-transformer
                      'collection-transformer transform/collection-transformer}
    'balli.edn {'write-string edn/write-string
                'read-string edn/read-string}})

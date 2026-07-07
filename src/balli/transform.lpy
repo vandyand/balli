@@ -850,3 +850,34 @@
     (transformer
      {:decoders coders
       :encoders coders})))
+
+(defn env-transformer
+  "Preset for flat environment/config maps with string keys and string values:
+  string keys decode to keywords, scalar values decode with string rules, and
+  encode turns keyword keys back into names."
+  []
+  (transformer
+   (key-transformer {:decode keyword :encode name})
+   (string-transformer)))
+
+(defn query-params-transformer
+  "Preset for query/form parameter maps: string keys decode to keywords,
+  string scalar values decode with string rules, and repeated/list values can
+  be coerced into vectors or sets via collection rules."
+  []
+  (transformer
+   (key-transformer {:decode keyword :encode name})
+   (string-transformer)
+   (collection-transformer)))
+
+(defn json-api-transformer
+  "Preset for JSON API request/response bodies. Decode strips undeclared map
+  keys, decodes JSON-friendly scalar representations including time values,
+  and coerces collection shapes. Encode applies the reverse scalar/time
+  conversions and strips extra keys."
+  []
+  (transformer
+   (strip-extra-keys-transformer)
+   (json-transformer)
+   (time-transformer)
+   (collection-transformer)))

@@ -260,6 +260,34 @@
     (is (= [:map [:x {:doc "d"} :int]]
            (u/required-keys [:map [:x {:doc "d" :optional true} :int]])))))
 
+(deftest map-entry-introspection
+  (let [schema [:map {:closed true}
+                [:id :int]
+                [:name {:optional true :doc "display"} :string]]]
+    (is (= [{:key :id :properties {} :schema :int :optional false}
+            {:key :name
+             :properties {:optional true :doc "display"}
+             :schema :string
+             :optional true}]
+           (u/entries schema)))
+    (is (= [:id :name] (u/keys schema)))
+    (is (true? (u/required-key? schema :id)))
+    (is (false? (u/required-key? schema :name)))
+    (is (true? (u/optional-key? schema :name)))
+    (is (false? (u/optional-key? schema :missing))))
+  (testing "schema objects and registries are accepted"
+    (let [r (reg/registry {:user/id :int})
+          schema (b/schema [:map [:id :user/id]] {:registry r})]
+      (is (= [{:key :id :properties {} :schema :user/id :optional false}]
+             (u/entries schema)))
+      (is (true? (u/required-key? schema :id)))))
+  (testing "non-map schema throws at the boundary"
+    (is (= :balli.core/invalid-schema
+           (try
+             (u/entries :int)
+             nil
+             (catch python/Exception e (:type (ex-data e))))))))
+
 ;; ---------------------------------------------------------------------------
 ;; closed-schema / open-schema
 

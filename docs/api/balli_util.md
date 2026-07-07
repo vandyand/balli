@@ -38,6 +38,30 @@ Kind: `defn`
 
 Remove :optional from the given :map entries (all entries when `ks` is omitted or nil).
 
+## `entries`
+
+Kind: `defn`
+
+Return map-entry metadata for `s` in schema order. Each entry is {:key k :properties props :schema value-form :optional bool}. Throws when `s` is not a :map schema.
+
+## `keys`
+
+Kind: `defn`
+
+Return the declared :map entry keys of `s` in schema order.
+
+## `optional-key?`
+
+Kind: `defn`
+
+Return true when :map schema `s` has key `k` marked optional.
+
+## `required-key?`
+
+Kind: `defn`
+
+Return true when :map schema `s` has required key `k`.
+
 ## `closed-schema`
 
 Kind: `defn`

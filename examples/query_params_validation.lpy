@@ -1,0 +1,22 @@
+(ns examples.query-params-validation
+  (:require [balli.core :as b]
+            [balli.error :as be]
+            [balli.transform :as bt]))
+
+(def query-schema
+  [:map {:closed true}
+   [:limit [:int {:min 1 :max 100}]]
+   [:tags {:optional true} [:set :keyword]]
+   [:q {:optional true} :string]])
+
+(def raw-query
+  {"limit" "25"
+   "tags" ["new" "paid"]
+   "q" "balli"})
+
+(def decoded
+  (b/decode query-schema raw-query (bt/query-params-transformer)))
+
+(if (b/validate query-schema decoded)
+  (println decoded)
+  (println (be/humanize (b/explain query-schema decoded))))

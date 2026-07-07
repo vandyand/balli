@@ -1,0 +1,22 @@
+(ns examples.env-config-validation
+  (:require [balli.core :as b]
+            [balli.error :as be]
+            [balli.transform :as bt]))
+
+(def env-schema
+  [:map {:closed true}
+   [:host [:string {:min 1}]]
+   [:port [:int {:min 1 :max 65535}]]
+   [:debug :boolean]])
+
+(def raw-env
+  {"host" "localhost"
+   "port" "8080"
+   "debug" "false"})
+
+(def decoded
+  (b/decode env-schema raw-env (bt/env-transformer)))
+
+(if (b/validate env-schema decoded)
+  (println decoded)
+  (println (be/humanize (b/explain env-schema decoded))))

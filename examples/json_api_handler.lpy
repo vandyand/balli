@@ -1,0 +1,27 @@
+(ns examples.json-api-handler
+  (:require [balli.core :as b]
+            [balli.error :as be]
+            [balli.openapi :as openapi]
+            [balli.transform :as bt]))
+
+(def user-schema
+  [:map {:closed true}
+   [:id :uuid]
+   [:name [:string {:min 1}]]
+   [:roles [:set :keyword]]])
+
+(def raw-body
+  {:id "550e8400-e29b-41d4-a716-446655440000"
+   :name "Ada"
+   :roles ["admin" "user"]
+   :ignored "dropped"})
+
+(def decoded
+  (b/decode user-schema raw-body (bt/json-api-transformer)))
+
+(println "OpenAPI response")
+(println (openapi/response user-schema))
+
+(if (b/validate user-schema decoded)
+  (println {:status 200 :body decoded})
+  (println {:status 400 :errors (be/humanize (b/explain user-schema decoded))}))

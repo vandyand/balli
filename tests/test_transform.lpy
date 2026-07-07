@@ -253,6 +253,45 @@
     (testing "empty stays valid sequential (documented deviation from malli's seq->nil)"
       (is (sequential? (b/decode [:sequential :int] [] t))))))
 
+(deftest env-transformer-preset
+  (let [schema [:map {:closed true}
+                [:host [:string {:min 1}]]
+                [:port [:int {:min 1 :max 65535}]]
+                [:debug {:optional true} :boolean]]
+        raw {"host" "localhost" "port" "8080" "debug" "false"}
+        decoded (b/decode schema raw (bt/env-transformer))]
+    (is (= {:host "localhost" :port 8080 :debug false} decoded))
+    (is (true? (b/validate schema decoded)))
+    (is (= {"host" "localhost" "port" "8080" "debug" false}
+           (b/encode schema decoded (bt/env-transformer))))))
+
+(deftest query-params-transformer-preset
+  (let [schema [:map {:closed true}
+                [:limit [:int {:min 1 :max 100}]]
+                [:tags {:optional true} [:set :keyword]]
+                [:q {:optional true} :string]]
+        raw {"limit" "25" "tags" ["new" "paid"] "q" "balli"}
+        decoded (b/decode schema raw (bt/query-params-transformer))]
+    (is (= {:limit 25 :tags #{:new :paid} :q "balli"} decoded))
+    (is (true? (b/validate schema decoded)))))
+
+(deftest json-api-transformer-preset
+  (let [schema [:map {:closed true}
+                [:id :uuid]
+                [:created :time/instant]
+                [:roles [:set :keyword]]]
+        raw {:id "550e8400-e29b-41d4-a716-446655440000"
+             :created "2024-06-01T12:00:00+00:00"
+             :roles ["admin" "user"]
+             :extra "dropped"}
+        decoded (b/decode schema raw (bt/json-api-transformer))]
+    (is (not (contains? decoded :extra)))
+    (is (uuid? (:id decoded)))
+    (is (true? (b/validate schema decoded)))
+    (is (= #{:admin :user} (:roles decoded)))
+    (is (= "550e8400-e29b-41d4-a716-446655440000"
+           (:id (b/encode schema decoded (bt/json-api-transformer)))))))
+
 ;; ---------------------------------------------------------------------------
 ;; composition: chain order (decode) vs reversal (leave-phase encode)
 

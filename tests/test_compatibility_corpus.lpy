@@ -25,7 +25,19 @@
     :valid [1 "a" "b"] :invalid [1 "a" 2]}
    {:area "default branch"
     :schema [:map {:closed true} [:id :int] [:balli.core/default [:map-of :keyword :string]]]
-    :valid {:id 1 :extra "ok"} :invalid {:id 1 :extra 2}}])
+    :valid {:id 1 :extra "ok"} :invalid {:id 1 :extra 2}}
+   {:area "closed maps"
+    :schema [:map {:closed true} [:id :int]]
+    :valid {:id 1}
+    :invalid {:id 1 :extra true}}
+   {:area "named branches"
+    :schema [:orn [:id :int] [:name :string]]
+    :valid "Ada"
+    :invalid :Ada}
+   {:area "map-of"
+    :schema [:map-of :keyword :int]
+    :valid {:a 1 :b 2}
+    :invalid {:a "1"}}])
 
 (deftest compatibility-corpus-validates
   (doseq [{:keys [area schema valid invalid]} compatibility-cases]
@@ -45,6 +57,22 @@
                                             (bt/collection-transformer)))]
       (is (= {:age 42 :tags #{:a}} decoded))
       (is (map? (json-schema/transform schema)))))
+  (testing "integration transformer presets"
+    (let [env-schema [:map {:closed true} [:port :int] [:debug :boolean]]
+          env-value (b/decode env-schema {"port" "8080" "debug" "true"}
+                              (bt/env-transformer))
+          query-schema [:map {:closed true} [:limit :int] [:tags [:set :keyword]]]
+          query-value (b/decode query-schema {"limit" "10" "tags" ["a" "b"]}
+                                (bt/query-params-transformer))
+          json-schema [:map {:closed true} [:id :uuid] [:roles [:set :keyword]]]
+          json-value (b/decode json-schema
+                               {:id "550e8400-e29b-41d4-a716-446655440000"
+                                :roles ["admin"]
+                                :extra "dropped"}
+                               (bt/json-api-transformer))]
+      (is (true? (b/validate env-schema env-value)))
+      (is (true? (b/validate query-schema query-value)))
+      (is (true? (b/validate json-schema json-value)))))
   (testing "generation and destructuring"
     (let [schema [:map [:id :int] [:profile [:map [:name :string]]]]
           value {:id 1 :profile {:name "Ada"}}
