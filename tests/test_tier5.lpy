@@ -68,7 +68,12 @@
                         {:locale :es})))
     (is (= ["bad: :balli.core/invalid-type"]
            (be/humanize
-            (b/explain [:int {:error/fn (fn [e _opts] (str "bad: " (:type e)))}] "x"))))))
+            (b/explain [:int {:error/fn (fn [e _opts] (str "bad: " (:type e)))}] "x"))))
+    (is (= ["[tipo invalido]"]
+           (be/humanize
+            (b/explain :int "x")
+            {:locale :es
+             :format-message (fn [msg _e _opts] (str "[" msg "]"))})))))
 
 (deftest safe-serialization
   (serial/register-function! :tier5/posish posish?)
@@ -271,7 +276,14 @@
              (be/humanize
               (b/explain type bad)
               {:locale locale
-               :messages {:balli.core/invalid-type "caller"}}))))))
+               :messages {:balli.core/invalid-type "caller"}})))
+      (is (= [(str "code=" (name :balli.core/invalid-type) ":caller")]
+             (be/humanize
+              (b/explain type bad)
+              {:locale locale
+               :messages {:balli.core/invalid-type "caller"}
+               :format-message (fn [msg error _opts]
+                                 (str "code=" (name (:type error)) ":" msg))}))))))
 
 (deftest tier5-fuzz-serialization-nested-schemas
   (serial/register-function! :tier5/posish posish?)

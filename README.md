@@ -636,6 +636,17 @@ Refs become `$ref` pointers with a top-level `"definitions"` map (recursion term
 ;; => {:nam ["should be spelled :name"]}
 ```
 
+`humanize` also accepts caller-level message customization. `:messages`
+overrides messages by error type, `:locale` selects built-in or schema-level
+localized messages, and `:format-message` post-processes every final message:
+
+```clojure
+(be/humanize (b/explain :int "x")
+             {:format-message (fn [msg error _opts]
+                                (str (name (:type error)) ": " msg))})
+;; => ["invalid-type: should be an integer"]
+```
+
 `be/levenshtein` (the underlying edit distance) is public too: `(be/levenshtein "nam" "name")` → `1`.
 
 ## Parsing
@@ -839,7 +850,7 @@ Maps with many distinct keys but uniform key/value shapes become `[:map-of k v]`
 | Function | Description |
 |---|---|
 | `balli.json-schema/transform` | `(transform s opts?)` — JSON Schema as a string-keyed map, `"definitions"` when refs are reached. |
-| `balli.error/humanize` | `(humanize explain-map)` — messages mirroring the value shape; nil in, nil out. |
+| `balli.error/humanize` | `(humanize explain-map opts?)` — messages mirroring the value shape; supports `:locale`, `:messages`, and `:format-message`; nil in, nil out. |
 | `balli.error/with-spell-checking` | `(with-spell-checking explain-map)` — rewrite extra-key/dispatch errors as misspellings. |
 | `balli.error/levenshtein` | `(levenshtein a b)` — edit distance. |
 | `balli.generator/generate` | `(generate s opts?)` — one value; `{:seed :size :registry}`. |

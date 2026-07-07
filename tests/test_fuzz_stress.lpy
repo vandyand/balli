@@ -290,6 +290,29 @@
                               [:tag {:optional (zero? (mod seed 3))} :keyword]]
                              key)))))))
 
+(deftest humanize-format-message-fuzz
+  (doseq [seed (range 40)]
+    (let [schema (case (mod seed 4)
+                   0 :int
+                   1 [:string {:min 3}]
+                   2 [:map [:id :int]]
+                   3 [:vector {:min 3} :int])
+          value (case (mod seed 4)
+                  0 "x"
+                  1 "x"
+                  2 {:id "x"}
+                  3 [1 "x"])
+          explained (b/explain schema value)
+          base (be/humanize explained)
+          formatted (be/humanize
+                     explained
+                     {:format-message
+                      (fn [msg error _opts]
+                        (str (name (:type error)) "|" msg))})]
+      (is (some? formatted))
+      (is (not= formatted base))
+      (is (not= -1 (.find (str formatted) "|"))))))
+
 (deftest seqex-parse-unparse-fuzz
   (let [cases [[[:cat :int [:* :string]] [1 "a" "b"]]
                [[:catn [:n :int] [:tail [:* :string]]] [1 "a" "b"]]

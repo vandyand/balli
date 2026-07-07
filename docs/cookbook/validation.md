@@ -11,6 +11,12 @@
 
 (be/humanize (b/explain schema {:id "1" :name ""}))
 ;; => {:id ["should be an integer"], :name ["should be at least 1 characters"]}
+
+(be/humanize (b/explain schema {:id "1" :name ""})
+             {:format-message (fn [msg error _opts]
+                                (str (name (:type error)) ": " msg))})
+;; => {:id ["invalid-type: should be an integer"],
+;;     :name ["limits: should be at least 1 characters"]}
 ```
 
 Use `b/assert-valid` at boundaries where invalid data should throw.

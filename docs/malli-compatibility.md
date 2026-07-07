@@ -9,7 +9,7 @@ matrix tracks the major Malli feature families Balli intentionally covers.
 | Map syntax / schema AST | Supported via raw schema input, `balli.core/ast`, and `balli.core/from-ast` |
 | Lite syntax | Supported explicitly via `balli.lite/form` and `balli.lite/schema` |
 | Validation / explain / humanize | Supported |
-| Spell checking and custom messages | Supported |
+| Spell checking and custom messages | Supported, including schema messages, locale maps, caller overrides, and global message formatting |
 | Value transformation / coercion | Supported |
 | Integration transformer presets | Supported for env/config maps, query params, and JSON API payloads |
 | Parse / unparse | Supported |
