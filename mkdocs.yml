@@ -63,6 +63,7 @@ nav:
       - CI Evidence: compatibility-evidence.md
       - Research Notes: basilisp balli from malli.md
   - Benchmarks: benchmarks.md
+  - Reviewer Outreach: reviewer-outreach.md
   - Releases: releases.md
   - Deployment: deployment.md
   - Contributing: contributing.md

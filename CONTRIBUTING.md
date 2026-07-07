@@ -35,3 +35,9 @@ For Malli parity changes, update the tests and docs together:
 - `tests/test_fuzz_stress.lpy`
 - `docs/malli-compatibility.md`
 - `docs/compatibility-evidence.md`
+
+## Third-Party Review
+
+External review is part of Balli's parity work. The reviewer search plan lives
+in `docs/reviewer-outreach.md` and favors focused opt-in reviews over broad
+GitHub mention lists.
