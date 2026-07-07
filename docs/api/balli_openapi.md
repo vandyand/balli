@@ -1,5 +1,7 @@
 # `balli.openapi`
 
+OpenAPI 3 export helpers built on balli.json-schema. `schema` exports a Balli schema as an OpenAPI Schema Object, moving JSON Schema definitions under components/schemas and rewriting refs. `openapi` wraps schemas into a minimal OpenAPI document.
+
 ## `schema`
 
 Kind: `defn`

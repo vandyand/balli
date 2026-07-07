@@ -1,5 +1,7 @@
 # `balli.plantuml`
 
+PlantUML class-style schema visualization.
+
 ## `transform`
 
 Kind: `defn`

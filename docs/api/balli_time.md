@@ -1,64 +1,66 @@
 # `balli.time`
 
+Pure Python datetime helpers for Balli time schemas. This namespace is deliberately a leaf: no balli.* requires. Higher-level namespaces consume the `types` table for validation, transformation, generation, and JSON Schema wiring.
+
 ## `aware-datetime?`
 
 Kind: `defn`
 
-_No docstring._
+Return true for Python datetimes carrying tzinfo.
 
 ## `zoned-datetime?`
 
 Kind: `defn`
 
-_No docstring._
+Return true for aware datetimes backed by a zoneinfo.ZoneInfo timezone.
 
 ## `local-date-time?`
 
 Kind: `defn`
 
-_No docstring._
+Return true for naive Python datetimes.
 
 ## `local-date?`
 
 Kind: `defn`
 
-_No docstring._
+Return true for Python dates that are not datetimes.
 
 ## `local-time?`
 
 Kind: `defn`
 
-_No docstring._
+Return true for Python times without tzinfo.
 
 ## `offset-time?`
 
 Kind: `defn`
 
-_No docstring._
+Return true for Python times carrying tzinfo.
 
 ## `duration?`
 
 Kind: `defn`
 
-_No docstring._
+Return true for Python datetime.timedelta values.
 
 ## `period?`
 
 Kind: `defn`
 
-_No docstring._
+Return true for Balli period maps with integer :years/:months/:days keys.
 
 ## `zone-id?`
 
 Kind: `defn`
 
-_No docstring._
+Return true for strings accepted by Python zoneinfo.ZoneInfo.
 
 ## `zone-offset?`
 
 Kind: `defn`
 
-_No docstring._
+Return true for fixed-offset Python datetime.timezone values.
 
 ## `parse-duration`
 
@@ -76,7 +78,7 @@ Parse an ISO-8601 calendar period subset (PnYnMnD) into {:years y :months m :day
 
 Kind: `defn`
 
-_No docstring._
+Format a Balli period map as an ISO-8601 period string.
 
 ## `format-duration`
 
@@ -88,13 +90,13 @@ Format datetime.timedelta as a canonical ISO-8601 duration string. Weeks are can
 
 Kind: `defn`
 
-_No docstring._
+Parse Z, +HH, +HHMM, or +HH:MM into datetime.timezone.
 
 ## `format-zone-offset`
 
 Kind: `defn`
 
-_No docstring._
+Format a Python datetime.timezone value as Z or +/-HH:MM.
 
 ## `decode`
 
@@ -106,22 +108,22 @@ Decode a string for time schema `type`, returning nil on parse/type miss.
 
 Kind: `defn`
 
-_No docstring._
+Encode a time value for time schema `type` as a JSON-friendly string.
 
 ## `types`
 
 Kind: `def`
 
-_No docstring._
+Table of Balli time schema specs consumed by validators and transformers.
 
 ## `time-type?`
 
 Kind: `defn`
 
-_No docstring._
+Return true when `t` is a supported Balli time schema keyword.
 
 ## `type-spec`
 
 Kind: `defn`
 
-_No docstring._
+Return the internal time schema spec map for schema keyword `t`.

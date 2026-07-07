@@ -1,5 +1,7 @@
 # `balli.compile`
 
+AST -> compiled validator + explainer closures. Entry points: (compile-validator ast registry) -> 1-arg fn returning boolean (compile-explainer ast registry) -> fn [value path in] returning a vector of error maps {:path :in :schema <original-form-fragment> :value :type} (compile-parser ast registry) -> 1-arg fn returning the parsed value or the sentinel :balli.core/invalid (compile-unparser ast registry) -> exact inverse of the parser, same sentinel on mismatch Compilation walks the AST once, producing a closure tree — no per-call interpretation. Refs resolve eagerly at compile time (unresolved refs throw ex-info {:type :balli.core/unresolved-ref}) but their targets compile lazily through a per-compilation cache atom (fn indirection), so recursive schemas (Phase 5) terminate on finite data. Local {:registry ...} schema properties layer the registry per subtree (balli.registry/push-layer); ref caches are keyed [kw layer-token] so shadowed keywords never share compiled fns (see compile-ref).
+
 ## `regex-op?`
 
 Kind: `defn`
@@ -16,7 +18,7 @@ Matched-element count bounds for seqex AST node `ast`: {:min n :max m}, :max abs
 
 Kind: `def`
 
-_No docstring._
+Return true for callable values Balli can treat as functions.
 
 ## `compile-validator`
 

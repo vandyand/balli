@@ -13,16 +13,50 @@ nav:
       - Overview: cookbook/index.md
       - Validation and Errors: cookbook/validation.md
       - Coercion and Transforms: cookbook/coercion.md
+      - Web API Validation: cookbook/web-api.md
+      - Config Validation: cookbook/config.md
       - Registries: cookbook/registries.md
       - OpenAPI and JSON Schema: cookbook/openapi.md
+      - OpenAPI Export Workflow: cookbook/openapi-workflow.md
       - Generation and Testing: cookbook/generation.md
       - Function Instrumentation: cookbook/functions.md
   - Examples: examples.md
-  - API Reference: api/index.md
+  - API Reference:
+      - Overview: api/index.md
+      - balli.clj-kondo: api/balli_clj_kondo.md
+      - balli.compile: api/balli_compile.md
+      - balli.core: api/balli_core.md
+      - balli.describe: api/balli_describe.md
+      - balli.destructure: api/balli_destructure.md
+      - balli.dev: api/balli_dev.md
+      - balli.dot: api/balli_dot.md
+      - balli.edn: api/balli_edn.md
+      - balli.error: api/balli_error.md
+      - balli.extension: api/balli_extension.md
+      - balli.generator: api/balli_generator.md
+      - balli.json-schema: api/balli_json_schema.md
+      - balli.lite: api/balli_lite.md
+      - balli.normalize: api/balli_normalize.md
+      - balli.openapi: api/balli_openapi.md
+      - balli.plantuml: api/balli_plantuml.md
+      - balli.pretty: api/balli_pretty.md
+      - balli.provider: api/balli_provider.md
+      - balli.regex: api/balli_regex.md
+      - balli.registry: api/balli_registry.md
+      - balli.sci: api/balli_sci.md
+      - balli.serial: api/balli_serial.md
+      - balli.swagger: api/balli_swagger.md
+      - balli.time: api/balli_time.md
+      - balli.transform: api/balli_transform.md
+      - balli.util: api/balli_util.md
   - Compatibility:
+      - Balli vs Malli: malli-comparison.md
       - Malli Matrix: malli-compatibility.md
       - CI Evidence: compatibility-evidence.md
+      - Research Notes: basilisp balli from malli.md
   - Benchmarks: benchmarks.md
+  - Releases: releases.md
+  - Deployment: deployment.md
   - Contributing: contributing.md
 markdown_extensions:
   - toc:

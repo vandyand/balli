@@ -22,12 +22,14 @@
   nil)
 
 (defn uncapture-fail!
+  "Stop collecting failures and return the captured failure data."
   []
   (let [xs @failures]
     (reset! failures [])
     xs))
 
 (defn captured-failures
+  "Return the currently captured instrumentation failure data."
   []
   @failures)
 
@@ -62,6 +64,7 @@
    k))
 
 (defn unregister!
+  "Unregister instrumentation entry `k` and restore its original function."
   [k]
   (when-let [{:keys [atom original]} (get @entries k)]
     (reset! atom original))
@@ -69,6 +72,7 @@
   nil)
 
 (defn registered
+  "Return the set of registered instrumentation keys."
   []
   (set (keys @entries)))
 
@@ -97,5 +101,6 @@
   true)
 
 (defn running
+  "Return true when development instrumentation is currently active."
   []
   @running?)

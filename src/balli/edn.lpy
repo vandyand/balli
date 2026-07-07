@@ -5,9 +5,9 @@
   Malli module name and keeps executable code opt-in through named refs."
   (:require [balli.serial :as serial]))
 
-(def serialize serial/serialize)
-(def deserialize serial/deserialize)
-(def write-string serial/write-string)
-(def read-string serial/read-string)
-(def register-function! serial/register-function!)
-(def unregister-function! serial/unregister-function!)
+(def serialize "Alias for balli.serial/serialize." serial/serialize)
+(def deserialize "Alias for balli.serial/deserialize." serial/deserialize)
+(def write-string "Alias for balli.serial/write-string." serial/write-string)
+(def read-string "Alias for balli.serial/read-string." serial/read-string)
+(def register-function! "Alias for balli.serial/register-function!." serial/register-function!)
+(def unregister-function! "Alias for balli.serial/unregister-function!." serial/unregister-function!)

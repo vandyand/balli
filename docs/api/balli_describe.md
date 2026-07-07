@@ -1,7 +1,9 @@
 # `balli.describe`
 
+Small English schema descriptions.
+
 ## `describe`
 
 Kind: `defn`
 
-_No docstring._
+Return a compact English description for schema `s`.

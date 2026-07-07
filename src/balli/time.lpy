@@ -10,46 +10,55 @@
   (re/compile "^(-)?P(?:(\\d+(?:\\.\\d+)?)W)?(?:(\\d+(?:\\.\\d+)?)D)?(?:T(?:(\\d+(?:\\.\\d+)?)H)?(?:(\\d+(?:\\.\\d+)?)M)?(?:(\\d+(?:\\.\\d+)?)S)?)?$"))
 
 (defn aware-datetime?
+  "Return true for Python datetimes carrying tzinfo."
   [x]
   (and (isinstance x datetime/datetime)
        (some? (.-tzinfo x))))
 
 (defn zoned-datetime?
+  "Return true for aware datetimes backed by a zoneinfo.ZoneInfo timezone."
   [x]
   (and (aware-datetime? x)
        (isinstance (.-tzinfo x) zoneinfo/ZoneInfo)))
 
 (defn local-date-time?
+  "Return true for naive Python datetimes."
   [x]
   (and (isinstance x datetime/datetime)
        (nil? (.-tzinfo x))))
 
 (defn local-date?
+  "Return true for Python dates that are not datetimes."
   [x]
   (and (isinstance x datetime/date)
        (not (isinstance x datetime/datetime))))
 
 (defn local-time?
+  "Return true for Python times without tzinfo."
   [x]
   (and (isinstance x datetime/time)
        (nil? (.-tzinfo x))))
 
 (defn offset-time?
+  "Return true for Python times carrying tzinfo."
   [x]
   (and (isinstance x datetime/time)
        (some? (.-tzinfo x))))
 
 (defn duration?
+  "Return true for Python datetime.timedelta values."
   [x]
   (isinstance x datetime/timedelta))
 
 (defn period?
+  "Return true for Balli period maps with integer :years/:months/:days keys."
   [x]
   (and (map? x)
        (every? #{:years :months :days} (keys x))
        (every? int? (vals x))))
 
 (defn zone-id?
+  "Return true for strings accepted by Python zoneinfo.ZoneInfo."
   [x]
   (and (string? x)
        (try
@@ -58,6 +67,7 @@
          (catch python/Exception _ false))))
 
 (defn zone-offset?
+  "Return true for fixed-offset Python datetime.timezone values."
   [x]
   (isinstance x datetime/timezone))
 
@@ -114,6 +124,7 @@
 (declare trim-float)
 
 (defn format-period
+  "Format a Balli period map as an ISO-8601 period string."
   [p]
   (let [years (:years p 0)
         months (:months p 0)
@@ -203,6 +214,7 @@
   (re/compile "^(Z|[+-]\\d\\d(?::?\\d\\d)?)$"))
 
 (defn parse-zone-offset
+  "Parse Z, +HH, +HHMM, or +HH:MM into datetime.timezone."
   [s]
   (when (string? s)
     (when-let [m (.match offset-pattern s)]
@@ -218,6 +230,7 @@
              (datetime/timedelta ** :minutes (* sign (+ (* hours 60) minutes))))))))))
 
 (defn format-zone-offset
+  "Format a Python datetime.timezone value as Z or +/-HH:MM."
   [tz]
   (if (= tz datetime.timezone/utc)
     "Z"
@@ -250,6 +263,7 @@
       :time/zone-offset (parse-zone-offset s))))
 
 (defn encode
+  "Encode a time value for time schema `type` as a JSON-friendly string."
   [type v]
   (case type
     :time/duration (format-duration v)
@@ -260,6 +274,7 @@
     (.isoformat v)))
 
 (def types
+  "Table of Balli time schema specs consumed by validators and transformers."
   {:time/instant {:check aware-datetime?
                   :decode #(decode :time/instant %)
                   :encode #(encode :time/instant %)
@@ -332,9 +347,11 @@
                       :json-format "time-zone-offset"}})
 
 (defn time-type?
+  "Return true when `t` is a supported Balli time schema keyword."
   [t]
   (contains? types t))
 
 (defn type-spec
+  "Return the internal time schema spec map for schema keyword `t`."
   [t]
   (get types t))

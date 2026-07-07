@@ -14,6 +14,8 @@ Schemas are plain data in Malli's vector syntax, plus Malli-style map syntax / A
 - PyPI package: <https://pypi.org/project/balli/>
 - Hosted docs: <https://vandyand.github.io/balli/>
 - API reference: <https://vandyand.github.io/balli/api/>
+- Deployment status: [docs/deployment.md](docs/deployment.md)
+- Balli vs Malli: [docs/malli-comparison.md](docs/malli-comparison.md)
 - Compatibility matrix: [docs/malli-compatibility.md](docs/malli-compatibility.md)
 - Examples: [examples/](examples/)
 - Benchmarks: [benchmarks/](benchmarks/)

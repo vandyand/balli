@@ -1,5 +1,7 @@
 # `balli.normalize`
 
+Schema form -> AST normalization. Every AST node is a plain map: {:type <kw> :properties <map> :children <vector> :form <original form fragment>} :children is always a vector. :map, :multi, and :orn children are entry maps {:key k :properties p :schema <ast>}. A :map/:multi entry keyed :balli.core/default is split out of :children onto the node as :default-entry (same entry-map shape); :form keeps the original entry. :ref nodes additionally carry :ref <kw>. Nodes whose properties carry a {:registry {kw form}} local registry additionally carry :local-registry {kw form} (the prop kept verbatim in :properties/:form) — every compiling surface layers it over the effective registry for the subtree (balli.registry/push-layer). :balli/pred nodes (predicate schemas — AST-only type, never a form keyword) additionally carry :pred-key <symbol> and :pred <fn>. Comparator nodes (:> :>= :< :<= :not=) hold their single child as a plain VALUE, not a schema AST. Entry point: (normalize form opts) where opts may carry {:registry r}. Unknown/invalid forms throw ex-info with {:type :balli.core/invalid-schema}.
+
 ## `ast-syntax?`
 
 Kind: `defn`

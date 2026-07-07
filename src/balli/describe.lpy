@@ -41,6 +41,7 @@
       (str (:type node)))))
 
 (defn describe
+  "Return a compact English description for schema `s`."
   ([s] (describe s {}))
   ([s opts]
    (let [registry (if (b/schema? s)
