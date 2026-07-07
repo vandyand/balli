@@ -171,6 +171,81 @@
                             (map entry-triple))
                       (:children ast))))))
 
+(defn set-entry
+  "Set or append a :map entry `k` to schema `v`. `entry-props` defaults to
+  {}. Root map properties and existing entry order are preserved; new keys
+  append to the end. This is the non-shadowing Balli equivalent of
+  malli.util/assoc."
+  ([s k v] (set-entry s k v {} {}))
+  ([s k v entry-props] (set-entry s k v entry-props {}))
+  ([s k v entry-props opts]
+   (let [ast (map-ast s opts "set-entry")
+         seen? (atom false)
+         entries (mapv (fn [{:keys [key] :as e}]
+                         (if (= k key)
+                           (do
+                             (reset! seen? true)
+                             [k entry-props v])
+                           (entry-triple e)))
+                       (:children ast))
+         entries (if @seen? entries (conj entries [k entry-props v]))]
+     (map->form (:properties ast) entries))))
+
+(defn update-entry
+  "Update the value schema of :map entry `k` with `(f current-form & args)`.
+  Throws when `k` is absent. Entry/root properties and order are preserved."
+  ([s k f] (update-entry s k f {}))
+  ([s k f opts & args]
+   (let [ast (map-ast s opts "update-entry")
+         found? (atom false)
+         entries (mapv (fn [{:keys [key properties schema] :as e}]
+                         (if (= k key)
+                           (do
+                             (reset! found? true)
+                             [key properties (apply f (:form schema) args)])
+                           (entry-triple e)))
+                       (:children ast))]
+     (when-not @found?
+       (throw (ex-info "update-entry key not found"
+                       {:type :balli.core/invalid-schema :key k :form (:form ast)})))
+     (map->form (:properties ast) entries))))
+
+(defn rename-keys
+  "Rename :map entries according to `kmap` while preserving entry order and
+  metadata. Later collisions keep the later rewritten entry."
+  ([s kmap] (rename-keys s kmap {}))
+  ([s kmap opts]
+   (let [ast (map-ast s opts "rename-keys")
+         triples (map (fn [{:keys [key] :as e}]
+                        (let [[_ props v] (entry-triple e)]
+                          [(core-get kmap key key) props v]))
+                      (:children ast))
+         deduped (reduce (fn [acc [k props v]]
+                           (conj (vec (remove #(= k (first %)) acc))
+                                 [k props v]))
+                         []
+                         triples)]
+     (map->form (:properties ast) deduped))))
+
+(defn transform-entries
+  "Apply `(f entry-map)` to every :map entry and rebuild the schema. `f`
+  should return {:key k :properties props :schema form}; nil drops the entry."
+  ([s f] (transform-entries s f {}))
+  ([s f opts]
+   (let [ast (map-ast s opts "transform-entries")]
+     (map->form
+      (:properties ast)
+      (into []
+            (comp (map (fn [{:keys [key properties schema]}]
+                         (f {:key key
+                             :properties properties
+                             :schema (:form schema)
+                             :optional (boolean (:optional properties))})))
+                  (remove nil?)
+                  (map (fn [{:keys [key properties schema]}]
+                         [key (or properties {}) schema])))
+            (:children ast))))))
+
 (defn- set-requiredness
   [s ks opts fname optional?]
   (let [ast (map-ast s opts fname)

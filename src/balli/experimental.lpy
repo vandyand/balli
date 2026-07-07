@@ -1,0 +1,55 @@
+(ns balli.experimental
+  "Experimental Balli helpers for Malli-adjacent schema analysis.
+
+  These APIs are intentionally small and data-only. They avoid Clojure/JVM
+  runtime dependencies while giving Basilisp users practical equivalents for
+  common malli.experimental-style workflows."
+  (:require [balli.core :as b]
+            [balli.normalize :as norm]
+            [balli.registry :as reg]))
+
+(defn- ->ast
+  [s opts]
+  (if (b/schema? s)
+    (:ast s)
+    (norm/normalize s {:registry (or (:registry opts) (reg/default-registry))})))
+
+(defn paths
+  "Return every schema path in `s` using Balli/Malli path conventions."
+  ([s] (paths s {}))
+  ([s opts]
+   (let [out (atom [])]
+     (b/walk s (fn [form path]
+                 (swap! out conj {:path path :schema form})
+                 form)
+             opts)
+     @out)))
+
+(defn leaf-paths
+  "Return path metadata for schemas with no child schemas."
+  ([s] (leaf-paths s {}))
+  ([s opts]
+   (into []
+         (filter (fn [{:keys [schema path]}]
+                   (let [ast (->ast schema opts)]
+                     (or (empty? (:children ast))
+                         (contains? #{:enum := :fn :re :balli/pred :> :>= :< :<= :not=}
+                                    (:type ast))))))
+         (paths s opts))))
+
+(defn coverage
+  "Summarize schema shape for docs/tests/tooling."
+  ([s] (coverage s {}))
+  ([s opts]
+   (let [counts (atom {})
+         max-depth (atom 0)]
+     (doseq [{:keys [path schema]} (paths s opts)]
+       (let [ast (->ast schema opts)
+             t (:type ast)]
+         (swap! counts update t (fnil inc 0))
+         (reset! max-depth (max @max-depth (count path)))))
+     {:types @counts
+      :paths (count (paths s opts))
+      :leaf-paths (count (leaf-paths s opts))
+      :max-depth @max-depth})))
+

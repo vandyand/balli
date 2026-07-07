@@ -76,7 +76,7 @@
             [balli.registry :as reg]
             [balli.time :as bt]))
 
-(declare gen generate sample shrink)
+(declare gen generate sample shrink make-rnd generate* sample* shrink*)
 
 (defn- layered-registry
   "Registry for descending into `ast`: its :local-registry (when present)
@@ -576,6 +576,59 @@
     :sample (fn [opts*] (sample s (merge opts opts*)))
     :shrink (fn [value opts*] (shrink s value (merge opts opts*)))}))
 
+(defn generator-from
+  "Return a Balli generator object from functions. `generate-fn` receives opts
+  and returns a value. Optional `sample-fn` and `shrink-fn` override default
+  repeated generation and no-op shrinking. This is the Balli-native adapter
+  point for generator ecosystems outside Clojure test.check."
+  ([generate-fn] (generator-from generate-fn nil nil))
+  ([generate-fn sample-fn shrink-fn]
+   {:balli/generator true
+    :generate generate-fn
+    :sample (or sample-fn
+                (fn [opts]
+                  (mapv (fn [_] (generate-fn opts))
+                        (range (or (:size opts) 10)))))
+    :shrink (or shrink-fn (fn [_value _opts] []))}))
+
+(defn return
+  "Generator object that always returns `value`."
+  [value]
+  (generator-from (fn [_opts] value)))
+
+(defn elements
+  "Generator object that picks one value from `xs` using opts :seed when
+  present."
+  [xs]
+  (let [xs (vec xs)]
+    (generator-from
+     (fn [opts]
+       (let [rnd (make-rnd opts)]
+         (.choice rnd xs))))))
+
+(defn fmap
+  "Map `f` over a generator object or raw schema form."
+  [f g]
+  (generator-from
+   (fn [opts] (f (generate* g opts)))
+   (fn [opts] (mapv f (sample* g opts)))
+   (fn [value opts]
+     (into []
+           (keep (fn [candidate]
+                   (try
+                     (f candidate)
+                     (catch python/Exception _ nil))))
+           (shrink* g value opts)))))
+
+(defn bind
+  "Monadic bind for Balli generator objects. `(f generated-value)` must return
+  a generator object or raw schema form."
+  [g f]
+  (generator-from
+   (fn [opts]
+     (let [v (generate* g opts)]
+       (generate* (f v) opts)))))
+
 (defn generate*
   "Run a Balli generator object or a raw schema form."
   ([g] (generate* g {}))
@@ -714,6 +767,18 @@
      (if pred
        (vec (filter pred candidates))
        candidates))))
+
+(defn shrink-trace
+  "Greedily shrink `value`, returning every accepted step. With
+  `:predicate`, only candidates preserving the predicate are accepted."
+  ([s value] (shrink-trace s value {}))
+  ([s value opts]
+   (loop [cur value
+          trace [value]]
+     (let [candidates (shrink s cur opts)]
+       (if-let [next (first (remove #(= cur %) candidates))]
+         (recur next (conj trace next))
+         trace)))))
 
 ;; ---------------------------------------------------------------------------
 ;; function-checker (generative :=>/:function validation, Phase 8)

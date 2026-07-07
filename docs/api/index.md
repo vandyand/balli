@@ -11,8 +11,11 @@ Generated from `src/balli/*.lpy`.
 - [`balli.dot`](balli_dot.md) - Graphviz DOT export for Balli schemas.
 - [`balli.edn`](balli_edn.md) - EDN-style schema persistence wrappers
 - [`balli.error`](balli_error.md) - Humanized error messages for balli explain maps
+- [`balli.experimental`](balli_experimental.md) - Experimental Balli helpers for Malli-adjacent schema analysis
 - [`balli.extension`](balli_extension.md) - Custom schema type extension registry
 - [`balli.generator`](balli_generator.md) - Schema-driven value generation (Phase 7, malli-semantics section H)
+- [`balli.inspect`](balli_inspect.md) - Static inspection helpers for Balli schemas
+- [`balli.integrations`](balli_integrations.md) - Python ecosystem adapters for Balli schemas
 - [`balli.json-schema`](balli_json_schema.md) - Schema -> JSON Schema export (Malli's malli.json-schema)
 - [`balli.lite`](balli_lite.md) - Small data-spec-style schema shorthand
 - [`balli.normalize`](balli_normalize.md) - Schema form -> AST normalization

@@ -26,6 +26,30 @@ Kind: `defn`
 
 Remove the :map entry of `s` keyed `k`.
 
+## `set-entry`
+
+Kind: `defn`
+
+Set or append a :map entry `k` to schema `v`. `entry-props` defaults to {}. Root map properties and existing entry order are preserved; new keys append to the end. This is the non-shadowing Balli equivalent of malli.util/assoc.
+
+## `update-entry`
+
+Kind: `defn`
+
+Update the value schema of :map entry `k` with `(f current-form & args)`. Throws when `k` is absent. Entry/root properties and order are preserved.
+
+## `rename-keys`
+
+Kind: `defn`
+
+Rename :map entries according to `kmap` while preserving entry order and metadata. Later collisions keep the later rewritten entry.
+
+## `transform-entries`
+
+Kind: `defn`
+
+Apply `(f entry-map)` to every :map entry and rebuild the schema. `f` should return {:key k :properties props :schema form}; nil drops the entry.
+
 ## `optional-keys`
 
 Kind: `defn`

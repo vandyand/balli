@@ -14,6 +14,36 @@ Kind: `defn`
 
 Return a small generator object for schema `s`. The object is data and can be stored in :gen/gen; use `generate*`, `sample*`, or `shrink*` to run it.
 
+## `generator-from`
+
+Kind: `defn`
+
+Return a Balli generator object from functions. `generate-fn` receives opts and returns a value. Optional `sample-fn` and `shrink-fn` override default repeated generation and no-op shrinking. This is the Balli-native adapter point for generator ecosystems outside Clojure test.check.
+
+## `return`
+
+Kind: `defn`
+
+Generator object that always returns `value`.
+
+## `elements`
+
+Kind: `defn`
+
+Generator object that picks one value from `xs` using opts :seed when present.
+
+## `fmap`
+
+Kind: `defn`
+
+Map `f` over a generator object or raw schema form.
+
+## `bind`
+
+Kind: `defn`
+
+Monadic bind for Balli generator objects. `(f generated-value)` must return a generator object or raw schema form.
+
 ## `generate*`
 
 Kind: `defn`
@@ -49,6 +79,12 @@ Vector of generated values for schema `s`. `opts` supports {:seed n :size n :reg
 Kind: `defn`
 
 Return schema-valid smaller candidates for `value`. With `:predicate`, only candidates for which predicate returns truthy are kept; this models shrinking a failing generated case while preserving the failure.
+
+## `shrink-trace`
+
+Kind: `defn`
+
+Greedily shrink `value`, returning every accepted step. With `:predicate`, only candidates preserving the predicate are accepted.
 
 ## `function-checker`
 

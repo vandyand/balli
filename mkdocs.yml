@@ -35,8 +35,11 @@ nav:
       - balli.dot: api/balli_dot.md
       - balli.edn: api/balli_edn.md
       - balli.error: api/balli_error.md
+      - balli.experimental: api/balli_experimental.md
       - balli.extension: api/balli_extension.md
       - balli.generator: api/balli_generator.md
+      - balli.inspect: api/balli_inspect.md
+      - balli.integrations: api/balli_integrations.md
       - balli.json-schema: api/balli_json_schema.md
       - balli.lite: api/balli_lite.md
       - balli.normalize: api/balli_normalize.md

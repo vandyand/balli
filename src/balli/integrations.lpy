@@ -1,0 +1,64 @@
+(ns balli.integrations
+  "Python ecosystem adapters for Balli schemas.
+
+  These helpers keep Balli's core plain-data model while making common Python
+  boundaries easier to validate."
+  (:import dataclasses typing)
+  (:require [balli.core :as b]))
+
+(def ^:private annotation-schemas
+  {python/int :int
+   python/str :string
+   python/float :double
+   python/bool :boolean
+   python/dict [:map-of :any :any]
+   python/list [:vector :any]
+   python/tuple [:vector :any]
+   python/set [:set :any]})
+
+(defn annotation-schema
+  "Best-effort Balli schema for a Python type annotation."
+  [ann]
+  (let [origin (typing/get_origin ann)
+        args (vec (or (typing/get_args ann) []))]
+    (cond
+      (contains? annotation-schemas ann) (get annotation-schemas ann)
+      (= origin python/list) [:vector (annotation-schema (first args))]
+      (= origin python/set) [:set (annotation-schema (first args))]
+      (= origin python/dict) [:map-of (annotation-schema (first args))
+                              (annotation-schema (second args))]
+      (= origin python/tuple) (into [:tuple] (map annotation-schema) args)
+      :else :any)))
+
+(defn dataclass-schema
+  "Infer a closed Balli :map schema from a Python dataclass class."
+  [cls]
+  (when-not (dataclasses/is_dataclass cls)
+    (throw (ex-info "dataclass-schema expects a Python dataclass"
+                    {:type :balli.integrations/not-dataclass
+                     :class cls})))
+  (into [:map {:closed true}]
+        (map (fn [field]
+               (let [k (keyword (.-name field))
+                     s (annotation-schema (.-type field))
+                     required? (and (= (.-default field) dataclasses/MISSING)
+                                    (= (.-default_factory field) dataclasses/MISSING))]
+                 (if required?
+                   [k s]
+                   [k {:optional true} s]))))
+        (dataclasses/fields cls)))
+
+(defn validator
+  "Return a Python-callable validator for schema `s`."
+  ([s] (validator s {}))
+  ([s opts]
+   (let [vf (b/validator s opts)]
+     (fn [value] (vf value)))))
+
+(defn assert-valid
+  "Validate `value` at a Python boundary and return it, throwing on failure."
+  ([s value] (assert-valid s value {}))
+  ([s value opts]
+   (b/assert-valid s value opts)
+   value))
+
