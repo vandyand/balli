@@ -2,13 +2,14 @@
 
 ## From PyPI
 
-Once a release is published, install Balli with:
+Install the latest published release from PyPI:
 
 ```bash
 python -m pip install balli
 ```
 
-Balli depends on Basilisp and declares that dependency in `pyproject.toml`.
+Balli is published at <https://pypi.org/project/balli/> and depends on
+Basilisp. The Basilisp dependency is declared in `pyproject.toml`.
 
 ## From Source
 
