@@ -11,6 +11,7 @@ Runnable examples live in the repository `examples/` directory.
 | `examples/json_api_handler.lpy` | Validate a JSON API-style handler boundary and export OpenAPI response data |
 | `examples/openapi_export.lpy` | Generate OpenAPI/JSON Schema data |
 | `examples/test_data_generation.lpy` | Generate deterministic sample data |
+| `examples/parity_tooling.lpy` | Exercise provider reports, coercion diagnostics, schema diffs, generated checks, and static risk reports |
 
 Run an example with:
 

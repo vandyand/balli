@@ -53,3 +53,72 @@
       :leaf-paths (count (leaf-paths s opts))
       :max-depth @max-depth})))
 
+(defn refs
+  "Return refs mentioned directly in schema `s`, without dereferencing them."
+  ([s] (refs s {}))
+  ([s opts]
+   (let [out (atom #{})]
+     (b/walk s
+             (fn [form _path]
+               (when (keyword? form)
+                 (swap! out conj form))
+               (when (and (vector? form) (= :ref (first form)))
+                 (swap! out conj (last form)))
+               form)
+             opts)
+     (vec @out))))
+
+(defn dependency-graph
+  "Return {registry-key #{referenced-registry-keys}} for a registry map or a
+  Balli registry object. Non-keyword inline type forms are ignored."
+  ([registry] (dependency-graph registry {}))
+  ([registry opts]
+   (let [schemas (or (:schemas registry) registry)]
+     (into {}
+           (map (fn [[k schema]]
+                  [k (set (filter #(contains? schemas %)
+                                  (refs schema (assoc opts :registry
+                                                     (reg/registry schemas)))))]))
+           schemas))))
+
+(defn migration-impact
+  "Classify a schema change using a conservative path diff. Returns
+  :unchanged, :additive, :breaking, or :changed. Removed paths are breaking;
+  added paths are additive; changed existing paths are classified as changed."
+  ([old-schema new-schema] (migration-impact old-schema new-schema {}))
+  ([old-schema new-schema opts]
+   (let [old-map (into {} (map (fn [{:keys [path schema]}] [path schema]))
+                       (leaf-paths old-schema opts))
+         new-map (into {} (map (fn [{:keys [path schema]}] [path schema]))
+                       (leaf-paths new-schema opts))
+         old-paths (set (keys old-map))
+         new-paths (set (keys new-map))
+         removed (seq (remove new-paths old-paths))
+         added (seq (remove old-paths new-paths))
+         changed (seq (filter (fn [p] (not= (get old-map p) (get new-map p)))
+                              (filter new-paths old-paths)))]
+     (cond
+       removed :breaking
+       changed :changed
+       added :additive
+       :else :unchanged))))
+
+(defn risk-report
+  "Return conservative static risk flags for schema `s`. This does not execute
+  user predicates; it highlights shapes that often deserve extra tests."
+  ([s] (risk-report s {}))
+  ([s opts]
+   (let [items (atom [])]
+     (doseq [{:keys [path schema]} (paths s opts)]
+       (let [ast (->ast schema opts)
+             t (:type ast)]
+         (when (= :balli/pred t)
+           (swap! items conj {:path path :risk :custom-predicate :schema schema}))
+         (when (= :ref t)
+           (swap! items conj {:path path :risk :registry-ref :schema schema}))
+         (when (contains? #{:or :orn :multi} t)
+           (swap! items conj {:path path :risk :branching :schema schema}))
+         (when (and (= :map t) (not (:closed (:properties ast))))
+           (swap! items conj {:path path :risk :open-map :schema schema}))))
+     {:risks @items
+      :risk-count (count @items)})))

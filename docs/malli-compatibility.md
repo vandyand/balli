@@ -11,19 +11,21 @@ Basilisp/Python diverge from Clojure/JVM.
 | Lite syntax | Supported explicitly via `balli.lite/form` and `balli.lite/schema` |
 | Validation / explain / humanize | Supported |
 | Spell checking and custom messages | Supported, including schema messages, locale maps, caller overrides, and global message formatting |
-| Value transformation / coercion | Supported |
+| Value transformation / coercion | Supported, including non-throwing reports and roundtrip checks |
 | Integration transformer presets | Supported for env/config maps, query params, and JSON API payloads |
 | Parse / unparse | Supported |
 | Sequence regex schemas | Supported |
 | `:seqable` / `:every` | Supported, including bounded-prefix `:every` checks |
-| Function schemas / instrumentation | Supported, including `:->`, `:=>`, and `:function` |
+| Function schemas / instrumentation | Supported, including `:->`, `:=>`, `:function`, wrapper ergonomics, and contract metadata |
 | Generative function checking | Supported |
 | Value generation / sampling | Supported |
 | Reusable generator objects | Supported via `balli.generator/generator` and `:gen/gen` |
 | Generator combinators | Supported via Balli-native generator objects (`return`, `elements`, `fmap`, `bind`) |
+| Generator property checks | Supported via `balli.generator/check` and `check-roundtrip` reports |
 | Shrinking | Heuristic Balli shrinker with `shrink-trace`; not Clojure test.check shrinking |
 | Provider inference | Supported |
 | Provider closed-map/common-key inference | Supported via `{:closed-maps true}` and `{:optional-threshold f}` metadata |
+| Provider fit reports | Supported via `balli.provider/provide-report` |
 | Destructuring | Supported via `balli.destructure` |
 | Immutable/custom registries | Supported |
 | Mutable default registry | Supported |
@@ -37,9 +39,10 @@ Basilisp/Python diverge from Clojure/JVM.
 | English descriptions | Supported |
 | `malli.util`-style map introspection | Supported via `entries`, `keys`, `required-key?`, and `optional-key?` |
 | `malli.util`-style map surgery | Supported via `set-entry`, `update-entry`, `rename-keys`, and `transform-entries` |
+| `malli.util`-style path utilities | Supported via `path-map`, `update-at`, and `diff` |
 | EDN schema persistence | Supported safely via named function refs |
-| Experimental schema analysis | Balli-native data-only helpers via `balli.experimental` |
-| Python ecosystem integrations | Supported at adapter boundaries via `balli.integrations` |
+| Experimental schema analysis | Balli-native data-only helpers via `balli.experimental`, including dependency graphs, migration impact, and risk reports |
+| Python ecosystem integrations | Supported at adapter boundaries via `balli.integrations`, including callable validators and coercers |
 | Static schema inspection | Supported via `balli.inspect` |
 | SCI integration | Data-only host context via `balli.sci`; no Clojure SCI runtime |
 | clj-kondo / static analyzer integration | Data export via `balli.clj-kondo`; no Clojure analyzer runtime |

@@ -33,6 +33,12 @@ jobs:
         run: scripts/test.sh
       - name: Build wheel
         run: python -m build --wheel
+      - name: Smoke installed wheel
+        run: |
+          python -m venv /tmp/balli-wheel-smoke
+          /tmp/balli-wheel-smoke/bin/python -m pip install --upgrade pip
+          /tmp/balli-wheel-smoke/bin/python -m pip install dist/*.whl pytest
+          /tmp/balli-wheel-smoke/bin/basilisp test tests/test_user_suite.lpy
       - name: Check whitespace
         run: git diff --check
 

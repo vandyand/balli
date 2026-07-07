@@ -23,12 +23,21 @@
                 'from-ast b/from-ast
                 'validate b/validate
                 'explain b/explain
+                'coercion-report b/coercion-report
+                'coerce? b/coerce?
+                'roundtrip? b/roundtrip?
+                'wrap-function b/wrap-function
+                'function-contract b/function-contract
                 'parse b/parse
                 'unparse b/unparse}
    'balli.error {'humanize error/humanize}
    'balli.experimental {'paths experimental/paths
                         'leaf-paths experimental/leaf-paths
-                        'coverage experimental/coverage}
+                        'coverage experimental/coverage
+                        'refs experimental/refs
+                        'dependency-graph experimental/dependency-graph
+                        'migration-impact experimental/migration-impact
+                        'risk-report experimental/risk-report}
    'balli.generator {'generate gen/generate
                      'sample gen/sample
                      'generator gen/generator
@@ -37,12 +46,16 @@
                      'elements gen/elements
                      'fmap gen/fmap
                      'bind gen/bind
-                     'shrink-trace gen/shrink-trace}
+                     'shrink-trace gen/shrink-trace
+                     'check gen/check
+                     'check-roundtrip gen/check-roundtrip}
    'balli.inspect {'problems inspect/problems
                    'valid-schema? inspect/valid-schema?
                    'report inspect/report}
    'balli.integrations {'annotation-schema integrations/annotation-schema
                         'validator integrations/validator
+                        'coercer integrations/coercer
+                        'coercion-report integrations/coercion-report
                         'assert-valid integrations/assert-valid}
    'balli.json-schema {'transform json-schema/transform}
    'balli.registry {'registry registry/registry
@@ -58,7 +71,10 @@
    'balli.util {'set-entry util/set-entry
                 'update-entry util/update-entry
                 'rename-keys util/rename-keys
-                'transform-entries util/transform-entries}
+                'transform-entries util/transform-entries
+                'path-map util/path-map
+                'update-at util/update-at
+                'diff util/diff}
    'balli.edn {'write-string edn/write-string
                'read-string edn/read-string}})
 

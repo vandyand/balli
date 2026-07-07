@@ -55,10 +55,24 @@
    (let [vf (b/validator s opts)]
      (fn [value] (vf value)))))
 
+(defn coercer
+  "Return a Python-callable coercer for schema `s` and transformer `t`.
+  The callable decodes, validates, and returns the decoded value or raises
+  Balli's coercion ex-info."
+  ([s t] (coercer s t {}))
+  ([s t opts]
+   (let [cf (b/coercer s t opts)]
+     (fn [value] (cf value)))))
+
+(defn coercion-report
+  "Return Balli's non-throwing coercion report at a Python boundary."
+  ([s value t] (coercion-report s value t {}))
+  ([s value t opts]
+   (b/coercion-report s value t opts)))
+
 (defn assert-valid
   "Validate `value` at a Python boundary and return it, throwing on failure."
   ([s value] (assert-valid s value {}))
   ([s value opts]
    (b/assert-valid s value opts)
    value))
-

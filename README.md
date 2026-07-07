@@ -815,6 +815,7 @@ Maps with many distinct keys but uniform key/value shapes become `[:map-of k v]`
 | `decoder` / `decode` | `(decoder s t opts?)` / `(decode s value t opts?)` | Transform toward the schema with transformer `t`; lenient (mismatches pass through). |
 | `encoder` / `encode` | `(encoder s t opts?)` / `(encode s value t opts?)` | Transform away from the schema; lenient. |
 | `coercer` / `coerce` | `(coercer s t opts?)` / `(coerce s value t opts?)` | Decode then validate; returns the decoded value or throws `:balli.core/coercion`. |
+| `coercion-report` / `coerce?` / `roundtrip?` | Non-throwing coercion diagnostics, coercibility predicate, and encode/decode roundtrip checks. |
 | `parser` / `parse` | `(parser s opts?)` / `(parse s value opts?)` | Value → parsed value or `:balli.core/invalid`; `Tag`/`Tags` for named branches. |
 | `unparser` / `unparse` | `(unparser s opts?)` / `(unparse s value opts?)` | Exact inverse of `parse`; same sentinel. |
 | `tag` / `tag?` | `(tag k v)` / `(tag? x)` | Construct/detect the `Tag` parse container (`:orn`/`:multi`/`:altn`). |
@@ -822,8 +823,9 @@ Maps with many distinct keys but uniform key/value shapes become `[:map-of k v]`
 | `invalid?` | `(invalid? x)` | True when `x` is the parse failure sentinel (`=`-compared). |
 | `walk` | `(walk s f opts?)` | Form-level postwalk; `f` is `(fn [rebuilt-form path] form')`. |
 | `schema-walker` | `(schema-walker f)` | Adapt a 1-arg form fn for `walk`. |
-| `function-info` | `(function-info s opts?)` | `{:min :max? :arity :input :output :guard?}` for a `:=>` schema; nil otherwise. |
+| `function-info` / `function-contract` | Function arity/contract metadata for `:=>` and `:function` schemas. |
 | `instrument` | `(instrument props f)` | Wrap `f` per `{:schema s :scope #{:input :output} :report rf}` — typed failures per call. |
+| `wrap-function` | `(wrap-function s f opts?)` | Ergonomic function instrumentation wrapper around `instrument`. |
 | `version` | var | The library version string. |
 
 ### `balli.transform`
@@ -843,6 +845,7 @@ Maps with many distinct keys but uniform key/value shapes become `[:map-of k v]`
 | `optional-keys` / `required-keys` | Set / clear `:optional` on entries (all, or a key seq). |
 | `set-entry` / `update-entry` / `rename-keys` / `transform-entries` | Malli-style map entry surgery without shadowing core `assoc`/`update`. |
 | `entries` / `keys` / `required-key?` / `optional-key?` | Inspect `:map` entries and requiredness. |
+| `path-map` / `update-at` / `diff` | Path-indexed schema inspection, nested schema rewrites, and path-level schema diffs. |
 | `closed-schema` / `open-schema` | Recursively add / remove `{:closed true}` (explicit `{:closed false}` is respected). |
 | `get` / `get-in` | Sub-schema form by entry key or child index; nil when absent. |
 
@@ -859,9 +862,10 @@ Maps with many distinct keys but uniform key/value shapes become `[:map-of k v]`
 | `balli.generator/generator` / `generate*` / `sample*` / `shrink*` | Reusable data generator objects, accepted by `:gen/gen`. |
 | `balli.generator/generator-from` / `return` / `elements` / `fmap` / `bind` | Balli-native generator object combinators for non-test.check ecosystems. |
 | `balli.generator/shrink` / `shrink-trace` | Smaller valid candidates for a value; `{:predicate f}` keeps only still-failing values. |
+| `balli.generator/check` / `check-roundtrip` | Small property-check reports for generated values and transformer roundtrips. |
 | `balli.generator/function-checker` | `(function-checker opts?)` — generative `:=>`/`:function` checker; `{:iterations n}` (default 100). |
-| `balli.experimental/paths` / `leaf-paths` / `coverage` | Data-only experimental schema analysis helpers. |
-| `balli.integrations/annotation-schema` / `dataclass-schema` / `validator` / `assert-valid` | Python boundary adapters that keep Balli schemas as plain data. |
+| `balli.experimental/paths` / `leaf-paths` / `coverage` / `refs` / `dependency-graph` / `migration-impact` / `risk-report` | Data-only experimental schema analysis helpers. |
+| `balli.integrations/annotation-schema` / `dataclass-schema` / `validator` / `coercer` / `coercion-report` / `assert-valid` | Python boundary adapters that keep Balli schemas as plain data. |
 | `balli.inspect/problems` / `valid-schema?` / `report` | Static inspection helpers for malformed schemas, unresolved refs, and export smoke checks. |
 | `balli.openapi/schema` / `openapi` / `request-body` / `response` / `parameter` | Export OpenAPI 3 schema objects, minimal documents, and operation fragments. |
 | `balli.swagger/schema` / `swagger` / `parameter` / `response` | Export Swagger 2 schema objects, minimal documents, and operation fragments. |
@@ -877,7 +881,7 @@ Maps with many distinct keys but uniform key/value shapes become `[:map-of k v]`
 | `balli.dev/register!` / `unregister!` / `start!` / `stop!` / `running` / `capture-fail!` / `captured-failures` | Explicit development instrumentation for atoms holding functions. |
 | `balli.clj-kondo/function-config` / `lint-config` | Static-analysis metadata for function schemas. |
 | `balli.sci/sci-context` | Data-only namespace map for embedding Balli public functions in restricted evaluators. |
-| `balli.provider/provide` | `(provide samples opts?)` — infer a schema form; supports map-of, enum, tuple, closed-map, common-key metadata, and map-of disable knobs. |
+| `balli.provider/provide` / `provide-report` | Infer a schema form and optionally return sample-fit evidence; supports map-of, enum, tuple, closed-map, common-key metadata, and map-of disable knobs. |
 | `balli.registry/registry` | `(registry & schema-maps)` — layer `{qualified-kw form}` maps over the default registry. |
 | `balli.registry/lazy-registry` | `(lazy-registry provider)` / `(lazy-registry base provider)` — provider-on-miss registry with memoized forms. |
 | `balli.registry/dynamic-registry` | `(dynamic-registry source)` — read an atom/fn source at raw-form lookup time. |

@@ -401,3 +401,67 @@
        (nil? cur) nil
        (nil? ks) (->form cur)
        :else (recur (get cur (first ks) opts) (next ks))))))
+
+(defn path-map
+  "Return {path schema-form} for every schema node in `s` using Balli walk
+  path conventions. Refs are left as ref nodes."
+  ([s] (path-map s {}))
+  ([s opts]
+   (let [out (atom {})]
+     (b/walk s (fn [form path]
+                 (swap! out assoc path form)
+                 form)
+             opts)
+     @out)))
+
+(defn update-at
+  "Update the schema node at `path` with `(f form & args)`. Throws when the
+  path is not present. This is a form-level counterpart to Malli utility
+  workflows that rewrite nested schemas by path."
+  ([s path f] (update-at s path f {}))
+  ([s path f opts & args]
+   (let [seen? (atom false)
+         out (b/walk s
+                     (fn [form p]
+                       (if (= p path)
+                         (do
+                           (reset! seen? true)
+                           (apply f form args))
+                         form))
+                     opts)]
+     (when-not @seen?
+       (throw (ex-info "update-at path not found"
+                       {:type :balli.core/invalid-schema
+                        :path path
+                        :form (->form s)})))
+     out)))
+
+(defn diff
+  "Compare two schemas by path and return data about added, removed, and
+  changed schema nodes. Paths are the same vectors used by `walk`/`explain`."
+  ([s1 s2] (diff s1 s2 {}))
+  ([s1 s2 opts]
+   (let [m1 (path-map s1 opts)
+         m2 (path-map s2 opts)
+         p1 (set (basilisp.core/keys m1))
+         p2 (set (basilisp.core/keys m2))
+         both (set (filter p2 p1))
+         changed-paths (into []
+                             (filter (fn [p]
+                                       (not= (core-get m1 p) (core-get m2 p))))
+                             (sort-by str both))
+         changed-paths (if (and (some #{[]} changed-paths)
+                                (< 1 (count changed-paths)))
+                         (vec (remove #{[]} changed-paths))
+                         changed-paths)]
+     {:added (into []
+                   (map (fn [p] {:path p :schema (core-get m2 p)}))
+                   (sort-by str (remove p1 p2)))
+      :removed (into []
+                     (map (fn [p] {:path p :schema (core-get m1 p)}))
+                     (sort-by str (remove p2 p1)))
+      :changed (into []
+                     (map (fn [p] {:path p
+                                    :from (core-get m1 p)
+                                    :to (core-get m2 p)}))
+                     changed-paths)})))

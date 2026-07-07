@@ -7,3 +7,9 @@ Schema inference (Malli's malli.provider): `provide` takes a collection of sampl
 Kind: `defn`
 
 Infer a schema FORM from `samples` (any seqable of values). `opts` supports {:map-of-threshold n} (default 3) for the [:map-of ...] heuristic, {:infer-enums true :enum-threshold n}, {:infer-tuples true}, and {:closed-maps true}. {:optional-threshold f} annotates optional keys present in at least f of samples with {:balli.provider/common true}; it never makes source samples invalid. {:prefer-map-of false} disables the [:map-of ...] heuristic. Every sample validates against the returned form. No samples -> :any.
+
+## `provide-report`
+
+Kind: `defn`
+
+Infer a schema and return evidence about how it fits the source samples. The report is data-only: {:schema form :samples n :valid-samples n :valid? bool :confidence f :invalid-samples [...]} `:confidence` is the fraction of samples validated by the inferred schema. A correct provider run should normally report 1.0; exposing it makes provider fuzzing and user audits straightforward.

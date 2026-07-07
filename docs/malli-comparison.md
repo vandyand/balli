@@ -13,20 +13,22 @@ Balli currently covers most user-facing schema workflows:
 - validation and explain data
 - humanized errors
 - coercion, decoding, encoding, parsing, and unparsing
+- non-throwing coercion reports and transformer roundtrip checks
 - map, collection, predicate, comparator, enum, ref, multi, and regex schemas
 - function schemas, instrumentation, and generative checking
-- deterministic generators and shrinking
+- deterministic generators, shrinking, shrink traces, and small property-check reports
 - Balli-native generator objects and combinators
 - JSON Schema, OpenAPI, Swagger, DOT, PlantUML, and description export
-- schema walking, utility operations, and map-entry surgery
+- schema walking, utility operations, map-entry surgery, path rewrites, and diffs
 - custom registries, local registries, lazy/dynamic/var registries, and
   recursive references
 - EDN-style safe serialization through registered function references
 - custom extension types
 - time schemas
-- schema inference and destructuring helpers
-- data-only experimental analysis helpers
-- Python integration adapters and static schema inspection
+- schema inference, provider fit reports, and destructuring helpers
+- data-only experimental analysis helpers, including dependency graphs,
+  migration impact, and static risk reports
+- Python integration adapters, callable coercers, and static schema inspection
 
 ## Remaining Differences
 
@@ -34,10 +36,10 @@ Some Malli ecosystem features are intentionally thinner in Balli:
 
 - Malli's ClojureScript/browser ecosystem has no direct Basilisp equivalent.
 - Malli's documentation site and community examples are more mature.
-- Malli has broader downstream library integrations.
+- Malli has broader downstream library integrations and more community examples.
 - Malli's advanced provider ecosystem and schema tooling are still deeper, but
-  Balli now has provider knobs, static inspection, and data-only experimental
-  analysis helpers.
+  Balli now has provider knobs, fit reports, static inspection, path diffs, and
+  data-only experimental analysis helpers.
 - Balli's package ecosystem is younger because Basilisp's ecosystem is smaller.
 
 ## Practical Parity Target

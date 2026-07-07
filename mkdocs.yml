@@ -23,6 +23,7 @@ nav:
       - OpenAPI Export Workflow: cookbook/openapi-workflow.md
       - Generation and Testing: cookbook/generation.md
       - Function Instrumentation: cookbook/functions.md
+      - Parity Tooling: cookbook/parity-tooling.md
   - Examples: examples.md
   - API Reference:
       - Overview: api/index.md

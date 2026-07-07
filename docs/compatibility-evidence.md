@@ -14,8 +14,13 @@ Balli keeps compatibility claims tied to executable tests:
 | Integration transformer presets | `tests/test_transform.lpy`, `tests/test_fuzz_stress.lpy`, `examples/` |
 | Utility introspection | `tests/test_util.lpy`, `tests/test_fuzz_stress.lpy` |
 | Utility schema surgery | `tests/test_parity_extensions.lpy`, `tests/test_util.lpy` |
+| Utility path diffs and rewrites | `tests/test_parity_extensions.lpy`, `tests/test_compatibility_corpus.lpy` |
 | Provider inference options | `tests/test_provider.lpy`, `tests/test_fuzz_stress.lpy` |
+| Provider fit reports | `tests/test_parity_extensions.lpy`, `tests/test_compatibility_corpus.lpy` |
 | Generator combinators and shrink traces | `tests/test_parity_extensions.lpy`, `tests/test_generator.lpy` |
+| Generator property-check reports | `tests/test_parity_extensions.lpy`, `tests/test_compatibility_corpus.lpy` |
+| Coercion diagnostics and roundtrip checks | `tests/test_parity_extensions.lpy`, `tests/test_compatibility_corpus.lpy` |
+| Function wrapper ergonomics and contract metadata | `tests/test_parity_extensions.lpy`, `tests/test_compatibility_corpus.lpy`, `tests/test_function.lpy` |
 | Experimental/integration/inspection helpers | `tests/test_parity_extensions.lpy`, `tests/test_compatibility_corpus.lpy` |
 | Exporters | `tests/test_json_schema.lpy`, `tests/test_tier5.lpy` |
 | Registries | `tests/test_registry.lpy`, `tests/test_registry_mut.lpy`, `tests/test_local_registry.lpy` |

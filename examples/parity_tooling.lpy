@@ -1,0 +1,45 @@
+(ns parity-tooling
+  "Runnable example for Balli's Malli-parity tooling helpers."
+  (:require [balli.core :as b]
+            [balli.experimental :as exp]
+            [balli.generator :as bg]
+            [balli.provider :as bp]
+            [balli.transform :as bt]
+            [balli.util :as u]))
+
+(def samples
+  [{:id 1 :name "Ada"}
+   {:id 2}])
+
+(def inferred
+  (bp/provide-report samples {:closed-maps true
+                              :optional-threshold 0.5}))
+
+(def user-schema
+  (-> (:schema inferred)
+      (u/set-entry :active :boolean)
+      (u/update-at [:id] (fn [s] [:and s [:>= 0]]))))
+
+(def transformer
+  (bt/transformer (bt/string-transformer)
+                  (bt/collection-transformer)))
+
+(def coerced
+  (b/coercion-report user-schema
+                     {:id "7" :name "Grace" :active true}
+                     transformer))
+
+(def generated-check
+  (bg/check user-schema user-schema {:iterations 10 :seed 42}))
+
+(def schema-risk
+  (exp/risk-report user-schema))
+
+(def schema-diff
+  (u/diff (:schema inferred) user-schema))
+
+(println {:provider inferred
+          :coercion coerced
+          :generated generated-check
+          :risk schema-risk
+          :diff schema-diff})

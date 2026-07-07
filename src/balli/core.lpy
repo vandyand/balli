@@ -345,6 +345,41 @@
   ([s value t] ((coercer s t) value))
   ([s value t opts] ((coercer s t opts) value)))
 
+(defn coercion-report
+  "Return data about decoding/coercion without throwing:
+  {:schema form :value original :decoded decoded :valid? bool :explain maybe}.
+  This is useful at API boundaries and mirrors Malli-style coercion workflows
+  where callers often need both the coerced value and explain data."
+  ([s value t] (coercion-report s value t {}))
+  ([s value t opts]
+   (let [so (schema s opts)
+         decoded (decode so value t opts)
+         ex (explain so decoded)]
+     {:schema (:form so)
+      :value value
+      :decoded decoded
+      :valid? (nil? ex)
+      :explain ex})))
+
+(defn coerce?
+  "True when `value` decodes with transformer `t` into a value valid for `s`."
+  ([s value t] (coerce? s value t {}))
+  ([s value t opts]
+   (:valid? (coercion-report s value t opts))))
+
+(defn roundtrip?
+  "Decode then encode `value` with transformer `t` and compare to the original
+  value. When `:validate?` is true (default), the decoded value must also
+  validate against `s`."
+  ([s value t] (roundtrip? s value t {}))
+  ([s value t opts]
+   (let [validate? (get opts :validate? true)
+         so (schema s opts)
+         decoded (decode so value t opts)
+         encoded (encode so decoded t opts)]
+     (and (= value encoded)
+          (or (not validate?) (validate so decoded))))))
+
 ;; ---------------------------------------------------------------------------
 ;; parse/unparse (Phase 5)
 ;;
@@ -697,3 +732,27 @@
 
       (throw (ex-info "instrument requires a :=> or :function schema"
                       {:type :balli.core/invalid-schema :form (:form ast)})))))
+
+(defn wrap-function
+  "Ergonomic alias around `instrument`: `(wrap-function schema f)` returns a
+  callable guarded by a :=> or :function schema. `opts` is merged into the
+  instrument props, so callers can pass :scope, :report, or :registry."
+  ([s f] (wrap-function s f {}))
+  ([s f opts]
+   (instrument (assoc opts :schema s) f)))
+
+(defn function-contract
+  "Return static function-contract metadata for a :=> or :function schema.
+  Root :=> returns {:type :=> :arities [...]}; root :function returns one
+  arity map per child. Non-function schemas return nil."
+  ([s] (function-contract s {}))
+  ([s opts]
+   (let [so (schema s opts)
+         ast (:ast so)]
+     (case (:type ast)
+       :=> {:type :=> :arities [(function-info so)]}
+       :function {:type :function
+                  :arities (mapv #(function-info (:form %)
+                                                 {:registry (:registry so)})
+                                  (:children ast))}
+       nil))))
