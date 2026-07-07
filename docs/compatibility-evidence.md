@@ -9,6 +9,9 @@ Balli keeps compatibility claims tied to executable tests:
 | Broad generated schema behavior | `tests/test_fuzz_stress.lpy` |
 | User clone smoke coverage | `tests/test_user_suite.lpy` |
 | Core runtime APIs | `tests/test_core.lpy`, `tests/test_parse.lpy`, `tests/test_transform.lpy` |
+| Integration transformer presets | `tests/test_transform.lpy`, `tests/test_fuzz_stress.lpy`, `examples/` |
+| Utility introspection | `tests/test_util.lpy`, `tests/test_fuzz_stress.lpy` |
+| Provider inference options | `tests/test_provider.lpy`, `tests/test_fuzz_stress.lpy` |
 | Exporters | `tests/test_json_schema.lpy`, `tests/test_tier5.lpy` |
 | Registries | `tests/test_registry.lpy`, `tests/test_registry_mut.lpy`, `tests/test_local_registry.lpy` |
 

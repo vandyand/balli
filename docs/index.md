@@ -19,4 +19,5 @@ remains the quick project overview.
 
 - Repository: <https://github.com/vandyand/balli>
 - Compatibility matrix: [Malli Compatibility](malli-compatibility.md)
+- Malli migration guide: [Malli Users Start Here](malli-users-start-here.md)
 - API reference: [API Reference](api/index.md)

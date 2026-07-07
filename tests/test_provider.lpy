@@ -100,6 +100,22 @@
   (testing "empty map samples"
     (is (= [:map] (bp/provide [{} {} {}])))))
 
+(deftest closed-map-inference-option
+  (let [samples [{:id 1 :name "a"} {:id 2}]
+        schema (bp/provide samples {:closed-maps true})]
+    (is (= [:map {:closed true}
+            [:id :int]
+            [:name {:optional true} :string]]
+           schema))
+    (doseq [sample samples]
+      (is (true? (b/validate schema sample))))
+    (is (false? (b/validate schema {:id 1 :name "a" :extra true})))))
+
+(deftest closed-map-option-does-not-affect-map-of
+  (is (= [:map-of :string :int]
+         (bp/provide [{"a" 1 "b" 2} {"c" 3} {"d" 4}]
+                     {:closed-maps true}))))
+
 ;; ---------------------------------------------------------------------------
 ;; :map-of heuristic
 

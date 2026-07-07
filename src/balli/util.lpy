@@ -9,7 +9,7 @@
   Refs are never dereferenced: a ref-valued entry participates as its form
   (the bare keyword or [:ref k]), matching balli.core/walk's refs-not-entered
   rule."
-  (:refer-basilisp :exclude [merge dissoc select-keys get get-in])
+  (:refer-basilisp :exclude [merge dissoc select-keys get get-in keys])
   (:require [balli.core :as b]
             [balli.normalize :as norm]
             [balli.registry :as reg]))
@@ -199,6 +199,41 @@
   ([s] (required-keys s nil {}))
   ([s ks] (required-keys s ks {}))
   ([s ks opts] (set-requiredness s ks opts "required-keys" false)))
+
+(defn entries
+  "Return map-entry metadata for `s` in schema order. Each entry is
+  {:key k :properties props :schema value-form :optional bool}. Throws when
+  `s` is not a :map schema."
+  ([s] (entries s {}))
+  ([s opts]
+   (let [ast (map-ast s opts "entries")]
+     (mapv (fn [{:keys [key properties schema]}]
+             {:key key
+              :properties properties
+              :schema (:form schema)
+              :optional (boolean (:optional properties))})
+           (:children ast)))))
+
+(defn keys
+  "Return the declared :map entry keys of `s` in schema order."
+  ([s] (keys s {}))
+  ([s opts] (mapv :key (entries s opts))))
+
+(defn optional-key?
+  "Return true when :map schema `s` has key `k` marked optional."
+  ([s k] (optional-key? s k {}))
+  ([s k opts]
+   (boolean
+    (some (fn [e] (when (= k (:key e)) (:optional e)))
+          (entries s opts)))))
+
+(defn required-key?
+  "Return true when :map schema `s` has required key `k`."
+  ([s k] (required-key? s k {}))
+  ([s k opts]
+   (boolean
+    (some (fn [e] (when (= k (:key e)) (not (:optional e))))
+          (entries s opts)))))
 
 ;; ---------------------------------------------------------------------------
 ;; closed-schema / open-schema (recursive via balli.core/walk)
