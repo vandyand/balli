@@ -1,5 +1,5 @@
 site_name: Balli
-site_description: Data-driven schemas for Basilisp, inspired by Malli.
+site_description: "Malli for Basilisp: data-driven schemas, validation, transformation, and generation."
 site_url: https://vandyand.github.io/balli/
 repo_url: https://github.com/vandyand/balli
 repo_name: vandyand/balli

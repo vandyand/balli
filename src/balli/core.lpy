@@ -1,5 +1,5 @@
 (ns balli.core
-  "Public API for balli - Malli-inspired data-driven schemas for Basilisp.
+  "Public API for balli - Malli for Basilisp.
 
   Schemas are plain data (Malli vector syntax). `schema` wraps a form into a
   schema object {:balli/schema true :form ... :ast ... :registry ... :cache

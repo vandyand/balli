@@ -1,6 +1,6 @@
 # Does basilisp have a drop in clojure malli replacement?
 
-Basilisp does not ship a drop‑in replacement for Clojure’s Malli library, and there is no official Basilisp “Malli clone” that you can just require and use with the same API.[^2_1][^2_2]
+Basilisp itself does not ship a drop-in replacement for Clojure's Malli library.[^2_1][^2_2] Balli fills that gap as Malli for Basilisp: a Malli clone with documented runtime and ecosystem differences.
 
 ## What Basilisp gives you instead
 
@@ -11,7 +11,7 @@ Basilisp focuses on being a Clojure‑compatible(-ish) Lisp on Python, with core
 Given that, your practical options are:
 
 - Use Python libraries (e.g., pydantic, marshmallow, attrs-based validation) from Basilisp via Python interop and treat them as your schema/validation layer. Basilisp is designed for “seamless Python interop,” so this is a first‑class path.[^2_1]
-- Implement a lightweight schema/validation DSL yourself in Basilisp, inspired by Malli’s ideas but tailored to Python types and your needs.
+- Use Balli as a Malli-style schema/validation DSL for Basilisp, with Python-aware runtime behavior where Basilisp differs from Clojure.
 - If you rely heavily on Malli’s specific API, keep that part in Clojure and call Basilisp/Python services over a boundary (HTTP, RPC) rather than trying to duplicate Malli exactly.
 
 
@@ -267,14 +267,15 @@ For test fixtures, copy Malli-like examples such as open/closed maps, enums, tup
 
 ## Naming and positioning
 
-“Balli” is a good name if you frame it honestly: **data-driven schemas for Basilisp, inspired by Malli**. That avoids overpromising exact compatibility while signaling the developer experience you want. Malli’s own positioning centers on data-driven schemas, validation, transformation, error reporting, registries, and schema tooling, and those are the right pillars to preserve.[^3_1]
+“Balli” is now best framed directly as **Malli for Basilisp**: a Malli clone that ports Malli's schema syntax and core workflows into Python-hosted Basilisp while documenting the runtime and ecosystem differences. Malli’s own positioning centers on data-driven schemas, validation, transformation, error reporting, registries, and schema tooling, and those are the right pillars to preserve.[^3_1]
 
 A crisp project statement could be:
 
+- “Balli is Malli for Basilisp.”
 - “Balli is a data-driven schema library for Basilisp.”
 - “Schemas are plain data.”
 - “Validation, explain data, transformation, and coercion.”
-- “Python-powered interop where it helps, Malli-inspired UX where it matters.”[^3_2][^3_1]
+- “Python-powered interop where it helps, Malli-compatible UX where it matters.”[^3_2][^3_1]
 
 Would you like me to draft the actual `balli.core` MVP API and a first-pass compiler for `:map`, `:string`, `:int`, `:maybe`, and `:vector`?
 <span style="display:none">[^3_10][^3_11][^3_12][^3_13][^3_14][^3_15][^3_16][^3_17][^3_3][^3_4][^3_5][^3_6][^3_7][^3_8][^3_9]</span>
@@ -1330,4 +1331,3 @@ If you want, I can turn this into a concrete Balli roadmap with “easy / medium
 [^6_18]: https://cljdoc.org/d/metosin/malli/0.8.8/doc/changelog
 
 [^6_19]: https://github.com/metosin/malli/blob/master/docs/tips.md
-

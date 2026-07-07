@@ -5,9 +5,9 @@
 [![PyPI](https://img.shields.io/pypi/v/balli.svg)](https://pypi.org/project/balli/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Data-driven schemas for [Basilisp](https://github.com/basilisp-lang/basilisp), inspired by [Malli](https://github.com/metosin/malli).
+Balli is [Malli](https://github.com/metosin/malli) for [Basilisp](https://github.com/basilisp-lang/basilisp): a data-driven schema library that brings Malli's schema syntax and core workflows to Python-hosted Basilisp code.
 
-Schemas are plain data in Malli's vector syntax, plus Malli-style map syntax / AST input — no macros, no protocols to implement. Balli covers most of Malli's surface: validation and Malli-shaped explain data with `:path`/`:in`, humanized errors with key spell-checking and localized/custom messages, value transformation (decode/encode/coerce), parse/unparse with tagged branches, sequence (regex) schemas with an iterative backtracking engine, function schemas with generative checking and instrumentation, deterministic seeded generators with regex generation, generator objects, and heuristic shrinking, JSON Schema/OpenAPI/Swagger/DOT/PlantUML/description export, schema utilities (`merge`/`union`/`closed-schema`/...), form walking, safe schema serialization through named function refs and EDN wrappers, custom schema type extensions, schema inference/destructuring from sample data, predicate/comparator schemas, time schemas, default branches, self-contained local registries, and mutable/lazy/dynamic/var custom registries with recursive refs. Malli-inspired, not a strict port — see [Differences from Malli](#differences-from-malli). Pure Basilisp; no Python dependencies beyond the standard library.
+Schemas are plain data in Malli's vector syntax, plus Malli-style map syntax / AST input — no macros, no protocols to implement. Balli covers most of Malli's surface: validation and Malli-shaped explain data with `:path`/`:in`, humanized errors with key spell-checking and localized/custom messages, value transformation (decode/encode/coerce), parse/unparse with tagged branches, sequence (regex) schemas with an iterative backtracking engine, function schemas with generative checking and instrumentation, deterministic seeded generators with regex generation, generator objects, and heuristic shrinking, JSON Schema/OpenAPI/Swagger/DOT/PlantUML/description export, schema utilities (`merge`/`union`/`closed-schema`/...), form walking, safe schema serialization through named function refs and EDN wrappers, custom schema type extensions, schema inference/destructuring from sample data, predicate/comparator schemas, time schemas, default branches, self-contained local registries, and mutable/lazy/dynamic/var custom registries with recursive refs. The remaining differences are documented below in [Differences from Malli](#differences-from-malli). Pure Basilisp; no Python dependencies beyond the standard library.
 
 ## Project resources
 
@@ -889,7 +889,7 @@ Unknown or malformed schema forms throw `ex-info` with `:type :balli.core/invali
 
 ## Differences from Malli
 
-Balli covers most of Malli's core surface but is Malli-**inspired**, not a port. Not implemented:
+Balli is a Malli clone for Basilisp, with runtime and ecosystem differences where Basilisp/Python diverge from Clojure/JVM. Not implemented:
 
 See also [docs/malli-compatibility.md](docs/malli-compatibility.md) for the
 feature-family compatibility matrix.
